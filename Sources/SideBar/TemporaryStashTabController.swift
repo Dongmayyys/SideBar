@@ -140,7 +140,7 @@ private final class TemporaryStashTabView: NSView {
     var expanded = false
 
     override func draw(_ dirtyRect: NSRect) {
-        (expanded ? NSColor.selectedContentBackgroundColor : NSColor.windowBackgroundColor).setFill()
+        (expanded ? NSColor(white: 0.32, alpha: 1) : NSColor.black).setFill()
         NSBezierPath(roundedRect: bounds, xRadius: 5, yRadius: 5).fill()
         let capacity = max(1, Int((bounds.height - 2 * TemporaryStashDefaults.textPadding) / TemporaryStashDefaults.lineHeight))
         var characters = Array(title)
@@ -149,7 +149,7 @@ private final class TemporaryStashTabView: NSView {
         style.alignment = .center
         let attributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: TemporaryStashDefaults.fontSize),
-            .foregroundColor: expanded ? NSColor.selectedTextColor : NSColor.labelColor,
+            .foregroundColor: NSColor.white,
             .paragraphStyle: style
         ]
         let top = bounds.midY + CGFloat(characters.count) * TemporaryStashDefaults.lineHeight / 2

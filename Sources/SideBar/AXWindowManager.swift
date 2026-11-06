@@ -4,7 +4,8 @@ import ApplicationServices
 class AXWindowManager {
     private var sessions: [WindowSession] = []
     private let fusionCoordinator = FusionStripCoordinator()
-    private var temporaryShortcutSession: WindowSession?
+    private let temporaryTabCoordinator = TemporaryStashTabCoordinator()
+    private var temporaryOrdinals = TemporaryStashOrdinals()
     private var temporarilyExcludedWindowKeys: Set<String> = []
     private var bundleControlOwnerOverrides: [String: SideBarHotkeyClaim.HotkeyOwner] = [:]
     private var bundlePreferredClaimSessionIDs: [String: String] = [:]
@@ -55,7 +56,7 @@ class AXWindowManager {
 
         fusionRefreshTimer = Timer.scheduledTimer(withTimeInterval: 0.12, repeats: true) { [weak self] _ in
             guard let self else { return }
-            self.fusionCoordinator.reconcile(sessions: self.sessions)
+            self.reconcileIndicators()
         }
         
         // 低频轮询（每 5 秒）：检测被管理应用是否已退出，自动清理残留 session
@@ -121,6 +122,10 @@ class AXWindowManager {
                     session.restoreAndDestroy()
                     return true
                 }
+                if result == .invalidUIElement && session.isManagedByTemporaryShortcut {
+                    session.restoreAndDestroy()
+                    return true
+                }
                 // 进程还在，信任 session 的内部容错计数
                 return false
             }
@@ -142,7 +147,7 @@ class AXWindowManager {
             }
         }
 
-        fusionCoordinator.reconcile(sessions: sessions)
+        reconcileIndicators()
         refreshSideBarHotkeyRuntime()
     }
     
@@ -153,10 +158,11 @@ class AXWindowManager {
     }
 
     @objc private func handleActiveSpaceDidChange() {
-        fusionCoordinator.resetForSpaceChange(sessions: sessions)
+        temporaryTabCoordinator.tearDownAll()
+        fusionCoordinator.resetForSpaceChange(sessions: sessions.filter { !$0.isManagedByTemporaryShortcut })
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { [weak self] in
             guard let self else { return }
-            self.fusionCoordinator.reconcile(sessions: self.sessions)
+            self.reconcileIndicators()
         }
     }
 
@@ -184,10 +190,11 @@ class AXWindowManager {
             print("🖥️ 检测到屏幕配置变化: reseat=\(reseated), recover=\(recovered)")
         }
 
-        fusionCoordinator.resetForSpaceChange(sessions: sessions)
+        temporaryTabCoordinator.tearDownAll()
+        fusionCoordinator.resetForSpaceChange(sessions: sessions.filter { !$0.isManagedByTemporaryShortcut })
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { [weak self] in
             guard let self else { return }
-            self.fusionCoordinator.reconcile(sessions: self.sessions)
+            self.reconcileIndicators()
         }
     }
     
@@ -199,6 +206,7 @@ class AXWindowManager {
             monitorApp(pid: app.processIdentifier, bundleID: bundleID, maxRetries: 5)
             prepareDockActivationRoutingIfNeeded(bundleID: bundleID)
         }
+        temporaryTabCoordinator.handleAppActivation(activatedPID: app.processIdentifier, sessions: sessions)
     }
     
     func cleanup() {
@@ -214,6 +222,7 @@ class AXWindowManager {
         bundleLastExpandedSessions.removeAll()
         bundleLastSnappedSessions.removeAll()
         fusionCoordinator.tearDownAll()
+        temporaryTabCoordinator.tearDownAll()
         fusionRefreshTimer?.invalidate()
         fusionRefreshTimer = nil
         sessionSyncTimer?.invalidate()
@@ -266,6 +275,7 @@ class AXWindowManager {
         bundleLastExpandedSessions.removeAll()
         bundleLastSnappedSessions.removeAll()
         fusionCoordinator.tearDownAll()
+        temporaryTabCoordinator.tearDownAll()
         fusionRefreshTimer?.invalidate()
         fusionRefreshTimer = nil
         sessionSyncTimer?.invalidate()
@@ -423,7 +433,7 @@ class AXWindowManager {
             return false
         }
 
-        fusionCoordinator.reconcile(sessions: sessions)
+        reconcileIndicators()
         refreshSideBarHotkeyRuntime()
     }
     
@@ -502,34 +512,48 @@ class AXWindowManager {
     }
 
     private func handleTemporaryShortcut() -> Bool {
-        if let temporaryShortcutSession {
-            temporaryShortcutSession.toggleTemporaryShortcutStash()
+        guard let target = currentFocusedStandardWindow() else { return false }
+        let existing = sessions.first { CFEqual($0.windowElement, target.windowElement) }
+        let action = TemporaryStashShortcutAction.resolve(
+            isConfiguredApp: AppConfig.shared.isAppEnabled(bundleID: target.bundleID),
+            isManaged: existing?.isManagedByTemporaryShortcut == true,
+            isExpanded: existing?.isExpandedForCoordination == true
+        )
+        switch action {
+        case .ignore:
+            // 收起的窗口不能通过快捷键展开；设置托管的软件本期不接管。
+            return false
+        case .cancel:
+            existing?.cancelTemporaryShortcutStash()
+            return true
+        case .stash:
+            let session = WindowSession(appElement: target.appElement, windowElement: target.windowElement,
+                                        pid: target.pid, bundleID: target.bundleID, temporaryShortcut: true)
+            attachSessionLifecycle(to: session)
+            guard session.startTemporaryShortcutStash() else {
+                session.restoreAndDestroy()
+                return false
+            }
+            clearTemporarilyExcludedWindow(for: target.windowElement, pid: target.pid)
+            session.temporaryStashOrdinal = temporaryOrdinals.assign(bundleID: target.bundleID, windowID: session.temporaryStashID)
+            sessions.append(session)
+            refreshTemporaryDockExclusion(bundleID: target.bundleID)
+            reconcileIndicators()
+            refreshSideBarHotkeyRuntime()
             return true
         }
+    }
 
-        guard let target = currentFocusedStandardWindow() else { return false }
-        clearTemporarilyExcludedWindow(for: target.windowElement, pid: target.pid)
+    private func reconcileIndicators() {
+        fusionCoordinator.reconcile(sessions: sessions.filter { !$0.isManagedByTemporaryShortcut })
+        temporaryTabCoordinator.reconcile(sessions: sessions)
+    }
 
-        let session: WindowSession
-        if let existingSession = sessions.first(where: { CFEqual($0.windowElement, target.windowElement) }) {
-            session = existingSession
-        } else {
-            let createdSession = WindowSession(
-                appElement: target.appElement,
-                windowElement: target.windowElement,
-                pid: target.pid,
-                bundleID: target.bundleID
-            )
-            attachSessionLifecycle(to: createdSession)
-            sessions.append(createdSession)
-            session = createdSession
-        }
-
-        session.enableTemporaryShortcutManagement()
-        temporaryShortcutSession = session
-        fusionCoordinator.reconcile(sessions: sessions)
-        session.toggleTemporaryShortcutStash()
-        return true
+    private func refreshTemporaryDockExclusion(bundleID: String) {
+        AppConfig.shared.setTemporaryDockMinimizeExclusion(
+            bundleID: bundleID,
+            excluded: temporaryOrdinals.hasMembers(bundleID: bundleID)
+        )
     }
 
     private func currentFocusedStandardWindow() -> (appElement: AXUIElement, windowElement: AXUIElement, pid: pid_t, bundleID: String)? {
@@ -584,7 +608,7 @@ class AXWindowManager {
     private func handleSessionRuntimeStateChanged() {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            self.fusionCoordinator.reconcile(sessions: self.sessions)
+            self.reconcileIndicators()
             self.refreshSideBarHotkeyRuntime()
         }
     }
@@ -598,16 +622,15 @@ class AXWindowManager {
         if excludeWindow, let windowKey = windowKey(for: session.windowElement, pid: session.pid) {
             temporarilyExcludedWindowKeys.insert(windowKey)
         }
-        if temporaryShortcutSession === session {
-            temporaryShortcutSession = nil
-        }
+        temporaryOrdinals.release(bundleID: session.bundleID, windowID: session.temporaryStashID)
+        refreshTemporaryDockExclusion(bundleID: session.bundleID)
 
         guard removeSession else { return }
 
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.sessions.removeAll { $0 === session }
-            self.fusionCoordinator.reconcile(sessions: self.sessions)
+            self.reconcileIndicators()
             self.refreshSideBarHotkeyRuntime()
         }
     }
@@ -623,6 +646,7 @@ class AXWindowManager {
     }
 
     private func handleSessionStateTransition(_ session: WindowSession, oldState: SnapState, newState: SnapState) {
+        guard !session.isManagedByTemporaryShortcut else { return }
         rememberBundleWindowHistory(for: session, newState: newState)
         guard case .floating = oldState else { return }
         guard case .snapped = newState else { return }
@@ -630,6 +654,7 @@ class AXWindowManager {
     }
 
     private func handleManagedEdgeDetachment(for session: WindowSession) {
+        guard !session.isManagedByTemporaryShortcut else { return }
         let bundleSessions = sessions(for: session.bundleID)
         guard bundleSessions.count > 1 else { return }
 
@@ -661,6 +686,7 @@ class AXWindowManager {
     }
 
     private func handleFloatingToSnappedTransition(for session: WindowSession) {
+        guard !session.isManagedByTemporaryShortcut else { return }
         let bundleSessions = sessions(for: session.bundleID)
         guard bundleSessions.count > 1 else { return }
         guard bundleSessions.contains(where: { $0 !== session && $0.isFloatingForCoordination }) else {
@@ -684,7 +710,7 @@ class AXWindowManager {
     }
 
     private func sessions(for bundleID: String) -> [WindowSession] {
-        sessions.filter { $0.bundleID == bundleID }
+        sessions.filter { $0.bundleID == bundleID && !$0.isManagedByTemporaryShortcut }
     }
 
     private func effectiveBundleOwner(for bundleID: String) -> SideBarHotkeyClaim.HotkeyOwner {
@@ -701,7 +727,7 @@ class AXWindowManager {
     }
 
     private func reconcileBundleOwnershipState() {
-        let groupedSessions = Dictionary(grouping: sessions, by: \.bundleID)
+        let groupedSessions = Dictionary(grouping: sessions.filter { !$0.isManagedByTemporaryShortcut }, by: \.bundleID)
 
         bundleControlOwnerOverrides = bundleControlOwnerOverrides.filter { bundleID, _ in
             guard let bundleSessions = groupedSessions[bundleID], !bundleSessions.isEmpty else {
@@ -728,13 +754,13 @@ class AXWindowManager {
         reconcileBundleOwnershipState()
 
         let effectiveOwners = Dictionary(
-            uniqueKeysWithValues: Set(sessions.map(\.bundleID)).sorted().map { bundleID in
+            uniqueKeysWithValues: Set(sessions.filter { !$0.isManagedByTemporaryShortcut }.map(\.bundleID)).sorted().map { bundleID in
                 (bundleID, effectiveBundleOwner(for: bundleID))
             }
         )
 
         SideBarBridge.shared.syncRuntimeClaims(
-            from: sessions.map(\.runtimeClaimSnapshot),
+            from: sessions.filter { !$0.isManagedByTemporaryShortcut }.map(\.runtimeClaimSnapshot),
             effectiveOwners: effectiveOwners,
             preferredSessionIDs: bundlePreferredClaimSessionIDs
         )

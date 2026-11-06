@@ -99,6 +99,7 @@ final class Session {
     var pendingDockInteraction = false
     var hasReleasedDockClick = false
     var isTemporarilyPinned = false
+    var isTemporaryShortcutManaged = false
     var fusionHoverLock = false
     var siblingFocused = false
     var siblingUnderMouse = false

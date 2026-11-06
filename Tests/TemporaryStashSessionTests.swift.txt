@@ -1,0 +1,186 @@
+var total = 0
+var failures = 0
+func expect(_ condition: Bool, _ name: String) {
+    total += 1
+    if !condition { failures += 1 }
+    print("\(condition ? "PASS" : "FAIL") \(name)")
+}
+func resetScreens() { NSScreen.screens = [NSScreen(frame: CGRect(x: 0, y: 0, width: 1000, height: 1000))] }
+
+for right in [false, true] {
+    resetScreens()
+    let s = Session()
+    s.windowElement.frame.origin.x = right ? 550 : 100
+    let original = s.windowElement.frame
+    var excluded: Bool?
+    s.onTemporaryShortcutSessionEnded = { _, exclude, _ in excluded = exclude }
+    expect(s.startTemporaryShortcutStash() && s.isSnappedForCoordination && s.alpha == 0,
+           "production start hides window edge=\(right ? 2 : 1)")
+    expect(s.temporaryOriginalFrame == original && s.currentEdge == (right ? 2 : 1), "start stores original and nearest edge")
+    s.revealForTemporaryStashTab()
+    expect(s.isExpandedForCoordination && s.alpha == 1 && s.windowElement.frame.minY == original.minY && s.tracking,
+           "production reveal preserves vertical position and starts tracking")
+    s.isTemporarilyPinned = true
+    expect(s.hideForTemporaryStashTab() && s.isExpandedForCoordination, "production switch leaves pinned window visible")
+    s.cancelTemporaryShortcutStash()
+    expect(s.windowElement.frame.origin == original.origin && s.alpha == 1 && s.destroyed && excluded == true,
+           "production pinned cancel restores original and excludes only this window")
+    expect(!s.isMirrorPinActive && !s.isTemporarilyPinned && !s.focusReleasePending && s.windowAnimator.stopped,
+           "cancel clears pin and pending focus/animation work")
+    expect(s.clearedRecovery && !s.screenLocked && s.mouseTrackingTimer?.invalidated == true,
+           "successful restoration clears rescue record and stops tracking")
+}
+
+resetScreens()
+let quit = Session()
+let beforeQuit = quit.windowElement.frame.origin
+_ = quit.startTemporaryShortcutStash()
+quit.restoreAndDestroy()
+expect(quit.windowElement.frame.origin == beforeQuit && quit.alpha == 1 && quit.destroyed,
+       "production quit restores collapsed window before destroying")
+
+resetScreens()
+let readingFailure = Session()
+let beforeFailure = readingFailure.windowElement.frame.origin
+_ = readingFailure.startTemporaryShortcutStash()
+readingFailure.rawUnavailable = true
+readingFailure.restoreAndDestroy()
+expect(readingFailure.windowElement.frame.origin == beforeFailure && readingFailure.alpha == 1,
+       "quit can use stored frames even when AX geometry read fails")
+
+resetScreens()
+let retry = Session()
+let retryOriginal = retry.windowElement.frame.origin
+_ = retry.startTemporaryShortcutStash()
+retry.windowElement.positionResults = [.cannotComplete, .success]
+retry.windowElement.writes = 0
+retry.restoreAndDestroy()
+expect(retry.windowElement.writes == 2 && retry.windowElement.frame.origin == retryOriginal && retry.clearedRecovery,
+       "transient restoration write failure retries once")
+
+resetScreens()
+let persistent = Session()
+_ = persistent.startTemporaryShortcutStash()
+persistent.windowElement.positionResults = [.cannotComplete, .failure]
+persistent.restoreAndDestroy()
+expect(persistent.alpha == 1 && !persistent.clearedRecovery && persistent.destroyed,
+       "persistent write failure restores alpha and retains rescue record")
+
+resetScreens()
+let missing = Session()
+_ = missing.startTemporaryShortcutStash()
+missing.temporaryOriginalFrame = CGRect(x: -1000, y: 100, width: 400, height: 300)
+let expanded = missing.temporaryLastExpandedFrame!
+missing.cancelTemporaryShortcutStash()
+expect(missing.windowElement.frame.origin == expanded.origin, "missing original screen restores last expanded position")
+
+resetScreens()
+let closed = Session()
+_ = closed.startTemporaryShortcutStash()
+closed.windowElement.writes = 0
+closed.closed()
+expect(!closed.isTemporaryShortcutManaged && closed.destroyed && closed.windowElement.writes == 0,
+       "closed window ends its session without attempting restore on dead AX element")
+
+resetScreens()
+NSScreen.screens += [NSScreen(frame: CGRect(x: -1000, y: 0, width: 1000, height: 1000)),
+                     NSScreen(frame: CGRect(x: 1000, y: 0, width: 1000, height: 1000))]
+let blocked = Session()
+let blockedFrame = blocked.windowElement.frame
+expect(!blocked.startTemporaryShortcutStash() && blocked.windowElement.frame == blockedFrame && blocked.alpha == 1,
+       "blocked screen does not move or hide the window")
+resetScreens()
+let sibling1 = Session()
+let sibling2 = Session()
+_ = sibling1.startTemporaryShortcutStash()
+_ = sibling2.startTemporaryShortcutStash()
+sibling1.cancelTemporaryShortcutStash()
+expect(sibling2.isTemporaryShortcutManaged && sibling2.isSnappedForCoordination && sibling2.alpha == 0,
+       "same-app sibling session remains stashed when first is cancelled")
+
+for pinned in [false, true] {
+    resetScreens()
+    let drag = Session()
+    var dragExcluded = false
+    drag.onTemporaryShortcutSessionEnded = { _, excluded, _ in dragExcluded = excluded }
+    _ = drag.startTemporaryShortcutStash()
+    drag.revealForTemporaryStashTab()
+    drag.isTemporarilyPinned = pinned
+    drag.windowElement.frame.origin.x = 250
+    let dropped = drag.windowElement.frame
+    drag.windowElement.writes = 0
+    drag.isDragging = true
+    drag.handleMouseUp()
+    expect(drag.destroyed && drag.windowElement.frame == dropped && !drag.isTemporaryShortcutManaged,
+           "production drag detach cancels at dropped frame pinned=\(pinned)")
+    expect(drag.windowElement.writes == 0 && drag.alpha == 1 && dragExcluded && drag.clearedRecovery,
+           "drag cancel restores visibility and exclusion without position writes pinned=\(pinned)")
+}
+resetScreens()
+let vertical = Session()
+_ = vertical.startTemporaryShortcutStash()
+vertical.revealForTemporaryStashTab()
+vertical.windowElement.frame.origin.y = 450
+vertical.isDragging = true
+vertical.handleMouseUp()
+expect(vertical.isTemporaryShortcutManaged && vertical.temporaryLastExpandedFrame?.minY == 450 && !vertical.destroyed,
+       "vertical edge drag retains stash and updates label anchor")
+
+resetScreens()
+let focusedA = Session()
+let focusedB = Session()
+_ = focusedA.startTemporaryShortcutStash()
+_ = focusedB.startTemporaryShortcutStash()
+Session.targetedActivationByPID.removeAll()
+Session.programmaticPIDs.removeAll()
+NSWorkspace.shared.frontmostApplication = NSRunningApplication(processIdentifier: 123)
+Session.focusedElement = focusedA.windowElement
+Session.mainElement = focusedB.windowElement
+expect(focusedA.canRevealForTemporaryAppActivation(activatedPID: 123)
+       && !focusedB.canRevealForTemporaryAppActivation(activatedPID: 123),
+       "production activation targets only focused stash even when another stash is main")
+Session.focusedElement = nil
+expect(focusedB.canRevealForTemporaryAppActivation(activatedPID: 123)
+       && !focusedA.canRevealForTemporaryAppActivation(activatedPID: 123),
+       "production activation falls back to main only if focused is absent")
+Session.focusedElement = Element()
+expect(!focusedA.canRevealForTemporaryAppActivation(activatedPID: 123)
+       && !focusedB.canRevealForTemporaryAppActivation(activatedPID: 123),
+       "production non-stashed focus prevents main-window fallback")
+Session.focusedElement = focusedB.windowElement
+focusedA.revealForTemporaryStashTab(isAppActivated: true)
+expect(focusedA.pendingDockInteraction && focusedA.hasReleasedDockClick,
+       "keyboard application activation waits for interaction even with pointer outside")
+expect(!focusedB.canRevealForTemporaryAppActivation(activatedPID: 123),
+       "production targeted reveal cannot reenter on still-focused sibling")
+expect(TemporaryStashShortcutAction.resolve(isConfiguredApp: false, isManaged: true,
+                                          isExpanded: focusedA.isExpandedForCoordination) == .cancel,
+       "revealed window can immediately cancel via stash shortcut")
+Session.targetedActivationByPID.removeAll()
+Session.programmaticPIDs.insert(123)
+expect(!focusedB.canRevealForTemporaryAppActivation(activatedPID: 123), "production focus-return activation is ignored")
+Session.programmaticPIDs.removeAll()
+expect(!focusedB.canRevealForTemporaryAppActivation(activatedPID: 999), "activation for another app is ignored")
+NSWorkspace.shared.frontmostApplication = NSRunningApplication(processIdentifier: 999)
+expect(!focusedB.canRevealForTemporaryAppActivation(activatedPID: 123), "pending activation cannot steal another foreground app")
+NSWorkspace.shared.frontmostApplication = NSRunningApplication(processIdentifier: 123)
+focusedB.activationSuppressionUntil = Date().addingTimeInterval(10)
+expect(!focusedB.canRevealForTemporaryAppActivation(activatedPID: 123), "production activation suppression is respected")
+focusedB.activationSuppressionUntil = .distantPast
+Session.targetedActivationByPID[123] = (ObjectIdentifier(focusedA), Date.distantPast)
+expect(focusedB.canRevealForTemporaryAppActivation(activatedPID: 123), "expired targeted activation does not block user switching")
+focusedB.isTemporaryShortcutManaged = false
+expect(!focusedB.canRevealForTemporaryAppActivation(activatedPID: 123), "configured sessions stay on existing activation path")
+let dockReveal = Session()
+_ = dockReveal.startTemporaryShortcutStash()
+NSEvent.pressedMouseButtons = 1
+dockReveal.revealForTemporaryStashTab(isAppActivated: true)
+expect(dockReveal.pendingDockInteraction && !dockReveal.hasReleasedDockClick,
+       "Dock activation waits for original click release before accepting outside click")
+NSEvent.pressedMouseButtons = 0
+let hoverReveal = Session()
+_ = hoverReveal.startTemporaryShortcutStash()
+hoverReveal.revealForTemporaryStashTab()
+expect(!hoverReveal.pendingDockInteraction, "hover reveal preserves ordinary pointer-exit collapse behavior")
+print("RESULT checks=\(total) failures=\(failures)")
+exit(failures == 0 ? 0 : 1)

@@ -1,0 +1,138 @@
+import Foundation
+import ApplicationServices
+
+enum AXResult { case success, cannotComplete, failure }
+enum NSEvent { static var pressedMouseButtons = 0 }
+final class Element: NSObject {
+    var frame = CGRect(x: 100, y: 200, width: 400, height: 300)
+    var positionResults: [AXResult] = []
+    var writes = 0
+    var events: [String] = []
+}
+final class Timer { var invalidated = false; func invalidate() { invalidated = true } }
+final class Animator { var stopped = false; func stop() { stopped = true } }
+final class Effect { func stopExpandEffect(closeWindow: Bool, immediate: Bool = false) {} }
+final class Panel { func orderOut(_ sender: Any?) {} }
+struct NSScreen {
+    var frame: CGRect
+    static var screens = [NSScreen(frame: CGRect(x: 0, y: 0, width: 1000, height: 1000))]
+}
+struct ActivateOptions: OptionSet {
+    let rawValue: Int
+    static let activateIgnoringOtherApps = ActivateOptions(rawValue: 1)
+}
+final class NSRunningApplication {
+    let processIdentifier: Int32
+    init?(processIdentifier: Int32) { self.processIdentifier = processIdentifier }
+    func activate(options: ActivateOptions) { NSWorkspace.shared.frontmostApplication = self }
+}
+final class NSWorkspace { static let shared = NSWorkspace(); var frontmostApplication: NSRunningApplication? }
+@discardableResult
+func axSetPositionAttribute(on element: Element, position: CGPoint, context: String) -> AXResult {
+    element.writes += 1
+    element.events.append("position")
+    let result = element.positionResults.isEmpty ? .success : element.positionResults.removeFirst()
+    if result == .success { element.frame.origin = position }
+    return result
+}
+@discardableResult
+func axSetBoolAttribute(on element: Element, attribute: CFString, value: Bool, context: String) -> AXResult { .success }
+
+__SNAP_STATE__
+
+final class Session {
+    let windowElement = Element()
+    var state: SnapState = .floating
+    var isTemporaryShortcutManaged = true
+    var temporaryOriginalFrame: CGRect?
+    var temporaryLastExpandedFrame: CGRect?
+    var lockedWidth: CGFloat = 0
+    var initialFrameCaptured = false
+    var currentEdge = 0
+    var isTemporarilyPinned = false
+    var isMirrorPinActive = false
+    var pinnedAnchor: Int?
+    var queuedForwardedHotkeyToggle = false
+    var animationGenerationToken = 0
+    var isAnimating = false
+    var rawUnavailable = false
+    var destroyed = false
+    var clearedRecovery = false
+    var screenLocked = false
+    var fusionHoverLock = false
+    var isDragging = false
+    var pinControlRevealSuppressionUntil = Date.distantPast
+    static let managedEdgeDetachTolerance: CGFloat = 72
+    static var focusedElement: Element?
+    static var mainElement: Element?
+    static var targetedActivationByPID: [pid_t: (sessionID: ObjectIdentifier, expiresAt: Date)] = [:]
+    static var preferredSessionByPID: [pid_t: ObjectIdentifier] = [:]
+    static var programmaticPIDs: Set<pid_t> = []
+    var activationSuppressionUntil = Date.distantPast
+    static func cleanupRegistry() { targetedActivationByPID = targetedActivationByPID.filter { $0.value.expiresAt > Date() } }
+    static func shouldIgnoreProgrammaticActivation(for pid: pid_t) -> Bool { programmaticPIDs.contains(pid) }
+    func focusedWindowOfApp() -> Element? { Self.focusedElement }
+    func isMainWindowOfApp() -> Bool { Self.mainElement === windowElement }
+    var focusReleasePending = false
+    var tracking = false
+    var pendingDockInteraction = false
+    var hasReleasedDockClick = false
+    let pid: Int32 = 123
+    let bundleID = "same.app"
+    var mouseTrackingTimer: Timer? = Timer()
+    var hoverDelayTimer: Timer? = Timer()
+    var hoverInterruptTimer: Timer? = Timer()
+    let windowAnimator = Animator()
+    let effectWindow = Effect()
+    let indicatorWindow = Panel()
+    let pinControlWindow = Panel()
+    var alpha: CGFloat = 1
+    var onTemporaryShortcutStashStateChanged: ((Session, Bool) -> Void)?
+    var onTemporaryShortcutSessionEnded: ((Session, Bool, Bool) -> Void)?
+    var isExpandedForCoordination: Bool { state == .expanded }
+    var isSnappedForCoordination: Bool { if case .snapped = state { return true }; return false }
+    func getRawWindowFrame() -> CGRect? { rawUnavailable ? nil : windowElement.frame }
+    func getWindowFrame() -> CGRect? { getRawWindowFrame() }
+    func detectDisplayBounds() -> CGRect { NSScreen.screens[0].frame }
+    func getDisplayBounds() -> CGRect { detectDisplayBounds() }
+    func cgBounds(for screen: NSScreen) -> CGRect { screen.frame }
+    func lockCurrentScreen() { screenLocked = true }
+    func unlockScreen() { screenLocked = false }
+    func edgeGeometry(for frame: CGRect) -> (expanded: CGPoint, hidden: CGPoint, visualHidden: CGPoint)? {
+        let screen = detectDisplayBounds()
+        let x = currentEdge == 1 ? screen.minX : screen.maxX - frame.width
+        let hidden = currentEdge == 1 ? screen.minX - frame.width + 1 : screen.maxX - 1
+        return (CGPoint(x: x, y: frame.minY), .zero, CGPoint(x: hidden, y: frame.minY))
+    }
+    // Collapse's real control flow has its own production extraction suite.
+    func collapseWindow(immediate: Bool, triggerEffects: Bool) -> Bool {
+        guard !isAnimating, let frame = getRawWindowFrame(), let geometry = edgeGeometry(for: frame) else { return false }
+        state = .snapped(edge: currentEdge, hiddenOrX: geometry.visualHidden.x)
+        windowElement.frame.origin = geometry.visualHidden
+        alpha = 0
+        return true
+    }
+    func setWindowPosition(position: CGPoint) { _ = axSetPositionAttribute(on: windowElement, position: position, context: "stub") }
+    func setWindowAlpha(_ value: CGFloat, isHidden: Bool, frameHint: CGRect? = nil, preserveRecoveryRecord: Bool = false) {
+        alpha = value; windowElement.events.append("alpha")
+    }
+    func clearTrackedWindowRecoveryState(frameHint: CGRect) { clearedRecovery = true }
+    func safeRestorePosition(for frame: CGRect) -> CGPoint { .zero }
+    func scheduleFocusRelease(after delay: Double) { focusReleasePending = true }
+    func invalidatePendingFocusRelease() { focusReleasePending = false }
+    func rememberFocusReturnTargetBeforeReveal() {}
+    func stopPinnedRaisePulse() {}
+    func teardownMirrorCapture() {}
+    func startMouseTrackingTimer() { tracking = true }
+    func updatePinControlWindow() {}
+    func showIndicator(animated: Bool) {}
+    func isSnapAllowed(for edge: Int) -> Bool { true }
+    func hasAdjacentScreen(at edge: Int, bounds: CGRect) -> Bool { false }
+    func edgePriority(_ edge: Int) -> Int { edge }
+    func snapToEdge(edgeConfig: Int, frame: CGRect, displayBounds: CGRect) {}
+    func transitionToFloatingFromManagedState() { cancelTemporaryShortcutStash() }
+    func destroy() { destroyed = true; animationGenerationToken += 1 }
+    func closed() { handleDestroyed() }
+
+__METHODS__
+}

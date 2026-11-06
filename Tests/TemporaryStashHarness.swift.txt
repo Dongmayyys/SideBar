@@ -1,0 +1,63 @@
+import Foundation
+
+enum Clock { static var now: Double = 0 }
+struct Date {
+    let value: Double
+    init() { value = Clock.now }
+    init(_ value: Double) { self.value = value }
+    static let distantPast = Date(-1e10)
+    func timeIntervalSince(_ other: Date) -> Double { value - other.value }
+}
+enum NSEvent { static var mouseLocation = CGPoint(x: 500, y: 400) }
+let mainScreen = CGRect(x: 0, y: 0, width: 1000, height: 1000)
+var transitions: [String] = []
+
+// Coordinator uses production geometry/state decisions; only AX/UI endpoints are in-memory.
+final class WindowSession {
+    let temporaryStashID: String
+    var isManagedByTemporaryShortcut = true
+    var isExpandedForCoordination = false
+    var isPinned = false
+    var edge = 1
+    var screen = mainScreen
+    var visibleFrame = mainScreen
+    var pid: pid_t = 123
+    var activationFocused = false
+    var programmaticActivation = false
+    var center: CGFloat = 500
+    var eligible = true
+    var canHide = true
+    var hoverLock = false
+    var appActivationReveal = false
+    init(_ id: String, center: CGFloat = 500, edge: Int = 1) {
+        temporaryStashID = id; self.center = center; self.edge = edge
+    }
+    func temporaryStashTabDescriptor() -> TemporaryStashTabDescriptor? {
+        guard eligible else { return nil }
+        return TemporaryStashTabDescriptor(session: self, edge: edge, screenFrame: screen,
+                                           visibleFrame: visibleFrame,
+                                           centerY: center, title: temporaryStashID)
+    }
+    func canRevealForTemporaryAppActivation(activatedPID: pid_t) -> Bool {
+        isManagedByTemporaryShortcut && !isExpandedForCoordination && activationFocused && !programmaticActivation && activatedPID == pid
+    }
+    func setFusionHoverLock(_ locked: Bool) { hoverLock = locked }
+    func hideForTemporaryStashTab() -> Bool {
+        if isPinned { return true }
+        guard canHide else { return false }
+        transitions.append("hide:" + temporaryStashID)
+        isExpandedForCoordination = false
+        return true
+    }
+    func revealForTemporaryStashTab(isAppActivated: Bool = false) {
+        appActivationReveal = isAppActivated
+        transitions.append("reveal:" + temporaryStashID)
+        isExpandedForCoordination = true
+    }
+}
+final class TemporaryStashTabWindow {
+    static var live: [String: CGRect] = [:]
+    var title = ""
+    func update(frame: CGRect, title: String, expanded: Bool) { self.title = title; Self.live[title] = frame }
+    func close() { Self.live[title] = nil }
+}

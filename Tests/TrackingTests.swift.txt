@@ -154,5 +154,22 @@ NSEvent.pressedMouseButtons = 0
 advance(10)
 expect(focusMouseDown.snapped && focusMouseDown.focusReleases == 0, "focus-loss collapse runs after mouse release")
 
+reset()
+let temporarySibling = Session()
+temporarySibling.isTemporaryShortcutManaged = true
+temporarySibling.siblingUnderMouse = true
+temporarySibling.siblingFocused = true
+advance(10)
+expect(temporarySibling.snapped, "temporary window collapses independently of same-app sibling focus and geometry")
+
+reset()
+let cancelledAnimation = Session()
+_ = cancelledAnimation.directCollapse()
+advance(2) // animation completed; the final 50ms position write is still queued
+cancelledAnimation.animationGenerationToken += 1
+cancelledAnimation.frame.origin = CGPoint(x: 222, y: 111) // restoration wins
+advance(2)
+expect(cancelledAnimation.frame.origin == CGPoint(x: 222, y: 111), "stale collapse completion cannot move a restored window")
+
 print("RESULT checks=\(total) failures=\(failures)")
 exit(failures == 0 ? 0 : 1)

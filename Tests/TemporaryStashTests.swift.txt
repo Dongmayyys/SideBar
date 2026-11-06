@@ -1,0 +1,211 @@
+var total = 0
+var failures = 0
+func expect(_ condition: Bool, _ name: String) {
+    total += 1
+    if !condition { failures += 1 }
+    print("\(condition ? "PASS" : "FAIL") \(name)")
+}
+func near(_ left: CGFloat, _ right: CGFloat) -> Bool { abs(left - right) < 0.001 }
+
+expect(TemporaryStashShortcutAction.resolve(isConfiguredApp: false, isManaged: false, isExpanded: false) == .stash, "new focused standard window stashes")
+expect(TemporaryStashShortcutAction.resolve(isConfiguredApp: false, isManaged: true, isExpanded: true) == .cancel, "focused expanded window cancels (also covers pinned expanded)")
+expect(TemporaryStashShortcutAction.resolve(isConfiguredApp: false, isManaged: true, isExpanded: false) == .ignore, "collapsed window cannot reveal by shortcut")
+expect(TemporaryStashShortcutAction.resolve(isConfiguredApp: true, isManaged: false, isExpanded: false) == .ignore, "configured app stays on its existing path")
+expect(TemporaryStashShortcutAction.resolve(isConfiguredApp: true, isManaged: true, isExpanded: true) == .cancel, "existing temporary window can cancel after settings enable the app")
+
+let leftScreen = CGRect(x: -1000, y: 0, width: 1000, height: 1000)
+let belowScreen = CGRect(x: 0, y: 1000, width: 1000, height: 800)
+let rightScreen = CGRect(x: 1000, y: 0, width: 1000, height: 1000)
+let leftWindow = CGRect(x: 10, y: 100, width: 300, height: 300)
+let layout = [mainScreen, leftScreen, belowScreen]
+expect(TemporaryStashGeometry.nearestEdge(window: leftWindow, screen: mainScreen, screens: [mainScreen]) == 1, "nearest left edge")
+expect(TemporaryStashGeometry.nearestEdge(window: leftWindow.offsetBy(dx: 680, dy: 0), screen: mainScreen, screens: [mainScreen]) == 2, "nearest right edge")
+expect(TemporaryStashGeometry.nearestEdge(window: leftWindow, screen: mainScreen, screens: layout) == 2, "three-screen main screen excludes left seam")
+expect(TemporaryStashGeometry.nearestEdge(window: leftWindow.offsetBy(dx: -400, dy: 0), screen: leftScreen, screens: layout) == 1, "three-screen left screen uses outer left edge")
+expect(TemporaryStashGeometry.nearestEdge(window: leftWindow.offsetBy(dx: 0, dy: 1000), screen: belowScreen, screens: layout) == 1, "lower screen left remains available")
+expect(TemporaryStashGeometry.nearestEdge(window: leftWindow.offsetBy(dx: 680, dy: 1000), screen: belowScreen, screens: layout) == 2, "lower screen right remains available")
+expect(TemporaryStashGeometry.nearestEdge(window: leftWindow, screen: mainScreen, screens: layout + [rightScreen]) == nil, "both seams blocked ignores shortcut")
+let sliver = CGRect(x: -1000, y: 999, width: 1000, height: 600)
+expect(TemporaryStashGeometry.hasAdjacentScreen(edge: 1, screen: mainScreen, screens: [mainScreen, sliver]), "one point vertical overlap blocks whole side")
+expect(!TemporaryStashGeometry.hasAdjacentScreen(edge: 1, screen: mainScreen, screens: [mainScreen, sliver.offsetBy(dx: 0, dy: 1)]), "corner-only contact does not block side")
+expect(!TemporaryStashGeometry.hasAdjacentScreen(edge: 1, screen: mainScreen, screens: [mainScreen, leftScreen.offsetBy(dx: -10, dy: 0)]), "real horizontal gap is not adjacency")
+
+let original = CGRect(x: -900, y: 100, width: 400, height: 300)
+let expanded = CGRect(x: 0, y: 150, width: 400, height: 300)
+expect(TemporaryStashGeometry.restorePosition(original: original, expanded: expanded, screens: layout) == original.origin, "cancel and quit restore original on any connected screen")
+expect(TemporaryStashGeometry.restorePosition(original: original, expanded: expanded, screens: [mainScreen]) == expanded.origin, "disconnected original screen keeps expanded position")
+expect(TemporaryStashGeometry.restorePosition(original: original.offsetBy(dx: 850, dy: 0), expanded: expanded, screens: [mainScreen]).x == -50, "partially visible original position remains valid")
+
+let isolated = TemporaryStashGeometry.labelFrames(centers: [100, 500, 900], edge: 1, visibleFrame: mainScreen)
+expect(zip(isolated, [CGFloat(100), 500, 900]).allSatisfy { near($0.midY, $1) }, "non-overlapping labels keep exact window centers")
+expect(isolated.allSatisfy { $0.minX == 0 && $0.width == 24 && $0.height == 120 }, "fixed label dimensions at left edge")
+let pair = TemporaryStashGeometry.labelFrames(centers: [100, 500, 540, 900], edge: 2, visibleFrame: mainScreen)
+expect(near(pair[1].midY, 460) && near(pair[2].midY, 580), "overlapping neighbors each move half the overlap")
+expect(pair[0].midY == 100 && pair[3].midY == 900, "unrelated labels do not move")
+expect(pair.allSatisfy { $0.maxX == 1000 }, "right labels align to right edge")
+let chain = TemporaryStashGeometry.labelFrames(centers: [300, 320, 330], edge: 1, visibleFrame: mainScreen)
+expect(near(chain[1].midY - chain[0].midY, 120) && near(chain[2].midY - chain[1].midY, 120), "chain collisions settle without overlap and preserve order")
+expect(near(chain.reduce(0) { $0 + $1.midY }, 950), "collision resolution preserves cluster center")
+expect(TemporaryStashGeometry.labelFrames(centers: [], edge: 1, visibleFrame: mainScreen).isEmpty, "empty edge has no labels")
+let shifted = TemporaryStashGeometry.labelFrames(centers: [-500, -400], edge: 1, visibleFrame: mainScreen.offsetBy(dx: -1000, dy: -1000))
+expect(shifted.allSatisfy { $0.minX == -1000 } && shifted[0].maxY <= shifted[1].minY, "negative multi-screen coordinates")
+// Deterministic spread of dense layouts: order, no overlap, untouched distant label.
+for count in 2...12 {
+    let centers = (0..<count).map { CGFloat($0 * $0 * 7 + 200) }
+    let frames = TemporaryStashGeometry.labelFrames(centers: centers, edge: 1, visibleFrame: mainScreen)
+    expect(zip(frames, frames.dropFirst()).allSatisfy { $0.maxY <= $1.minY + 0.001 }, "dense layout order and non-overlap count=\(count)")
+}
+
+let usable = CGRect(x: 60, y: 50, width: 900, height: 900)
+let topLabel = TemporaryStashGeometry.labelFrames(centers: [995], edge: 2, visibleFrame: usable)
+expect(topLabel[0].maxY == usable.maxY && topLabel[0].maxX == usable.maxX && usable.contains(topLabel[0]),
+       "top label stays below menu bar and inside horizontal usable edge")
+let bottomLabel = TemporaryStashGeometry.labelFrames(centers: [5], edge: 1, visibleFrame: usable)
+expect(bottomLabel[0].minY == usable.minY && bottomLabel[0].minX == usable.minX && usable.contains(bottomLabel[0]),
+       "bottom label stays above Dock and inside horizontal usable edge")
+let topConflict = TemporaryStashGeometry.labelFrames(centers: [300, 940, 970], edge: 2, visibleFrame: usable)
+expect(topConflict.allSatisfy { usable.contains($0) } && topConflict[1].maxY == topConflict[2].minY
+       && topConflict[2].maxY == usable.maxY && topConflict[0].midY == 300,
+       "top collision stays in usable region without moving unrelated label")
+let bottomConflict = TemporaryStashGeometry.labelFrames(centers: [5, 30, 700], edge: 1, visibleFrame: usable)
+expect(bottomConflict.allSatisfy { usable.contains($0) } && bottomConflict[0].maxY == bottomConflict[1].minY
+       && bottomConflict[0].minY == usable.minY && bottomConflict[2].midY == 700,
+       "bottom collision stays in usable region without moving unrelated label")
+let full = TemporaryStashGeometry.labelFrames(centers: [-100, 800, 2000], edge: 1,
+                                             visibleFrame: CGRect(x: -900, y: -500, width: 900, height: 360))
+expect(full.map(\.minY) == [-500, -380, -260], "exact capacity maintains order and fills negative-coordinate usable region")
+
+var ordinals = TemporaryStashOrdinals()
+expect(ordinals.assign(bundleID: "a", windowID: "1") == 1, "first window has unnumbered name")
+expect(ordinals.assign(bundleID: "a", windowID: "2") == 2, "same app second window gets two")
+expect(ordinals.assign(bundleID: "b", windowID: "3") == 1, "different app numbering is independent")
+ordinals.release(bundleID: "a", windowID: "1")
+expect(ordinals.hasMembers(bundleID: "a"), "bundle exclusion remains while sibling windows are stashed")
+expect(ordinals.assign(bundleID: "a", windowID: "2") == 2, "survivor keeps ordinal after first cancels")
+expect(ordinals.assign(bundleID: "a", windowID: "4") == 3, "new window does not reuse cancelled ordinal")
+expect(TemporaryStashOrdinals.title(appName: "滴答", ordinal: 1) == "滴答" && TemporaryStashOrdinals.title(appName: "滴答", ordinal: 2) == "滴答 2", "label contains app name and stable suffix only")
+ordinals.release(bundleID: "a", windowID: "2")
+ordinals.release(bundleID: "a", windowID: "4")
+expect(!ordinals.hasMembers(bundleID: "a"), "bundle exclusion ends only after last window leaves")
+expect(ordinals.assign(bundleID: "a", windowID: "5") == 1, "after all leave a fresh round begins")
+
+let coordinator = TemporaryStashTabCoordinator()
+let a = WindowSession("a", center: 200)
+let b = WindowSession("b", center: 500)
+let c = WindowSession("c", center: 800, edge: 2)
+let configured = WindowSession("configured")
+configured.isManagedByTemporaryShortcut = false
+var sessions = [a, b, c, configured]
+func reconcile(at point: CGPoint, elapsed: Double = 0.3) {
+    NSEvent.mouseLocation = point
+    coordinator.reconcile(sessions: sessions)
+    Clock.now += elapsed
+    coordinator.reconcile(sessions: sessions)
+}
+coordinator.reconcile(sessions: sessions)
+expect(TemporaryStashTabWindow.live.count == 3 && TemporaryStashTabWindow.live["configured"] == nil, "three independent labels; configured app excluded")
+reconcile(at: CGPoint(x: 10, y: 200), elapsed: 0.1)
+expect(!a.isExpandedForCoordination, "hover waits for default delay")
+Clock.now += 0.1
+coordinator.reconcile(sessions: sessions)
+expect(a.isExpandedForCoordination && !b.isExpandedForCoordination && a.hoverLock, "only hovered label reveals and holds its window")
+transitions.removeAll()
+reconcile(at: CGPoint(x: 10, y: 500))
+expect(transitions == ["hide:a", "reveal:b"] && !a.isExpandedForCoordination, "same-edge switch hides previous before revealing next")
+expect(!a.hoverLock && b.hoverLock, "only current label holds collapse tracking")
+reconcile(at: CGPoint(x: 990, y: 800))
+expect(b.isExpandedForCoordination && c.isExpandedForCoordination, "different edges are independent")
+a.isExpandedForCoordination = true
+a.isPinned = true
+reconcile(at: CGPoint(x: 10, y: 200))
+expect(!b.isExpandedForCoordination, "hovering already-expanded pinned label still hides unpinned sibling")
+reconcile(at: CGPoint(x: 10, y: 500))
+expect(a.isExpandedForCoordination && b.isExpandedForCoordination, "pinned sibling stays expanded")
+reconcile(at: CGPoint(x: 500, y: 500))
+expect(!a.hoverLock && !b.hoverLock && !c.hoverLock, "pointer outside labels releases all hover locks")
+a.isPinned = false
+a.isExpandedForCoordination = false
+b.isExpandedForCoordination = false
+transitions.removeAll()
+reconcile(at: CGPoint(x: 10, y: 350))
+expect(transitions.isEmpty, "edge gap never expands a window")
+reconcile(at: CGPoint(x: 25, y: 200))
+expect(transitions.isEmpty, "one point outside label width never expands")
+reconcile(at: CGPoint(x: 10, y: 261))
+expect(transitions.isEmpty, "one point outside label height never expands")
+
+b.isExpandedForCoordination = true
+b.canHide = false
+reconcile(at: CGPoint(x: 10, y: 200))
+expect(!a.isExpandedForCoordination, "failed previous hide defers next reveal")
+b.canHide = true
+coordinator.reconcile(sessions: sessions)
+expect(a.isExpandedForCoordination && !b.isExpandedForCoordination, "next poll retries transition after AX recovery")
+sessions.removeAll { $0 === a }
+coordinator.reconcile(sessions: sessions)
+expect(TemporaryStashTabWindow.live["a"] == nil && TemporaryStashTabWindow.live["b"] != nil, "close/cancel removes only corresponding label")
+b.eligible = false
+coordinator.reconcile(sessions: sessions)
+expect(TemporaryStashTabWindow.live["b"] == nil, "window on other Space has no active label")
+coordinator.tearDownAll()
+expect(TemporaryStashTabWindow.live.isEmpty, "quit/Space reset removes every panel")
+let boundedCoordinator = TemporaryStashTabCoordinator()
+let bounded = WindowSession("bounded", center: 995)
+bounded.visibleFrame = usable
+boundedCoordinator.reconcile(sessions: [bounded])
+expect(TemporaryStashTabWindow.live["bounded"].map { usable.contains($0) && $0.minX == usable.minX } == true,
+       "coordinator passes descriptor visibleFrame rather than full screen bounds into layout")
+boundedCoordinator.tearDownAll()
+
+// Application activation uses the same hide-before-reveal path, without a hover delay.
+let activationCoordinator = TemporaryStashTabCoordinator()
+let active1 = WindowSession("active1", center: 200)
+let active2 = WindowSession("active2", center: 500)
+let pinned = WindowSession("pinned", center: 800)
+let otherEdge = WindowSession("otherEdge", center: 500, edge: 2)
+let activationSessions = [active1, active2, pinned, otherEdge]
+NSEvent.mouseLocation = CGPoint(x: 500, y: 400)
+active1.isExpandedForCoordination = true
+active2.activationFocused = true
+pinned.isExpandedForCoordination = true
+pinned.isPinned = true
+otherEdge.isExpandedForCoordination = true
+transitions.removeAll()
+activationCoordinator.handleAppActivation(activatedPID: 123, sessions: activationSessions)
+expect(transitions == ["hide:active1", "reveal:active2"] && active2.isExpandedForCoordination,
+       "application activation reveals focused stashed window after hiding same-edge unpinned window")
+expect(active2.appActivationReveal, "application activation uses existing Dock interaction wait mode")
+expect(pinned.isExpandedForCoordination && otherEdge.isExpandedForCoordination,
+       "application activation leaves pinned and other-edge windows expanded")
+expect(TemporaryStashTabWindow.live.count == 4, "all other labels remain present inside expanded window range")
+active2.isExpandedForCoordination = false
+active2.activationFocused = false
+transitions.removeAll()
+activationCoordinator.handleAppActivation(activatedPID: 123, sessions: activationSessions)
+expect(transitions.isEmpty, "non-stashed focused window does not reveal other windows of app")
+active2.activationFocused = true
+active2.programmaticActivation = true
+activationCoordinator.handleAppActivation(activatedPID: 123, sessions: activationSessions)
+expect(transitions.isEmpty, "programmatic activation cannot reenter reveal")
+active2.programmaticActivation = false
+active1.isExpandedForCoordination = true
+active1.canHide = false
+activationCoordinator.handleAppActivation(activatedPID: 123, sessions: activationSessions)
+expect(!active2.isExpandedForCoordination, "activation waits for previous hide to succeed")
+active1.canHide = true
+activationCoordinator.reconcile(sessions: activationSessions)
+expect(!active1.isExpandedForCoordination && active2.isExpandedForCoordination,
+       "activation retries failed hide using existing reconcile timer")
+active2.isExpandedForCoordination = false
+active1.isExpandedForCoordination = true
+active1.canHide = false
+activationCoordinator.handleAppActivation(activatedPID: 123, sessions: activationSessions)
+active2.activationFocused = false
+active1.canHide = true
+activationCoordinator.reconcile(sessions: activationSessions)
+expect(!active2.isExpandedForCoordination && active1.isExpandedForCoordination,
+       "pending activation is discarded when focus changes")
+activationCoordinator.tearDownAll()
+
+print("RESULT checks=\(total) failures=\(failures)")
+exit(failures == 0 ? 0 : 1)

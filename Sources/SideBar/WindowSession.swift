@@ -408,6 +408,8 @@ class WindowSession {
             )
         }
 
+        if isTemporaryShortcutManaged { temporaryLastExpandedFrame = getRawWindowFrame() }
+
         // 降级到 floating：清空 snappedScreen/snappedDisplayBounds 等锁定状态，
         // 让用户重新拖拽窗口靠近边缘即可重新吸附。
         transitionToFloatingFromManagedState(
@@ -552,6 +554,10 @@ class WindowSession {
     private static let mouseCacheQuantum: CGFloat = 3
 
     private var isTemporaryShortcutManaged = false
+    private var temporaryOriginalFrame: CGRect?
+    private var temporaryLastExpandedFrame: CGRect?
+    let temporaryStashID = UUID().uuidString
+    var temporaryStashOrdinal = 1
     private var isTemporarilyPinned = false
     /// 置顶能力是否处于激活状态：源窗口被钉住后，面板显示实时采集画面。
     private var isMirrorPinActive = false
@@ -636,11 +642,12 @@ class WindowSession {
     }
     var isManagedForCoordination: Bool { !isFloatingForCoordination }
     
-    init(appElement: AXUIElement, windowElement: AXUIElement, pid: pid_t, bundleID: String) {
+    init(appElement: AXUIElement, windowElement: AXUIElement, pid: pid_t, bundleID: String, temporaryShortcut: Bool = false) {
         self.appElement = appElement
         self.windowElement = windowElement
         self.pid = pid
         self.bundleID = bundleID
+        self.isTemporaryShortcutManaged = temporaryShortcut
         if let runningApp = NSRunningApplication(processIdentifier: pid) {
             self.appDisplayName = runningApp.localizedName ?? bundleID
             if let bundleURL = runningApp.bundleURL {
@@ -678,7 +685,7 @@ class WindowSession {
         NotificationCenter.default.addObserver(self, selector: #selector(handleConfigChanged), name: NSNotification.Name("AppConfigDidChange"), object: nil)
         
         // 核心修复：自动收编遗留在边缘的应用窗口
-        checkAndAdoptEdgeState()
+        if !temporaryShortcut { checkAndAdoptEdgeState() }
         Self.register(self)
 
         // [Watchdog] 启动状态自愈定时器：唯一的两件事——
@@ -732,6 +739,9 @@ class WindowSession {
 
     @discardableResult
     func relinquishToDockMinimizeIfDetachedFromEdge() -> Bool {
+        // 快捷键窗口只在真实拖动结束时判定取消，不把应用自己的布局调整当作拖离。
+        // 同时不让拖动中的 AX 回调触发软件级控制权转移。
+        if isTemporaryShortcutManaged { return false }
         guard !isAnimating else {
             // 动画过程中 frame 一定会临时偏离最终锚点，禁止任何脱离判定，
             // 也清空候选时间戳，避免动画结束的瞬间被误判为"持续脱离"。
@@ -793,7 +803,7 @@ class WindowSession {
     private func finishTemporaryShortcutSession(excludeWindow: Bool, removeSession: Bool) {
         guard isTemporaryShortcutManaged else { return }
         isTemporaryShortcutManaged = false
-        AppConfig.shared.setTemporaryDockMinimizeExclusion(bundleID: bundleID, excluded: false)
+        // bundle 级排除由 manager 按剩余快捷键窗口计数维护。
         onTemporaryShortcutStashStateChanged?(self, false)
         onTemporaryShortcutSessionEnded?(self, excludeWindow, removeSession)
     }
@@ -1002,7 +1012,7 @@ class WindowSession {
     }
 
     private func refreshIndicatorVisibility() {
-        if isIndicatorSuppressed {
+        if isIndicatorSuppressed || isTemporaryShortcutManaged {
             indicatorWindow.orderOut(nil)
             updatePinControlWindow()
             return
@@ -1544,6 +1554,8 @@ class WindowSession {
             }
             return
         }
+        // 快捷键窗口的激活展开由 manager 统一交给标签协调器，避免逐会话展开同软件窗口。
+        if isTemporaryShortcutManaged { return }
         if app.processIdentifier == self.pid {
             if Self.shouldIgnoreProgrammaticActivation(for: self.pid) {
                 print("📱 忽略: 程序内部触发的激活，不展开窗口")
@@ -1761,6 +1773,7 @@ class WindowSession {
         windowAnimator.stop()
         effectWindow.stopExpandEffect(closeWindow: true, immediate: true)
 
+        let pinReleaseGeneration = animationGenerationToken
         animateWindowPositionFast(
             from: rawFrame.minX,
             to: targetFrame.minX,
@@ -1769,7 +1782,7 @@ class WindowSession {
             duration: 0.16,
             easeIn: false
         ) { [weak self] in
-            guard let self else { return }
+            guard let self, self.animationGenerationToken == pinReleaseGeneration else { return }
             self.forceWindowGeometry(x: targetFrame.minX, y: targetFrame.minY, height: targetFrame.height)
             self.isAnimating = false
             self.pinnedAnchor = nil
@@ -1831,6 +1844,7 @@ class WindowSession {
         mouseTrackingTimer?.invalidate()
         windowAnimator.stop()
 
+        let pinReleaseGeneration = animationGenerationToken
         animateWindowPositionFast(
             from: rawFrame.minX,
             to: targetFrame.minX,
@@ -1839,7 +1853,7 @@ class WindowSession {
             duration: 0.16,
             easeIn: false
         ) { [weak self] in
-            guard let self else { return }
+            guard let self, self.animationGenerationToken == pinReleaseGeneration else { return }
             self.forceWindowGeometry(x: targetFrame.minX, y: targetFrame.minY, height: targetFrame.height)
             self.isAnimating = false
             self.pinnedAnchor = nil
@@ -3044,6 +3058,11 @@ class WindowSession {
     }
 
     func restoreAndDestroy() {
+        if isTemporaryShortcutManaged {
+            restoreTemporaryShortcutWindow(excludeWindow: false)
+            destroy()
+            return
+        }
         finishTemporaryShortcutSession(excludeWindow: false, removeSession: true)
         isTemporarilyPinned = false
         isMirrorPinActive = false
@@ -3086,6 +3105,7 @@ class WindowSession {
             return
         }
         Self.unregister(self)
+        animationGenerationToken &+= 1
         NSWorkspace.shared.notificationCenter.removeObserver(self)
         if let source = observerRunLoopSource {
             CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .defaultMode)
@@ -3353,11 +3373,14 @@ class WindowSession {
         notifyOwnerChange: Bool = true,
         restoreVisiblePositionIfNeeded: Bool = false
     ) {
+        if isTemporaryShortcutManaged {
+            cancelTemporaryShortcutStash()
+            return
+        }
         guard case .floating = state else {
             let previousState = state
             invalidatePendingFocusRelease()
             queuedForwardedHotkeyToggle = false
-            let shouldEndTemporaryShortcutSession = isTemporaryShortcutManaged
             let currentFrame = getWindowFrame() ?? CGRect(x: 100, y: 100, width: 400, height: 400)
             state = .floating
             if notifyOwnerChange {
@@ -3392,18 +3415,6 @@ class WindowSession {
                     }
                 } else {
                     clearTrackedWindowRecoveryState(frameHint: currentFrame)
-                }
-            }
-            if shouldEndTemporaryShortcutSession {
-                let shouldKeepConfiguredSession = AppConfig.shared.isAppEnabled(bundleID: bundleID)
-                finishTemporaryShortcutSession(
-                    excludeWindow: !shouldKeepConfiguredSession,
-                    removeSession: !shouldKeepConfiguredSession
-                )
-                if !shouldKeepConfiguredSession {
-                    DispatchQueue.main.async { [weak self] in
-                        self?.restoreAndDestroy()
-                    }
                 }
             }
             return
@@ -3821,6 +3832,10 @@ class WindowSession {
     private func handleMiniaturized() {
         if case .floating = state { return }
         print("🗕 窗口被最小化，解除边栏")
+        if isTemporaryShortcutManaged {
+            cancelTemporaryShortcutStash()
+            return
+        }
         finishTemporaryShortcutSession(excludeWindow: false, removeSession: true)
         isTemporarilyPinned = false
         isMirrorPinActive = false
@@ -3838,6 +3853,12 @@ class WindowSession {
     
     private func handleDestroyed() {
         print("❌ 窗口被关闭，销毁 SideBar Session")
+        if isTemporaryShortcutManaged {
+            state = .floating
+            finishTemporaryShortcutSession(excludeWindow: false, removeSession: true)
+            destroy()
+            return
+        }
         finishTemporaryShortcutSession(excludeWindow: false, removeSession: true)
         restoreAndDestroy()
     }
@@ -3871,41 +3892,135 @@ class WindowSession {
         }
     }
 
-    func enableTemporaryShortcutManagement() {
-        if !isTemporaryShortcutManaged {
-            AppConfig.shared.setTemporaryDockMinimizeExclusion(bundleID: bundleID, excluded: true)
-        }
-        isTemporaryShortcutManaged = true
+    @discardableResult
+    func startTemporaryShortcutStash() -> Bool {
+        guard isTemporaryShortcutManaged, let frame = getRawWindowFrame() else { return false }
+        let bounds = detectDisplayBounds()
+        guard let edge = TemporaryStashGeometry.nearestEdge(window: frame, screen: bounds,
+                                                           screens: NSScreen.screens.map { cgBounds(for: $0) }) else { return false }
+        temporaryOriginalFrame = frame
+        lockedWidth = frame.width
+        initialFrameCaptured = true
+        lockCurrentScreen()
+        currentEdge = edge
+        temporaryLastExpandedFrame = CGRect(x: edge == 1 ? bounds.minX : bounds.maxX - frame.width,
+                                            y: frame.minY, width: frame.width, height: frame.height)
+        guard collapseWindow(immediate: true, triggerEffects: false) else { return false }
+        scheduleFocusRelease(after: 0.5)
+        return true
     }
 
-    func toggleTemporaryShortcutStash() {
-        if isTemporarilyPinned {
-            releaseTemporaryPin()
-            return
-        }
-
-        switch state {
-        case .floating:
-            guard let frame = getWindowFrame() else { return }
-            let displayBounds = detectDisplayBounds()
-            let candidateEdges = [1, 2].filter {
-                !hasAdjacentScreen(at: $0, bounds: displayBounds) && isSnapAllowed(for: $0)
-            }
-
-            let targetEdge = candidateEdges.min { lhs, rhs in
-                distanceToEdge(lhs, frame: frame, displayBounds: displayBounds) < distanceToEdge(rhs, frame: frame, displayBounds: displayBounds)
-            }
-
-            guard let targetEdge else { return }
-            lockedWidth = frame.width
-            initialFrameCaptured = true
-            lockCurrentScreen()
-            snapToEdge(edgeConfig: targetEdge, frame: frame, displayBounds: displayBounds)
-        case .snapped, .expanded:
-            toggleExpandCollapse()
-        }
+    func cancelTemporaryShortcutStash(keepingFrame: CGRect? = nil) {
+        guard isTemporaryShortcutManaged else { return }
+        restoreTemporaryShortcutWindow(excludeWindow: true, keepingFrame: keepingFrame)
+        destroy()
     }
-    
+
+    private func restoreTemporaryShortcutWindow(excludeWindow: Bool, keepingFrame: CGRect? = nil) {
+        // 先终止所有位置写入，再恢复。防止退出后仍有动画/焦点回调把窗口拉回边缘。
+        invalidatePendingFocusRelease()
+        queuedForwardedHotkeyToggle = false
+        windowAnimator.stop()
+        animationGenerationToken &+= 1
+        isAnimating = false
+        mouseTrackingTimer?.invalidate()
+        hoverDelayTimer?.invalidate()
+        hoverInterruptTimer?.invalidate()
+        stopPinnedRaisePulse()
+        isTemporarilyPinned = false
+        isMirrorPinActive = false
+        pinnedAnchor = nil
+        teardownMirrorCapture()
+        effectWindow.stopExpandEffect(closeWindow: true, immediate: true)
+        let current = keepingFrame ?? getRawWindowFrame() ?? temporaryLastExpandedFrame ?? temporaryOriginalFrame
+        if let current {
+            setWindowAlpha(1, isHidden: false, frameHint: current, preserveRecoveryRecord: true)
+            if keepingFrame != nil {
+                // 拖离取消时不再写位置，保留用户松手后的几何。
+                clearTrackedWindowRecoveryState(frameHint: current)
+            } else {
+                let expanded = temporaryLastExpandedFrame
+                    ?? CGRect(origin: edgeGeometry(for: current)?.expanded ?? current.origin, size: current.size)
+                let position = temporaryOriginalFrame.map {
+                    TemporaryStashGeometry.restorePosition(original: $0, expanded: expanded,
+                                                           screens: NSScreen.screens.map { cgBounds(for: $0) })
+                } ?? current.origin
+                // 短暂 cannotComplete 重试一次；失败时保留已有救援记录。
+                var result = axSetPositionAttribute(on: windowElement, position: position,
+                                                    context: "WindowSession.restoreTemporaryShortcutWindow.position")
+                if result == .cannotComplete {
+                    result = axSetPositionAttribute(on: windowElement, position: position,
+                                                     context: "WindowSession.restoreTemporaryShortcutWindow.retry")
+                }
+                if result == .success { clearTrackedWindowRecoveryState(frameHint: current) }
+            }
+        }
+        state = .floating
+        indicatorWindow.orderOut(nil)
+        pinControlWindow.orderOut(nil)
+        fusionHoverLock = false
+        unlockScreen()
+        temporaryOriginalFrame = nil
+        temporaryLastExpandedFrame = nil
+        finishTemporaryShortcutSession(excludeWindow: excludeWindow, removeSession: true)
+    }
+
+    func temporaryStashTabDescriptor() -> TemporaryStashTabDescriptor? {
+        guard isTemporaryShortcutManaged, !isFloatingForCoordination else { return nil }
+        let screen = getScreenForWindow()
+        guard !isInFullscreenSpace(screen: screen), isWindowOnScreen(),
+              let frame = getRawWindowFrame() ?? temporaryLastExpandedFrame else { return nil }
+        if isExpandedForCoordination && !isAnimating { temporaryLastExpandedFrame = frame }
+        return TemporaryStashTabDescriptor(session: self, edge: currentEdge, screenFrame: screen.frame,
+                                           visibleFrame: screen.visibleFrame,
+                                           centerY: primaryScreenHeight - frame.midY,
+                                           title: TemporaryStashOrdinals.title(appName: appDisplayName, ordinal: temporaryStashOrdinal))
+    }
+
+    func canRevealForTemporaryAppActivation(activatedPID: pid_t) -> Bool {
+        guard isTemporaryShortcutManaged, isSnappedForCoordination,
+              activatedPID == pid, NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else { return false }
+        Self.cleanupRegistry()
+        // SideBar 自己定向展开/归还焦点时不重新选择同软件窗口。
+        guard Self.targetedActivationByPID[pid] == nil,
+              !Self.shouldIgnoreProgrammaticActivation(for: pid),
+              Date() >= activationSuppressionUntil else { return false }
+        // focused 优先；只有没有 focused 时才回退 main，不能展开另一个主窗口。
+        if let focused = focusedWindowOfApp() { return CFEqual(focused, windowElement) }
+        return isMainWindowOfApp()
+    }
+
+    @discardableResult
+    func hideForTemporaryStashTab() -> Bool {
+        guard isTemporaryShortcutManaged else { return false }
+        if isTemporarilyPinned { return true }
+        if !isExpandedForCoordination { return !isAnimating }
+        return collapseWindow(immediate: true, triggerEffects: false)
+    }
+
+    func revealForTemporaryStashTab(isAppActivated: Bool = false) {
+        guard isTemporaryShortcutManaged, !isAnimating, isSnappedForCoordination,
+              let frame = getRawWindowFrame(), let geometry = edgeGeometry(for: frame) else { return }
+        invalidatePendingFocusRelease()
+        rememberFocusReturnTargetBeforeReveal()
+        beginTargetedActivationWindow(for: 0.35)
+        // ⌘Tab/Dock 激活时鼠标可能仍在窗外，沿用原 Dock 等待首次交互的门禁。
+        pendingDockInteraction = isAppActivated
+        hasReleasedDockClick = NSEvent.pressedMouseButtons & 1 == 0
+        state = .expanded
+        // 切换标签时使用同步几何，保证前一个已收回后再显示目标，且无延迟回调复活会话。
+        setWindowPosition(position: geometry.expanded)
+        temporaryLastExpandedFrame = CGRect(origin: geometry.expanded, size: frame.size)
+        setWindowAlpha(1, isHidden: false, frameHint: temporaryLastExpandedFrame)
+        NSRunningApplication(processIdentifier: pid)?.activate(options: .activateIgnoringOtherApps)
+        axSetBoolAttribute(on: windowElement, attribute: kAXMainAttribute as CFString, value: true,
+                           context: "WindowSession.revealForTemporaryStashTab.main")
+        axSetBoolAttribute(on: windowElement, attribute: kAXFocusedAttribute as CFString, value: true,
+                           context: "WindowSession.revealForTemporaryStashTab.focused")
+        startMouseTrackingTimer()
+        updatePinControlWindow()
+    }
+
     func handleMouseUp() {
         let wasDragging = isDragging
         isDragging = false
@@ -3918,6 +4033,16 @@ class WindowSession {
         let maxX = displayBounds.maxX
         
         if !wasDragging { return }
+        if isTemporaryShortcutManaged {
+            // 拖动只更新这个窗口；拖离后取消收纳，不重新选择边缘或联动同软件窗口。
+            if isDetachedFromManagedEdge(frame) {
+                cancelTemporaryShortcutStash(keepingFrame: frame)
+            } else {
+                temporaryLastExpandedFrame = frame
+                showIndicator(animated: false)
+            }
+            return
+        }
         if isTemporarilyPinned {
             if let rawFrame = getRawWindowFrame(), abs(rawFrame.width - lockedWidth) > 1 {
                 lockedWidth = rawFrame.width
@@ -3985,17 +4110,6 @@ class WindowSession {
         }
     }
 
-    private func distanceToEdge(_ edge: Int, frame: CGRect, displayBounds: CGRect) -> CGFloat {
-        switch edge {
-        case 1:
-            return abs(frame.minX - displayBounds.minX)
-        case 2:
-            return abs(displayBounds.maxX - frame.maxX)
-        default:
-            return .greatestFiniteMagnitude
-        }
-    }
-
     private func edgePriority(_ edge: Int) -> Int {
         switch edge {
         case 2:
@@ -4008,7 +4122,7 @@ class WindowSession {
     }
 
     private func collapsedWindowAlpha() -> Float {
-        0.01
+        isTemporaryShortcutManaged ? 0 : 0.01
     }
     
     /// 判断给定的 CG bounds 是否与当前任何一块 live NSScreen 匹配。
@@ -4178,6 +4292,7 @@ class WindowSession {
             return true
         }
         
+        let collapseGeneration = animationGenerationToken
         animateWindowPositionFast(
             from: currentFrame.minX,
             to: geometry.visualHidden.x,
@@ -4187,10 +4302,12 @@ class WindowSession {
             easeIn: true
         ) { [weak self] in
             guard let self = self else { return }
+            guard self.animationGenerationToken == collapseGeneration else { return }
             
             self.setWindowAlpha(CGFloat(self.collapsedWindowAlpha()), isHidden: true, frameHint: currentFrame)
             
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                guard self.animationGenerationToken == collapseGeneration else { return }
                 self.setWindowPosition(position: geometry.visualHidden)
                 
                 self.isAnimating = false
@@ -4372,7 +4489,7 @@ class WindowSession {
     }
     
     private func showIndicator(animated: Bool = false) {
-        if isIndicatorSuppressed {
+        if isIndicatorSuppressed || isTemporaryShortcutManaged {
             indicatorWindow.orderOut(nil)
             updatePinControlWindow()
             return
@@ -4512,7 +4629,7 @@ class WindowSession {
         // 鼠标还在窗口内（isOutside=false）时，`!isOutside` 已经导致早退，
         // 任何 sibling 值都不会改变结果。因此直接跳过枚举，把 10Hz × N 的
         // CGWindowList 全量扫描消掉，显著降低 mouseTrackingTimer 的基线 CPU。
-        let shouldQuerySiblingState = !hasOtherForegroundApp && isOutside && !bypassSiblingGrace
+        let shouldQuerySiblingState = !isTemporaryShortcutManaged && !hasOtherForegroundApp && isOutside && !bypassSiblingGrace
         let rawIsInsideSiblingWindow = shouldQuerySiblingState
             ? isMouseInsideAnyVisibleSiblingWindow(mappedMouseLoc)
             : false

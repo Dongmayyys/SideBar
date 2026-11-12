@@ -66,12 +66,6 @@ enum DockAvoidanceMode: String, CaseIterable {
     case bottom
 }
 
-enum UpdateCheckFrequency: Int, CaseIterable {
-    case never = 0
-    case everyLaunch = 1
-    case weekly = 2
-}
-
 class AppConfig: ObservableObject {
     static let shared = AppConfig()
     static let defaultHoverTolerance: CGFloat = 0
@@ -102,8 +96,6 @@ class AppConfig: ObservableObject {
     private let mainInterfaceShortcutKeyCodeKey = "SideBarMainInterfaceShortcutKeyCode"
     private let mainInterfaceShortcutConfiguredKey = "SideBarMainInterfaceShortcutConfigured"
     private let dockAvoidanceModeKey = "SideBarDockAvoidanceMode"
-    private let updateCheckFrequencyKey = "SideBarUpdateCheckFrequency"
-    private let lastSuccessfulUpdateCheckAtKey = "SideBarLastSuccessfulUpdateCheckAt"
     
     // 格式: "PID:WindowID"
     @Published var hiddenWindowRecords: [String] = [] {
@@ -147,7 +139,7 @@ class AppConfig: ObservableObject {
     }
     
     /// 防误触缓冲（悬停延时）默认值（毫秒）
-    static let defaultHoverDelayMS: Int = 200
+    static let defaultHoverDelayMS: Int = 100
 
     @Published var hoverDelayMS: Int = AppConfig.defaultHoverDelayMS {
         didSet {
@@ -266,19 +258,6 @@ class AppConfig: ObservableObject {
         }
     }
 
-    @Published var updateCheckFrequencyRawValue: Int = UpdateCheckFrequency.weekly.rawValue {
-        didSet {
-            let normalized = UpdateCheckFrequency(rawValue: updateCheckFrequencyRawValue)?.rawValue ?? UpdateCheckFrequency.weekly.rawValue
-            if updateCheckFrequencyRawValue != normalized {
-                updateCheckFrequencyRawValue = normalized
-                return
-            }
-            UserDefaults.standard.set(normalized, forKey: updateCheckFrequencyKey)
-        }
-    }
-
-    private var lastSuccessfulUpdateCheckAt: TimeInterval = 0
-    
     private init() {
         self.hiddenWindowRecords = UserDefaults.standard.stringArray(forKey: snapRecordsKey) ?? []
         if let data = UserDefaults.standard.data(forKey: rescueRecordsKey),
@@ -298,7 +277,7 @@ class AppConfig: ObservableObject {
             : Self.defaultHoverTolerance
         
         // 注意：UserDefaults.integer 在键不存在时会返回 0，因此用 object(forKey:) 区分
-        // 「未配置」与「显式配置为 0」两种情况，前者使用默认值 200ms。
+        // 「未配置」与「显式配置为 0」两种情况，前者使用默认值。
         if UserDefaults.standard.object(forKey: "SideBarHoverDelayMS") != nil {
             self.hoverDelayMS = UserDefaults.standard.integer(forKey: "SideBarHoverDelayMS")
         } else {
@@ -387,16 +366,6 @@ class AppConfig: ObservableObject {
             UserDefaults.standard.set(DockAvoidanceMode.automatic.rawValue, forKey: dockAvoidanceModeKey)
         }
 
-        if let savedFrequency = UpdateCheckFrequency(rawValue: UserDefaults.standard.integer(forKey: updateCheckFrequencyKey)),
-           UserDefaults.standard.object(forKey: updateCheckFrequencyKey) != nil {
-            self.updateCheckFrequencyRawValue = savedFrequency.rawValue
-        } else {
-            self.updateCheckFrequencyRawValue = UpdateCheckFrequency.weekly.rawValue
-            UserDefaults.standard.set(UpdateCheckFrequency.weekly.rawValue, forKey: updateCheckFrequencyKey)
-        }
-
-        self.lastSuccessfulUpdateCheckAt = UserDefaults.standard.double(forKey: lastSuccessfulUpdateCheckAtKey)
-        
         if let data = UserDefaults.standard.data(forKey: defaultsKey),
            let savedDict = try? JSONDecoder().decode([String: AppSettings].self, from: data) {
             self.appSettings = savedDict.mapValues { setting in
@@ -536,32 +505,6 @@ class AppConfig: ObservableObject {
 
     func setDockAvoidanceMode(_ mode: DockAvoidanceMode) {
         dockAvoidanceModeRawValue = mode.rawValue
-    }
-
-    var updateCheckFrequency: UpdateCheckFrequency {
-        UpdateCheckFrequency(rawValue: updateCheckFrequencyRawValue) ?? .weekly
-    }
-
-    func setUpdateCheckFrequency(_ frequency: UpdateCheckFrequency) {
-        updateCheckFrequencyRawValue = frequency.rawValue
-    }
-
-    func shouldRunAutomaticUpdateCheck(now: Date = Date()) -> Bool {
-        switch updateCheckFrequency {
-        case .never:
-            return false
-        case .everyLaunch:
-            return true
-        case .weekly:
-            guard lastSuccessfulUpdateCheckAt > 0 else { return true }
-            let elapsed = now.timeIntervalSince1970 - lastSuccessfulUpdateCheckAt
-            return elapsed >= 7 * 24 * 60 * 60
-        }
-    }
-
-    func markSuccessfulUpdateCheck(at date: Date = Date()) {
-        lastSuccessfulUpdateCheckAt = date.timeIntervalSince1970
-        UserDefaults.standard.set(lastSuccessfulUpdateCheckAt, forKey: lastSuccessfulUpdateCheckAtKey)
     }
 
     func resolvedDockAvoidanceSide() -> String? {

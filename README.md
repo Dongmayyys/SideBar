@@ -1,5 +1,7 @@
 # SideBar
 
+> 自用维护版本（fork 自 `oidd/SideBar`）：新增多窗口快捷键收纳标签、重启恢复、回到主界面开关，去掉了上游更新检查。安装与更新见 [docs/自用版本安装与更新.md](docs/自用版本安装与更新.md)。
+
 ## English
 
 SideBar is a macOS menu bar utility that brings edge-snap and hover-reveal behavior to regular third-party app windows.

@@ -131,9 +131,9 @@ func reconcile(at point: CGPoint, elapsed: Double = 0.3) {
 }
 coordinator.reconcile(sessions: sessions)
 expect(TemporaryStashTabWindow.live.count == 3 && TemporaryStashTabWindow.live["configured"] == nil, "three independent labels; configured app excluded")
-reconcile(at: tabPoint("a"), elapsed: 0.1)
+reconcile(at: tabPoint("a"), elapsed: 0.099)
 expect(!a.isExpandedForCoordination, "hover waits for default delay")
-Clock.now += 0.101
+Clock.now += 0.002
 Timer.fireDue()
 expect(a.isExpandedForCoordination && !b.isExpandedForCoordination && a.hoverLock, "only hovered label reveals and holds its window")
 transitions.removeAll()
@@ -510,7 +510,7 @@ expect(primary.isExpandedForCoordination && secondary.isExpandedForCoordination,
        "same edge on distinct screens has independent reveal coordination")
 expect(TemporaryStashTabWindow.live["primary"]?.midY == 500 && TemporaryStashTabWindow.live["secondary"]?.midY == 500,
        "each screen centers its own independent column")
-AppConfig.shared.hoverDelayMS = 200
+AppConfig.shared.hoverDelayMS = AppConfig.defaultHoverDelayMS
 screenCoordinator.tearDownAll()
 
 // Only an actual regular-app activation dismisses expanded shortcut windows.
@@ -561,12 +561,12 @@ expect(!source.isExpandedForCoordination, "remaining on dismissed label cannot r
 AppConfig.shared.hoverDelayMS = 0
 switchCoordinator.reconcile(sessions: switchSessions)
 expect(!source.isExpandedForCoordination, "zero hover delay cannot bypass leave-before-reenter suppression")
-AppConfig.shared.hoverDelayMS = 200
+AppConfig.shared.hoverDelayMS = AppConfig.defaultHoverDelayMS
 NSEvent.mouseLocation = CGPoint(x: 500, y: 400)
 TemporaryStashTabWindow.emit("source", .hover)
 NSEvent.mouseLocation = tabPoint("source")
 TemporaryStashTabWindow.emit("source", .hover)
-Clock.now += 0.199
+Clock.now += 0.099
 Timer.fireDue()
 expect(!source.isExpandedForCoordination, "reenter starts a fresh full hover delay")
 Clock.now += 0.002

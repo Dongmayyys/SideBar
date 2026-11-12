@@ -112,7 +112,8 @@ final class WindowSession {
 }
 final class AppConfig {
     static let shared = AppConfig()
-    var hoverDelayMS = 200
+    static let defaultHoverDelayMS = 100
+    var hoverDelayMS = AppConfig.defaultHoverDelayMS
     var mainInterfaceShortcutModifiers: UInt? = 0x1c0000
     var mainInterfaceShortcutKeyCode: UInt16? = 4
     var temporaryShortcutModifiers: UInt? = 0x1c0000

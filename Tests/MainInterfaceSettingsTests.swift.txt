@@ -12,7 +12,6 @@ final class MemoryDefaults {
     func integer(forKey key: String) -> Int { (values[key] as? NSNumber)?.intValue ?? 0 }
     func bool(forKey key: String) -> Bool { (values[key] as? NSNumber)?.boolValue ?? false }
     func float(forKey key: String) -> Float { (values[key] as? NSNumber)?.floatValue ?? 0 }
-    func double(forKey key: String) -> Double { (values[key] as? NSNumber)?.doubleValue ?? 0 }
     func string(forKey key: String) -> String? { values[key] as? String }
     func stringArray(forKey key: String) -> [String]? { values[key] as? [String] }
     func data(forKey key: String) -> Data? { values[key] as? Data }
@@ -41,6 +40,7 @@ func expect(_ condition: Bool, _ name: String) {
 }
 let modifiers = NSEvent.ModifierFlags([.control, .option, .command]).rawValue
 let config = AppConfig()
+expect(AppConfig.defaultHoverDelayMS == 100 && config.hoverDelayMS == 100, "unset hover delay defaults to 100ms")
 expect(config.mainInterfaceShortcutModifiers == modifiers && config.mainInterfaceShortcutKeyCode == 4, "unset preferences default to control-option-command H")
 expect(config.temporaryShortcutModifiers == nil && config.temporaryShortcutKeyCode == nil, "new default does not rewrite existing stash settings")
 config.setMainInterfaceShortcut(modifiers: modifiers, keyCode: 8)
@@ -77,5 +77,14 @@ let savedConflict = AppConfig()
 expect(savedConflict.mainInterfaceShortcutKeyCode == nil && savedConflict.temporaryShortcutKeyCode == 1, "conflicting saved preferences cannot dispatch both bindings")
 MemoryDefaults.standard.values = ["SideBarMainInterfaceShortcutModifiers": modifiers, "SideBarMainInterfaceShortcutKeyCode": 65536]
 expect(AppConfig().mainInterfaceShortcutKeyCode == nil, "out-of-range stored keycode is ignored without trapping")
+MemoryDefaults.standard.values = ["SideBarHoverDelayMS": 200]
+let savedHoverDelay = AppConfig()
+expect(savedHoverDelay.hoverDelayMS == 200, "existing 200ms hover preference is preserved")
+savedHoverDelay.hoverDelayMS = 0
+expect(AppConfig().hoverDelayMS == 0, "explicit zero hover delay survives write and reload")
+savedHoverDelay.hoverDelayMS = 500
+expect(AppConfig().hoverDelayMS == 500, "custom hover delay survives write and reload")
+savedHoverDelay.hoverDelayMS = AppConfig.defaultHoverDelayMS
+expect(AppConfig().hoverDelayMS == 100, "resetting hover delay persists the 100ms default")
 print("RESULT settings checks=\(total) failures=\(failures)")
 exit(failures == 0 ? 0 : 1)

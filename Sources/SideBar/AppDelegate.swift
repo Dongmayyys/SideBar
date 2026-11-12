@@ -45,7 +45,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         startAXManagerIfNeeded()
         SideBarBridge.shared.start()
         AppConfig.shared.refreshDockMinimizeBridgeExports()
-        scheduleAutomaticUpdateCheckIfNeeded()
     }
     
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -207,14 +206,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         axRuntimePausedByPermissionLoss = false
         axManager = AXWindowManager()
         AppConfig.shared.refreshDockMinimizeBridgeExports()
-    }
-
-    private func scheduleAutomaticUpdateCheckIfNeeded() {
-        // 启动后延迟 5 秒再检查更新，避开权限弹窗 / 首启动引导，
-        // 让自动检查到的"发现新版本"提示不会与其它窗口抢焦点。
-        DispatchQueue.main.asyncAfter(deadline: .now() + 5.0) {
-            UpdateChecker.shared.checkForUpdatesIfNeededOnLaunch()
-        }
     }
 
     private func suspendAXManagerForPermissionLoss() {

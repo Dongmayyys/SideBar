@@ -171,5 +171,26 @@ cancelledAnimation.frame.origin = CGPoint(x: 222, y: 111) // restoration wins
 advance(2)
 expect(cancelledAnimation.frame.origin == CGPoint(x: 222, y: 111), "stale collapse completion cannot move a restored window")
 
+for edge in [1, 2] {
+    reset()
+    let instant = Session(edge: edge)
+    instant.isTemporaryShortcutManaged = true
+    expect(instant.directCollapse() && instant.snapped && !instant.isAnimating && instant.collapseAnimations == 0,
+           "temporary ordinary collapse is synchronous without animator edge=\(edge)")
+    expect(instant.geometryEvents == ["alpha:0.0", "position"] && instant.alpha == 0,
+           "temporary collapse hides alpha before moving edge=\(edge)")
+    instant.geometryEvents.removeAll()
+    expect(instant.hover() && instant.state == .expanded && !instant.isAnimating && instant.tracking && instant.expandAnimations == 0,
+           "shared hover entry uses synchronous temporary reveal edge=\(edge)")
+    expect(instant.geometryEvents == ["position", "alpha:1.0"] && instant.alpha == 1,
+           "temporary reveal positions before restoring alpha edge=\(edge)")
+    _ = instant.directCollapse()
+    expect(instant.dockReveal() && instant.pendingDockInteraction && !instant.isAnimating,
+           "shared Dock entry is synchronous with interaction gate edge=\(edge)")
+    advance(10)
+    expect(!instant.isAnimating && instant.expandAnimations == 0 && instant.collapseAnimations == 0,
+           "temporary transitions never queue animation callbacks edge=\(edge)")
+}
+
 print("RESULT checks=\(total) failures=\(failures)")
 exit(failures == 0 ? 0 : 1)

@@ -6,9 +6,10 @@ struct Date {
     init() { value = Clock.now }
     init(_ value: Double) { self.value = value }
     static let distantPast = Date(-1e10)
+    var timeIntervalSinceReferenceDate: Double { value }
     func timeIntervalSince(_ other: Date) -> Double { value - other.value }
 }
-enum NSEvent { static var mouseLocation = CGPoint(x: 500, y: 400) }
+enum NSEvent { static var mouseLocation = CGPoint(x: 500, y: 400); static var pressedMouseButtons = 0 }
 let mainScreen = CGRect(x: 0, y: 0, width: 1000, height: 1000)
 var transitions: [String] = []
 
@@ -19,24 +20,22 @@ final class WindowSession {
     var isExpandedForCoordination = false
     var isPinned = false
     var edge = 1
-    var screen = mainScreen
+    var screenID: UInt32 = 1
     var visibleFrame = mainScreen
     var pid: pid_t = 123
     var activationFocused = false
     var programmaticActivation = false
-    var center: CGFloat = 500
     var eligible = true
     var canHide = true
     var hoverLock = false
     var appActivationReveal = false
-    init(_ id: String, center: CGFloat = 500, edge: Int = 1) {
-        temporaryStashID = id; self.center = center; self.edge = edge
+    init(_ id: String, edge: Int = 1) {
+        temporaryStashID = id; self.edge = edge
     }
     func temporaryStashTabDescriptor() -> TemporaryStashTabDescriptor? {
-        guard eligible else { return nil }
-        return TemporaryStashTabDescriptor(session: self, edge: edge, screenFrame: screen,
+        return TemporaryStashTabDescriptor(session: self, edge: edge, screenID: screenID,
                                            visibleFrame: visibleFrame,
-                                           centerY: center, title: temporaryStashID)
+                                           isOnScreen: eligible, title: temporaryStashID)
     }
     func canRevealForTemporaryAppActivation(activatedPID: pid_t) -> Bool {
         isManagedByTemporaryShortcut && !isExpandedForCoordination && activationFocused && !programmaticActivation && activatedPID == pid
@@ -55,9 +54,55 @@ final class WindowSession {
         isExpandedForCoordination = true
     }
 }
+final class AppConfig {
+    static let shared = AppConfig()
+    var hoverDelayMS = 200
+}
+final class Timer {
+    static var all: [Timer] = []
+    let due: Double
+    let action: (Timer) -> Void
+    var valid = true
+    init(timeInterval: Double, repeats: Bool, block: @escaping (Timer) -> Void) {
+        due = Clock.now + timeInterval
+        action = block
+        Self.all.append(self)
+    }
+    func invalidate() { valid = false }
+    static func fireDue() {
+        let due = all.filter { $0.valid && $0.due <= Clock.now + 1e-9 }
+        for timer in due { timer.valid = false; timer.action(timer) }
+    }
+}
+final class RunLoop {
+    enum Mode { case common }
+    static let main = RunLoop()
+    func add(_ timer: Timer, forMode: Mode) {}
+}
 final class TemporaryStashTabWindow {
     static var live: [String: CGRect] = [:]
+    static var instances: [String: TemporaryStashTabWindow] = [:]
+    static var created = 0
+    static var closed = 0
     var title = ""
-    func update(frame: CGRect, title: String, expanded: Bool) { self.title = title; Self.live[title] = frame }
-    func close() { Self.live[title] = nil }
+    var frame = CGRect.zero
+    var onEvent: ((TemporaryStashTabEvent) -> Void)?
+    init() { Self.created += 1 }
+    func update(frame: CGRect, title: String, expanded: Bool) {
+        self.title = title
+        self.frame = frame
+        Self.live[title] = frame
+        Self.instances[title] = self
+    }
+    func orderFrontRegardless() { Self.live[title] = frame }
+    func orderOut(_ sender: Any?) { Self.live[title] = nil }
+    func close() { Self.closed += 1; Self.live[title] = nil; Self.instances[title] = nil }
+    static func emit(_ title: String, _ event: TemporaryStashTabEvent) {
+        switch event {
+        case .down: NSEvent.pressedMouseButtons = 1
+        case .up: NSEvent.pressedMouseButtons = 0
+        default: break
+        }
+        instances[title]?.onEvent?(event)
+    }
 }

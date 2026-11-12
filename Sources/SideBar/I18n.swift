@@ -26,7 +26,7 @@ class I18n {
         "高级功能": "Advanced Features",
         "关闭窗口 (⌘W)": "Close Window (⌘W)",
         "在 DockMinimize 中修改": "Change it in DockMinimize",
-        "决定鼠标悬停在屏幕边缘多久后才会唤出边界窗口。等待期内若发生点击（如点击滚动条）则中止等待。": "Determines how long the mouse must hover at the screen edge before the boundary window is revealed. Clicks during the wait period (e.g., clicking the scrollbar) will abort the wait.",
+        "决定鼠标悬停在融合条、屏幕边缘或快捷键收纳标签多久后展开窗口。屏幕边缘等待期间点击会中止等待；按住标签可拖动排序。": "Sets how long to hover over a fusion bar, screen edge, or shortcut stash label before revealing the window. Clicking cancels a screen-edge wait; drag a label to reorder it.",
         "切换应用 (⌘Tab)": "Switch App (⌘Tab)",
         "切换窗口 (⌘`)": "Switch Window (⌘`)",
         "前往下载": "Go to Download",

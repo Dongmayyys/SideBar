@@ -158,7 +158,7 @@ class AXWindowManager {
     }
 
     @objc private func handleActiveSpaceDidChange() {
-        temporaryTabCoordinator.tearDownAll()
+        temporaryTabCoordinator.reconcileAfterSpaceChange(sessions: sessions)
         fusionCoordinator.resetForSpaceChange(sessions: sessions.filter { !$0.isManagedByTemporaryShortcut })
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { [weak self] in
             guard let self else { return }
@@ -190,7 +190,7 @@ class AXWindowManager {
             print("🖥️ 检测到屏幕配置变化: reseat=\(reseated), recover=\(recovered)")
         }
 
-        temporaryTabCoordinator.tearDownAll()
+        temporaryTabCoordinator.reconcileAfterSpaceChange(sessions: sessions)
         fusionCoordinator.resetForSpaceChange(sessions: sessions.filter { !$0.isManagedByTemporaryShortcut })
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { [weak self] in
             guard let self else { return }

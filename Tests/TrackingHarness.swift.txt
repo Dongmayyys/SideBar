@@ -63,7 +63,7 @@ final class AppConfig {
     let hoverToleranceY: CGFloat = 10
     func getColor(for bundleID: String) -> Color { Color() }
 }
-final class Window { var alphaValue: CGFloat = 1 }
+final class Window { var alphaValue: CGFloat = 1; func orderOut(_ sender: Any?) {} }
 final class Effect { func stopExpandEffect(closeWindow: Bool, immediate: Bool = false) {} }
 final class Animator { func stop() {} }
 final class AXUIElement { var size = CGSize(width: 400, height: 300) }
@@ -95,7 +95,12 @@ final class Session {
     var rawReads = 0
     var collapseAnimations = 0
     var focusReleases = 0
+    var geometryEvents: [String] = []
+    var expandAnimations = 0
     var alpha: CGFloat = 1
+    var temporaryLastExpandedFrame: CGRect?
+    var isSnappedForCoordination: Bool { snapped }
+    var isExpandedForCoordination: Bool { state == .expanded }
     var pendingDockInteraction = false
     var hasReleasedDockClick = false
     var isTemporarilyPinned = false
@@ -137,6 +142,7 @@ final class Session {
     var tracking: Bool { mouseTrackingTimer?.isValid == true }
     var snapped: Bool { if case .snapped = state { return true }; return false }
     func hover() -> Bool { expandWindow() }
+    func dockReveal() -> Bool { expandWindow(isDockActivated: true) }
     func directCollapse() -> Bool { collapseWindow() }
     func updatePinControlWindow() {}
     func relinquishToDockMinimizeIfDetachedFromEdge() -> Bool { false }
@@ -157,9 +163,9 @@ final class Session {
     }
     func notifyTemporaryShortcutStashStateChanged(isStashed: Bool) {}
     func getScreenForWindow() -> Screen { Screen() }
-    func collapsedWindowAlpha() -> Double { 0.01 }
-    func setWindowAlpha(_ alpha: CGFloat, isHidden: Bool, frameHint: CGRect? = nil) { self.alpha = alpha }
-    func setWindowPosition(position: CGPoint) { frame.origin = position; observedGeometryChangeToken += 1 }
+    func collapsedWindowAlpha() -> Double { isTemporaryShortcutManaged ? 0 : 0.01 }
+    func setWindowAlpha(_ alpha: CGFloat, isHidden: Bool, frameHint: CGRect? = nil) { self.alpha = alpha; geometryEvents.append("alpha:\(alpha)") }
+    func setWindowPosition(position: CGPoint) { frame.origin = position; geometryEvents.append("position"); observedGeometryChangeToken += 1 }
     func triggerCollapseEffect(edge: SnapEdge, point: CGPoint, color: Color) {}
     func triggerExpandEffect(edge: SnapEdge, frame: CGRect, color: Color) {}
     func showIndicator(animated: Bool = false) {}
@@ -170,7 +176,7 @@ final class Session {
     func beginTargetedActivationWindow(for duration: Double) {}
     // Animator is unchanged by this patch. Model only its ordinary successful completion.
     func animateWindowPositionFast(from startX: CGFloat, to endX: CGFloat, startY: CGFloat? = nil, endY: CGFloat? = nil, duration: Double, easeIn: Bool, enableSlowPositionCompensation: Bool = false, onStart: (() -> Void)? = nil, completion: @escaping () -> Void) {
-        if easeIn { collapseAnimations += 1 }
+        if easeIn { collapseAnimations += 1 } else { expandAnimations += 1 }
         onStart?()
         DispatchQueue.main.asyncAfter(deadline: .now() + duration) {
             self.setWindowPosition(position: CGPoint(x: endX, y: endY ?? self.frame.minY))

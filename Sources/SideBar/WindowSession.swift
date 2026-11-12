@@ -3897,6 +3897,7 @@ class WindowSession {
         guard isTemporaryShortcutManaged, let frame = getRawWindowFrame() else { return false }
         let bounds = detectDisplayBounds()
         guard let edge = TemporaryStashGeometry.nearestEdge(window: frame, screen: bounds,
+                                                           visibleWidth: getScreenForWindow().visibleFrame.width,
                                                            screens: NSScreen.screens.map { cgBounds(for: $0) }) else { return false }
         temporaryOriginalFrame = frame
         lockedWidth = frame.width
@@ -3934,7 +3935,6 @@ class WindowSession {
         effectWindow.stopExpandEffect(closeWindow: true, immediate: true)
         let current = keepingFrame ?? getRawWindowFrame() ?? temporaryLastExpandedFrame ?? temporaryOriginalFrame
         if let current {
-            setWindowAlpha(1, isHidden: false, frameHint: current, preserveRecoveryRecord: true)
             if keepingFrame != nil {
                 // 拖离取消时不再写位置，保留用户松手后的几何。
                 clearTrackedWindowRecoveryState(frameHint: current)
@@ -3954,6 +3954,8 @@ class WindowSession {
                 }
                 if result == .success { clearTrackedWindowRecoveryState(frameHint: current) }
             }
+            // 保持隐藏直到恢复位置写完，避免取消时在屏幕边缘露出一帧。
+            setWindowAlpha(1, isHidden: false, frameHint: current, preserveRecoveryRecord: true)
         }
         state = .floating
         indicatorWindow.orderOut(nil)
@@ -3968,12 +3970,12 @@ class WindowSession {
     func temporaryStashTabDescriptor() -> TemporaryStashTabDescriptor? {
         guard isTemporaryShortcutManaged, !isFloatingForCoordination else { return nil }
         let screen = getScreenForWindow()
-        guard !isInFullscreenSpace(screen: screen), isWindowOnScreen(),
-              let frame = getRawWindowFrame() ?? temporaryLastExpandedFrame else { return nil }
-        if isExpandedForCoordination && !isAnimating { temporaryLastExpandedFrame = frame }
-        return TemporaryStashTabDescriptor(session: self, edge: currentEdge, screenFrame: screen.frame,
+        if isExpandedForCoordination && !isAnimating, let frame = getRawWindowFrame() {
+            temporaryLastExpandedFrame = frame
+        }
+        return TemporaryStashTabDescriptor(session: self, edge: currentEdge, screenID: screen.displayID,
                                            visibleFrame: screen.visibleFrame,
-                                           centerY: primaryScreenHeight - frame.midY,
+                                           isOnScreen: !isInFullscreenSpace(screen: screen) && isWindowOnScreen(),
                                            title: TemporaryStashOrdinals.title(appName: appDisplayName, ordinal: temporaryStashOrdinal))
     }
 
@@ -4002,12 +4004,20 @@ class WindowSession {
         guard isTemporaryShortcutManaged, !isAnimating, isSnappedForCoordination,
               let frame = getRawWindowFrame(), let geometry = edgeGeometry(for: frame) else { return }
         invalidatePendingFocusRelease()
+        windowAnimator.stop()
+        animationGenerationToken &+= 1
+        queuedForwardedHotkeyToggle = false
+        outsideCollapseCandidateSince = nil
+        edgeDetachCandidateSince = nil
         rememberFocusReturnTargetBeforeReveal()
         beginTargetedActivationWindow(for: 0.35)
         // ⌘Tab/Dock 激活时鼠标可能仍在窗外，沿用原 Dock 等待首次交互的门禁。
         pendingDockInteraction = isAppActivated
         hasReleasedDockClick = NSEvent.pressedMouseButtons & 1 == 0
         state = .expanded
+        notifyTemporaryShortcutStashStateChanged(isStashed: false)
+        effectWindow.stopExpandEffect(closeWindow: true, immediate: true)
+        indicatorWindow.orderOut(nil)
         // 切换标签时使用同步几何，保证前一个已收回后再显示目标，且无延迟回调复活会话。
         setWindowPosition(position: geometry.expanded)
         temporaryLastExpandedFrame = CGRect(origin: geometry.expanded, size: frame.size)
@@ -4206,10 +4216,16 @@ class WindowSession {
     ) {
         // 关键：停止并复用同一个 animator，防止两个 displayLink 同时抢占 AX 设置权限产生“晃动”
         windowAnimator.stop()
-        
-        guard let currentFrame = getWindowFrame() else { 
+        guard let currentFrame = getWindowFrame() else {
             completion()
-            return 
+            return
+        }
+        if isTemporaryShortcutManaged {
+            onStart?()
+            let y = endY ?? startY ?? currentFrame.minY
+            setWindowPosition(position: CGPoint(x: endX, y: y))
+            completion()
+            return
         }
         
         windowAnimator.animate(
@@ -4245,7 +4261,7 @@ class WindowSession {
         outsideCollapseCandidateSince = nil
         edgeDetachCandidateSince = nil
         lastSiblingWindowInteractionAt = nil
-        let shouldTriggerEffects = triggerEffects && !isIndicatorSuppressed
+        let shouldTriggerEffects = triggerEffects && !isIndicatorSuppressed && !isTemporaryShortcutManaged
         
         // 必须在计算坐标前抓取最新尺寸
         guard let rawFrame = getRawWindowFrame() else { return false }
@@ -4278,7 +4294,8 @@ class WindowSession {
             effectWindow.stopExpandEffect(closeWindow: true, immediate: true)
         }
 
-        if immediate {
+        if immediate || isTemporaryShortcutManaged {
+            windowAnimator.stop()
             setWindowAlpha(CGFloat(collapsedWindowAlpha()), isHidden: true, frameHint: currentFrame)
             setWindowPosition(position: geometry.visualHidden)
             isAnimating = false
@@ -4328,6 +4345,10 @@ class WindowSession {
         if isTemporarilyPinned { return false }
         if isAnimating { return false }
         if case .expanded = state { return false }
+        if isTemporaryShortcutManaged {
+            revealForTemporaryStashTab(isAppActivated: isDockActivated)
+            return isExpandedForCoordination
+        }
         invalidatePendingFocusRelease()
         queuedForwardedHotkeyToggle = false
         outsideCollapseCandidateSince = nil
@@ -4777,6 +4798,13 @@ class WindowSession {
     }
     /// [Space Sensing] 基于 PID 与边界坐标的比准
     private func isWindowOnScreen() -> Bool {
+        // 快捷键窗口移动时 CG 的 bounds 可能落后于 AX；用窗口 ID 判断 Space，
+        // 不把坐标瞬时不匹配当成离屏。ID 暂时不可读时仍由标签协调器去抖兜底。
+        if isTemporaryShortcutManaged,
+           let windowID = WindowAlphaManager.shared.findWindowID(for: windowElement, pid: pid) {
+            let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+            return windows.contains { ($0[kCGWindowNumber as String] as? CGWindowID) == windowID }
+        }
         // 获取预期的窗体在无界限全景空间中的物理几何尺寸
         guard let axFrame = getRawWindowFrame() else { return false }
         let pid = self.pid

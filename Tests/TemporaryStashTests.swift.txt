@@ -18,13 +18,13 @@ let belowScreen = CGRect(x: 0, y: 1000, width: 1000, height: 800)
 let rightScreen = CGRect(x: 1000, y: 0, width: 1000, height: 1000)
 let leftWindow = CGRect(x: 10, y: 100, width: 300, height: 300)
 let layout = [mainScreen, leftScreen, belowScreen]
-expect(TemporaryStashGeometry.nearestEdge(window: leftWindow, screen: mainScreen, screens: [mainScreen]) == 1, "nearest left edge")
-expect(TemporaryStashGeometry.nearestEdge(window: leftWindow.offsetBy(dx: 680, dy: 0), screen: mainScreen, screens: [mainScreen]) == 2, "nearest right edge")
-expect(TemporaryStashGeometry.nearestEdge(window: leftWindow, screen: mainScreen, screens: layout) == 2, "three-screen main screen excludes left seam")
-expect(TemporaryStashGeometry.nearestEdge(window: leftWindow.offsetBy(dx: -400, dy: 0), screen: leftScreen, screens: layout) == 1, "three-screen left screen uses outer left edge")
-expect(TemporaryStashGeometry.nearestEdge(window: leftWindow.offsetBy(dx: 0, dy: 1000), screen: belowScreen, screens: layout) == 1, "lower screen left remains available")
-expect(TemporaryStashGeometry.nearestEdge(window: leftWindow.offsetBy(dx: 680, dy: 1000), screen: belowScreen, screens: layout) == 2, "lower screen right remains available")
-expect(TemporaryStashGeometry.nearestEdge(window: leftWindow, screen: mainScreen, screens: layout + [rightScreen]) == nil, "both seams blocked ignores shortcut")
+expect(TemporaryStashGeometry.nearestEdge(window: leftWindow, screen: mainScreen, visibleWidth: mainScreen.width, screens: [mainScreen]) == 1, "nearest left edge")
+expect(TemporaryStashGeometry.nearestEdge(window: leftWindow.offsetBy(dx: 680, dy: 0), screen: mainScreen, visibleWidth: mainScreen.width, screens: [mainScreen]) == 2, "nearest right edge")
+expect(TemporaryStashGeometry.nearestEdge(window: leftWindow, screen: mainScreen, visibleWidth: mainScreen.width, screens: layout) == 2, "three-screen main screen excludes left seam")
+expect(TemporaryStashGeometry.nearestEdge(window: leftWindow.offsetBy(dx: -400, dy: 0), screen: leftScreen, visibleWidth: leftScreen.width, screens: layout) == 1, "three-screen left screen uses outer left edge")
+expect(TemporaryStashGeometry.nearestEdge(window: leftWindow.offsetBy(dx: 0, dy: 1000), screen: belowScreen, visibleWidth: belowScreen.width, screens: layout) == 1, "lower screen left remains available")
+expect(TemporaryStashGeometry.nearestEdge(window: leftWindow.offsetBy(dx: 680, dy: 1000), screen: belowScreen, visibleWidth: belowScreen.width, screens: layout) == 2, "lower screen right remains available")
+expect(TemporaryStashGeometry.nearestEdge(window: leftWindow, screen: mainScreen, visibleWidth: mainScreen.width, screens: layout + [rightScreen]) == nil, "both seams blocked ignores shortcut")
 let sliver = CGRect(x: -1000, y: 999, width: 1000, height: 600)
 expect(TemporaryStashGeometry.hasAdjacentScreen(edge: 1, screen: mainScreen, screens: [mainScreen, sliver]), "one point vertical overlap blocks whole side")
 expect(!TemporaryStashGeometry.hasAdjacentScreen(edge: 1, screen: mainScreen, screens: [mainScreen, sliver.offsetBy(dx: 0, dy: 1)]), "corner-only contact does not block side")
@@ -36,44 +36,67 @@ expect(TemporaryStashGeometry.restorePosition(original: original, expanded: expa
 expect(TemporaryStashGeometry.restorePosition(original: original, expanded: expanded, screens: [mainScreen]) == expanded.origin, "disconnected original screen keeps expanded position")
 expect(TemporaryStashGeometry.restorePosition(original: original.offsetBy(dx: 850, dy: 0), expanded: expanded, screens: [mainScreen]).x == -50, "partially visible original position remains valid")
 
-let isolated = TemporaryStashGeometry.labelFrames(centers: [100, 500, 900], edge: 1, visibleFrame: mainScreen)
-expect(zip(isolated, [CGFloat(100), 500, 900]).allSatisfy { near($0.midY, $1) }, "non-overlapping labels keep exact window centers")
-expect(isolated.allSatisfy { $0.minX == 0 && $0.width == 24 && $0.height == 120 }, "fixed label dimensions at left edge")
-let pair = TemporaryStashGeometry.labelFrames(centers: [100, 500, 540, 900], edge: 2, visibleFrame: mainScreen)
-expect(near(pair[1].midY, 460) && near(pair[2].midY, 580), "overlapping neighbors each move half the overlap")
-expect(pair[0].midY == 100 && pair[3].midY == 900, "unrelated labels do not move")
-expect(pair.allSatisfy { $0.maxX == 1000 }, "right labels align to right edge")
-let chain = TemporaryStashGeometry.labelFrames(centers: [300, 320, 330], edge: 1, visibleFrame: mainScreen)
-expect(near(chain[1].midY - chain[0].midY, 120) && near(chain[2].midY - chain[1].midY, 120), "chain collisions settle without overlap and preserve order")
-expect(near(chain.reduce(0) { $0 + $1.midY }, 950), "collision resolution preserves cluster center")
-expect(TemporaryStashGeometry.labelFrames(centers: [], edge: 1, visibleFrame: mainScreen).isEmpty, "empty edge has no labels")
-let shifted = TemporaryStashGeometry.labelFrames(centers: [-500, -400], edge: 1, visibleFrame: mainScreen.offsetBy(dx: -1000, dy: -1000))
-expect(shifted.allSatisfy { $0.minX == -1000 } && shifted[0].maxY <= shifted[1].minY, "negative multi-screen coordinates")
-// Deterministic spread of dense layouts: order, no overlap, untouched distant label.
-for count in 2...12 {
-    let centers = (0..<count).map { CGFloat($0 * $0 * 7 + 200) }
-    let frames = TemporaryStashGeometry.labelFrames(centers: centers, edge: 1, visibleFrame: mainScreen)
-    expect(zip(frames, frames.dropFirst()).allSatisfy { $0.maxY <= $1.minY + 0.001 }, "dense layout order and non-overlap count=\(count)")
+let usable = CGRect(x: 60, y: 50, width: 900, height: 900)
+let isolated = TemporaryStashGeometry.labelFrames(count: 1, edge: 1, visibleFrame: usable)
+expect(isolated[0].midY == usable.midY && isolated[0].minX == usable.minX, "single label centers inside visibleFrame")
+expect(isolated[0].width == 24 && isolated[0].height == 120, "fixed label dimensions")
+let column = TemporaryStashGeometry.labelFrames(count: 3, edge: 2, visibleFrame: usable)
+expect(near((column[0].maxY + column[2].minY) / 2, usable.midY), "whole column centers vertically")
+expect(zip(column, column.dropFirst()).allSatisfy { near($0.minY - $1.maxY, 4) }, "top-to-bottom order with four point gaps")
+expect(column.allSatisfy { usable.contains($0) && $0.maxX == usable.maxX }, "right column remains inside usable region")
+expect(TemporaryStashGeometry.labelFrames(count: 0, edge: 1, visibleFrame: mainScreen).isEmpty, "empty edge has no labels")
+let shifted = TemporaryStashGeometry.labelFrames(count: 3, edge: 1, visibleFrame: usable.offsetBy(dx: -1000, dy: -1000))
+expect(zip(column, shifted).allSatisfy { near($0.minY - 1000, $1.minY) && $1.minX == -940 }, "negative multi-screen coordinates keep centered layout")
+let range = column.reduce(column[0]) { $0.union($1) }
+let clampedTop = TemporaryStashGeometry.draggedFrame(initial: column[2], deltaY: 10000, column: range)
+let clampedBottom = TemporaryStashGeometry.draggedFrame(initial: column[0], deltaY: -10000, column: range)
+expect(clampedTop == column[0] && clampedBottom == column[2], "drag stays within column, preserving x and dimensions")
+expect(TemporaryStashGeometry.insertionIndex(centerY: column[0].midY + 1, columnFrames: column) == 0, "drag inserts at top slot")
+expect(TemporaryStashGeometry.insertionIndex(centerY: column[1].midY - 1, columnFrames: column) == 1, "drag inserts in middle")
+expect(TemporaryStashGeometry.insertionIndex(centerY: column[2].midY - 1, columnFrames: column) == 2, "drag inserts at bottom")
+expect(TemporaryStashGeometry.insertionIndex(centerY: 500, columnFrames: []) == 0, "empty column insertion is zero")
+let halfway = (column[0].midY + column[1].midY) / 2
+expect(TemporaryStashGeometry.insertionIndex(centerY: halfway + 1, columnFrames: column) == 0, "drop above slot midpoint keeps previous index")
+expect(TemporaryStashGeometry.insertionIndex(centerY: halfway - 1, columnFrames: column) == 1, "drop below slot midpoint inserts at next index")
+
+for edge in [1, 2] {
+    for count in 1...7 {
+        let frames = TemporaryStashGeometry.labelFrames(count: count, edge: edge, visibleFrame: usable)
+        expect(frames.allSatisfy { usable.contains($0) } && near((frames[0].maxY + frames[count - 1].minY) / 2, usable.midY),
+               "centered full column within visible region edge=\(edge) count=\(count)")
+    }
 }
 
-let usable = CGRect(x: 60, y: 50, width: 900, height: 900)
-let topLabel = TemporaryStashGeometry.labelFrames(centers: [995], edge: 2, visibleFrame: usable)
-expect(topLabel[0].maxY == usable.maxY && topLabel[0].maxX == usable.maxX && usable.contains(topLabel[0]),
-       "top label stays below menu bar and inside horizontal usable edge")
-let bottomLabel = TemporaryStashGeometry.labelFrames(centers: [5], edge: 1, visibleFrame: usable)
-expect(bottomLabel[0].minY == usable.minY && bottomLabel[0].minX == usable.minX && usable.contains(bottomLabel[0]),
-       "bottom label stays above Dock and inside horizontal usable edge")
-let topConflict = TemporaryStashGeometry.labelFrames(centers: [300, 940, 970], edge: 2, visibleFrame: usable)
-expect(topConflict.allSatisfy { usable.contains($0) } && topConflict[1].maxY == topConflict[2].minY
-       && topConflict[2].maxY == usable.maxY && topConflict[0].midY == 300,
-       "top collision stays in usable region without moving unrelated label")
-let bottomConflict = TemporaryStashGeometry.labelFrames(centers: [5, 30, 700], edge: 1, visibleFrame: usable)
-expect(bottomConflict.allSatisfy { usable.contains($0) } && bottomConflict[0].maxY == bottomConflict[1].minY
-       && bottomConflict[0].minY == usable.minY && bottomConflict[2].midY == 700,
-       "bottom collision stays in usable region without moving unrelated label")
-let full = TemporaryStashGeometry.labelFrames(centers: [-100, 800, 2000], edge: 1,
-                                             visibleFrame: CGRect(x: -900, y: -500, width: 900, height: 360))
-expect(full.map(\.minY) == [-500, -380, -260], "exact capacity maintains order and fills negative-coordinate usable region")
+for width: CGFloat in [960, 1000, 1200] {
+    expect(TemporaryStashGeometry.nearestEdge(window: CGRect(x: 0, y: 100, width: width, height: 300), screen: mainScreen,
+                                            visibleWidth: 1000, screens: [mainScreen]) == 2, "wide window prefers right width=\(width)")
+}
+expect(TemporaryStashGeometry.nearestEdge(window: CGRect(x: 0, y: 100, width: 860, height: 300), screen: mainScreen,
+                                        visibleWidth: 900, screens: [mainScreen]) == 2, "wide threshold uses visible width, not full screen width")
+for x: CGFloat in [340, 350, 360] {
+    expect(TemporaryStashGeometry.nearestEdge(window: CGRect(x: x, y: 100, width: 300, height: 300), screen: mainScreen,
+                                            visibleWidth: 1000, screens: [mainScreen]) == 2, "distance tie within inclusive twenty points x=\(x)")
+}
+expect(TemporaryStashGeometry.nearestEdge(window: CGRect(x: 339, y: 100, width: 300, height: 300), screen: mainScreen,
+                                        visibleWidth: 1000, screens: [mainScreen]) == 1, "distance difference over twenty uses nearest edge")
+expect(TemporaryStashGeometry.nearestEdge(window: mainScreen, screen: mainScreen, visibleWidth: 1000,
+                                        screens: [mainScreen, rightScreen]) == 1, "wide window falls back left when right blocked")
+expect(TemporaryStashGeometry.nearestEdge(window: mainScreen, screen: mainScreen, visibleWidth: 1000,
+                                        screens: [mainScreen, rightScreen, leftScreen]) == nil, "wide rule cannot override two blocked sides")
+
+var visibility = TemporaryStashVisibility()
+expect(visibility.isVisible(isOnScreen: true, now: 0), "on-screen label visible immediately")
+expect(visibility.isVisible(isOnScreen: false, now: 1), "first negative cannot hide label")
+expect(visibility.isVisible(isOnScreen: false, now: 1.29), "negative lasting less than three tenths stays visible")
+expect(visibility.isVisible(isOnScreen: true, now: 1.3), "positive sample resets debounce")
+expect(visibility.isVisible(isOnScreen: false, now: 2), "later negative starts fresh debounce")
+expect(!visibility.isVisible(isOnScreen: false, now: 2.31), "sustained off-space negative hides label")
+expect(visibility.isVisible(isOnScreen: true, now: 2.32), "return to current Space shows label immediately")
+visibility.expireDebounce()
+expect(!visibility.isVisible(isOnScreen: false, now: 3), "after Space change first negative hides label immediately")
+visibility.expireDebounce()
+expect(visibility.isVisible(isOnScreen: true, now: 4), "after Space change on-screen label stays visible")
+expect(visibility.isVisible(isOnScreen: false, now: 4.1), "debounce resumes after a positive sample")
 
 var ordinals = TemporaryStashOrdinals()
 expect(ordinals.assign(bundleID: "a", windowID: "1") == 1, "first window has unnumbered name")
@@ -90,12 +113,16 @@ expect(!ordinals.hasMembers(bundleID: "a"), "bundle exclusion ends only after la
 expect(ordinals.assign(bundleID: "a", windowID: "5") == 1, "after all leave a fresh round begins")
 
 let coordinator = TemporaryStashTabCoordinator()
-let a = WindowSession("a", center: 200)
-let b = WindowSession("b", center: 500)
-let c = WindowSession("c", center: 800, edge: 2)
+let a = WindowSession("a")
+let b = WindowSession("b")
+let c = WindowSession("c", edge: 2)
 let configured = WindowSession("configured")
 configured.isManagedByTemporaryShortcut = false
 var sessions = [a, b, c, configured]
+func tabPoint(_ title: String) -> CGPoint {
+    let frame = TemporaryStashTabWindow.live[title]!
+    return CGPoint(x: frame.midX, y: frame.midY)
+}
 func reconcile(at point: CGPoint, elapsed: Double = 0.3) {
     NSEvent.mouseLocation = point
     coordinator.reconcile(sessions: sessions)
@@ -104,22 +131,22 @@ func reconcile(at point: CGPoint, elapsed: Double = 0.3) {
 }
 coordinator.reconcile(sessions: sessions)
 expect(TemporaryStashTabWindow.live.count == 3 && TemporaryStashTabWindow.live["configured"] == nil, "three independent labels; configured app excluded")
-reconcile(at: CGPoint(x: 10, y: 200), elapsed: 0.1)
+reconcile(at: tabPoint("a"), elapsed: 0.1)
 expect(!a.isExpandedForCoordination, "hover waits for default delay")
-Clock.now += 0.1
-coordinator.reconcile(sessions: sessions)
+Clock.now += 0.101
+Timer.fireDue()
 expect(a.isExpandedForCoordination && !b.isExpandedForCoordination && a.hoverLock, "only hovered label reveals and holds its window")
 transitions.removeAll()
-reconcile(at: CGPoint(x: 10, y: 500))
+reconcile(at: tabPoint("b"))
 expect(transitions == ["hide:a", "reveal:b"] && !a.isExpandedForCoordination, "same-edge switch hides previous before revealing next")
 expect(!a.hoverLock && b.hoverLock, "only current label holds collapse tracking")
-reconcile(at: CGPoint(x: 990, y: 800))
+reconcile(at: tabPoint("c"))
 expect(b.isExpandedForCoordination && c.isExpandedForCoordination, "different edges are independent")
 a.isExpandedForCoordination = true
 a.isPinned = true
-reconcile(at: CGPoint(x: 10, y: 200))
+reconcile(at: tabPoint("a"))
 expect(!b.isExpandedForCoordination, "hovering already-expanded pinned label still hides unpinned sibling")
-reconcile(at: CGPoint(x: 10, y: 500))
+reconcile(at: tabPoint("b"))
 expect(a.isExpandedForCoordination && b.isExpandedForCoordination, "pinned sibling stays expanded")
 reconcile(at: CGPoint(x: 500, y: 500))
 expect(!a.hoverLock && !b.hoverLock && !c.hoverLock, "pointer outside labels releases all hover locks")
@@ -136,7 +163,7 @@ expect(transitions.isEmpty, "one point outside label height never expands")
 
 b.isExpandedForCoordination = true
 b.canHide = false
-reconcile(at: CGPoint(x: 10, y: 200))
+reconcile(at: tabPoint("a"))
 expect(!a.isExpandedForCoordination, "failed previous hide defers next reveal")
 b.canHide = true
 coordinator.reconcile(sessions: sessions)
@@ -145,12 +172,22 @@ sessions.removeAll { $0 === a }
 coordinator.reconcile(sessions: sessions)
 expect(TemporaryStashTabWindow.live["a"] == nil && TemporaryStashTabWindow.live["b"] != nil, "close/cancel removes only corresponding label")
 b.eligible = false
+let bPanel = TemporaryStashTabWindow.instances["b"]
+let createdBeforeHide = TemporaryStashTabWindow.created
+let closedBeforeHide = TemporaryStashTabWindow.closed
 coordinator.reconcile(sessions: sessions)
-expect(TemporaryStashTabWindow.live["b"] == nil, "window on other Space has no active label")
+expect(TemporaryStashTabWindow.live["b"] != nil, "transient negative leaves panel visible")
+Clock.now += 0.31
+coordinator.reconcile(sessions: sessions)
+expect(TemporaryStashTabWindow.live["b"] == nil && TemporaryStashTabWindow.closed == closedBeforeHide, "other Space hides panel without closing")
+b.eligible = true
+coordinator.reconcile(sessions: sessions)
+expect(TemporaryStashTabWindow.instances["b"] === bPanel && TemporaryStashTabWindow.created == createdBeforeHide,
+       "return from other Space reuses same panel")
 coordinator.tearDownAll()
-expect(TemporaryStashTabWindow.live.isEmpty, "quit/Space reset removes every panel")
+expect(TemporaryStashTabWindow.live.isEmpty, "quit teardown removes every panel")
 let boundedCoordinator = TemporaryStashTabCoordinator()
-let bounded = WindowSession("bounded", center: 995)
+let bounded = WindowSession("bounded")
 bounded.visibleFrame = usable
 boundedCoordinator.reconcile(sessions: [bounded])
 expect(TemporaryStashTabWindow.live["bounded"].map { usable.contains($0) && $0.minX == usable.minX } == true,
@@ -159,10 +196,10 @@ boundedCoordinator.tearDownAll()
 
 // Application activation uses the same hide-before-reveal path, without a hover delay.
 let activationCoordinator = TemporaryStashTabCoordinator()
-let active1 = WindowSession("active1", center: 200)
-let active2 = WindowSession("active2", center: 500)
-let pinned = WindowSession("pinned", center: 800)
-let otherEdge = WindowSession("otherEdge", center: 500, edge: 2)
+let active1 = WindowSession("active1")
+let active2 = WindowSession("active2")
+let pinned = WindowSession("pinned")
+let otherEdge = WindowSession("otherEdge", edge: 2)
 let activationSessions = [active1, active2, pinned, otherEdge]
 NSEvent.mouseLocation = CGPoint(x: 500, y: 400)
 active1.isExpandedForCoordination = true
@@ -206,6 +243,173 @@ activationCoordinator.reconcile(sessions: activationSessions)
 expect(!active2.isExpandedForCoordination && active1.isExpandedForCoordination,
        "pending activation is discarded when focus changes")
 activationCoordinator.tearDownAll()
+
+// Order survives polling, window y changes, Space hiding and drag/drop.
+let dragCoordinator = TemporaryStashTabCoordinator()
+let d1 = WindowSession("d1")
+let d2 = WindowSession("d2")
+let d3 = WindowSession("d3")
+let rightLabel = WindowSession("right", edge: 2)
+var dragSessions = [d1, d2, d3, rightLabel]
+NSEvent.mouseLocation = CGPoint(x: 500, y: 400)
+dragCoordinator.reconcile(sessions: dragSessions)
+func leftOrder() -> [String] {
+    TemporaryStashTabWindow.live.filter { $0.value.minX == 0 }.sorted { $0.value.midY > $1.value.midY }.map(\.key)
+}
+expect(leftOrder() == ["d1", "d2", "d3"], "new labels append at bottom in stash order")
+let initialFrames = TemporaryStashTabWindow.live
+dragCoordinator.reconcile(sessions: [d3, rightLabel, d2, d1])
+expect(TemporaryStashTabWindow.live == initialFrames, "input enumeration cannot reshuffle existing order")
+let down = tabPoint("d3")
+NSEvent.mouseLocation = down
+TemporaryStashTabWindow.emit("d3", .down(down))
+d2.isExpandedForCoordination = true
+rightLabel.isExpandedForCoordination = true
+transitions.removeAll()
+let outsideTop = CGPoint(x: 900, y: down.y + 10000)
+NSEvent.mouseLocation = outsideTop
+TemporaryStashTabWindow.emit("d3", .dragged(outsideTop))
+Clock.now += 1
+dragCoordinator.reconcile(sessions: dragSessions)
+expect(TemporaryStashTabWindow.live["d3"] == initialFrames["d1"], "drag follows y clamped at column top and ignores mouse x")
+expect(TemporaryStashTabWindow.live["d1"] == initialFrames["d1"] && TemporaryStashTabWindow.live["d2"] == initialFrames["d2"], "other labels remain stationary during drag")
+expect(transitions.isEmpty && dragSessions.allSatisfy(\.hoverLock), "drag blocks all hover reveals and all collapse timers")
+TemporaryStashTabWindow.emit("d3", .up(outsideTop))
+expect(leftOrder() == ["d3", "d1", "d2"], "drop inserts bottom label at top")
+expect(d2.isExpandedForCoordination && rightLabel.isExpandedForCoordination && dragSessions.allSatisfy { !$0.hoverLock }, "drop restores normal hover locks without collapsing expanded windows")
+let middleDrop = tabPoint("d1")
+let secondDown = tabPoint("d2")
+TemporaryStashTabWindow.emit("d2", .down(secondDown))
+TemporaryStashTabWindow.emit("d2", .dragged(CGPoint(x: 0, y: middleDrop.y + 5)))
+TemporaryStashTabWindow.emit("d2", .up(CGPoint(x: 0, y: middleDrop.y + 5)))
+expect(leftOrder() == ["d3", "d2", "d1"], "drop supports middle insertion")
+transitions.removeAll()
+let click = tabPoint("d2")
+TemporaryStashTabWindow.emit("d2", .down(click))
+TemporaryStashTabWindow.emit("d2", .up(click))
+expect(leftOrder() == ["d3", "d2", "d1"] && transitions.isEmpty, "single click has no extra action or reorder")
+let d4 = WindowSession("d4")
+dragSessions.append(d4)
+dragCoordinator.reconcile(sessions: dragSessions)
+expect(leftOrder() == ["d3", "d2", "d1", "d4"], "new stash appends after manually reordered members")
+dragSessions.removeAll { $0 === d2 }
+dragCoordinator.reconcile(sessions: dragSessions)
+expect(leftOrder() == ["d3", "d1", "d4"], "remove preserves relative order")
+let recentered = TemporaryStashTabWindow.live
+expect(near((recentered["d3"]!.maxY + recentered["d4"]!.minY) / 2, mainScreen.midY), "remove recenters entire column")
+let d3Panel = TemporaryStashTabWindow.instances["d3"]
+d3.eligible = false
+dragCoordinator.reconcile(sessions: dragSessions)
+Clock.now += 0.31
+dragCoordinator.reconcile(sessions: dragSessions)
+d3.eligible = true
+dragCoordinator.reconcile(sessions: dragSessions)
+expect(leftOrder() == ["d3", "d1", "d4"] && TemporaryStashTabWindow.instances["d3"] === d3Panel, "hidden Space member retains list slot and panel")
+
+// Tracking event starts the configured delay immediately, rather than waiting for the next poll.
+AppConfig.shared.hoverDelayMS = 0
+transitions.removeAll()
+NSEvent.mouseLocation = tabPoint("d4")
+TemporaryStashTabWindow.emit("d4", .hover)
+expect(d4.isExpandedForCoordination && transitions.contains("reveal:d4"), "zero delay expands on mouse-enter event")
+AppConfig.shared.hoverDelayMS = 500
+NSEvent.mouseLocation = CGPoint(x: 500, y: 400)
+TemporaryStashTabWindow.emit("d3", .hover)
+d3.isExpandedForCoordination = false
+NSEvent.mouseLocation = tabPoint("d3")
+TemporaryStashTabWindow.emit("d3", .hover)
+Clock.now += 0.3
+Timer.fireDue()
+expect(!d3.isExpandedForCoordination, "configured delay longer than old constant is respected")
+Clock.now += 0.21
+Timer.fireDue()
+expect(d3.isExpandedForCoordination, "one-shot timer reveals without another poll")
+AppConfig.shared.hoverDelayMS = 200
+NSEvent.mouseLocation = tabPoint("d1")
+d1.isExpandedForCoordination = false
+TemporaryStashTabWindow.emit("d1", .hover)
+Clock.now += 0.1
+NSEvent.mouseLocation = CGPoint(x: 500, y: 400)
+TemporaryStashTabWindow.emit("d1", .hover)
+Clock.now += 0.2
+Timer.fireDue()
+expect(!d1.isExpandedForCoordination, "mouse-exit cancels pending hover timer")
+let removalDown = tabPoint("d1")
+TemporaryStashTabWindow.emit("d1", .down(removalDown))
+dragSessions.removeAll { $0 === d1 }
+dragCoordinator.reconcile(sessions: dragSessions)
+expect(leftOrder() == ["d3", "d4"] && d4.hoverLock, "closing dragged member cancels reorder but holds hover lock until release")
+NSEvent.pressedMouseButtons = 0
+dragCoordinator.reconcile(sessions: dragSessions)
+expect(!d4.hoverLock, "polling recovers lost mouse-up after dragged panel closes")
+dragCoordinator.tearDownAll()
+expect(TemporaryStashTabWindow.live.isEmpty, "teardown closes reordered and hidden panels")
+
+for edge in [1, 2] {
+    let stableCoordinator = TemporaryStashTabCoordinator()
+    let first = WindowSession("first", edge: edge)
+    let second = WindowSession("second", edge: edge)
+    let third = WindowSession("third", edge: edge)
+    let members = [first, second, third]
+    NSEvent.mouseLocation = CGPoint(x: 500, y: 400)
+    stableCoordinator.reconcile(sessions: members)
+    let initialPanelCount = TemporaryStashTabWindow.created
+    let beforeJitter = TemporaryStashTabWindow.live
+    first.eligible = false
+    second.eligible = false
+    stableCoordinator.reconcile(sessions: members)
+    Clock.now += 0.12
+    stableCoordinator.reconcile(sessions: members)
+    Clock.now += 0.12
+    stableCoordinator.reconcile(sessions: members)
+    expect(TemporaryStashTabWindow.live == beforeJitter, "multiple short negative polls cannot move or hide labels edge=\(edge)")
+    first.eligible = true
+    second.eligible = true
+    stableCoordinator.reconcile(sessions: members)
+    expect(TemporaryStashTabWindow.created == initialPanelCount, "no panel recreation after visibility jitter edge=\(edge)")
+    let from = tabPoint("first")
+    let to = tabPoint("third")
+    TemporaryStashTabWindow.emit("first", .down(from))
+    TemporaryStashTabWindow.emit("first", .up(to))
+    let titles = TemporaryStashTabWindow.live.sorted { $0.value.midY > $1.value.midY }.map(\.key)
+    expect(titles == ["second", "third", "first"], "top label can drop at bottom edge=\(edge)")
+    TemporaryStashTabWindow.emit("third", .down(tabPoint("third")))
+    third.eligible = false
+    stableCoordinator.reconcile(sessions: members)
+    Clock.now += 0.31
+    stableCoordinator.reconcile(sessions: members)
+    expect(TemporaryStashTabWindow.live["third"] == nil && first.hoverLock, "off-Space dragged panel stays hidden while press holds locks edge=\(edge)")
+    NSEvent.pressedMouseButtons = 0
+    stableCoordinator.reconcile(sessions: members)
+    expect(!first.hoverLock && !second.hoverLock, "poll releases cancelled off-Space drag without mouse-up event edge=\(edge)")
+    third.eligible = true
+    stableCoordinator.reconcile(sessions: members)
+    let afterReturn = TemporaryStashTabWindow.live.sorted { $0.value.midY > $1.value.midY }.map(\.key)
+    expect(afterReturn == titles, "cancelled off-Space drag leaves order intact edge=\(edge)")
+    members.forEach { $0.visibleFrame = CGRect(x: 0, y: -500, width: 1200, height: 1000) }
+    stableCoordinator.reconcile(sessions: members)
+    let afterResize = TemporaryStashTabWindow.live.sorted { $0.value.midY > $1.value.midY }.map(\.key)
+    expect(afterResize == titles, "display ID preserves manual order after screen geometry change edge=\(edge)")
+    stableCoordinator.tearDownAll()
+}
+expect(TemporaryStashGeometry.nearestEdge(window: CGRect(x: 0, y: 100, width: 959, height: 300), screen: mainScreen,
+                                        visibleWidth: 1000, screens: [mainScreen]) == 1, "width just below forty-point threshold uses nearest edge")
+
+let screenCoordinator = TemporaryStashTabCoordinator()
+let primary = WindowSession("primary")
+let secondary = WindowSession("secondary")
+secondary.screenID = 2
+secondary.visibleFrame = leftScreen
+primary.isExpandedForCoordination = true
+NSEvent.mouseLocation = CGPoint(x: -990, y: 500)
+AppConfig.shared.hoverDelayMS = 0
+screenCoordinator.reconcile(sessions: [primary, secondary])
+expect(primary.isExpandedForCoordination && secondary.isExpandedForCoordination,
+       "same edge on distinct screens has independent reveal coordination")
+expect(TemporaryStashTabWindow.live["primary"]?.midY == 500 && TemporaryStashTabWindow.live["secondary"]?.midY == 500,
+       "each screen centers its own independent column")
+AppConfig.shared.hoverDelayMS = 200
+screenCoordinator.tearDownAll()
 
 print("RESULT checks=\(total) failures=\(failures)")
 exit(failures == 0 ? 0 : 1)

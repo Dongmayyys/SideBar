@@ -1841,7 +1841,7 @@ struct InteractionSettingsView: View {
                 DelayControlView(
                     title: "防误触缓冲 (悬停延时)".localized,
                     value: $config.hoverDelayMS,
-                    description: "决定鼠标悬停在屏幕边缘多久后才会唤出边界窗口。等待期内若发生点击（如点击滚动条）则中止等待。".localized
+                    description: "决定鼠标悬停在融合条、屏幕边缘或快捷键收纳标签多久后展开窗口。屏幕边缘等待期间点击会中止等待；按住标签可拖动排序。".localized
                 )
                 
                 Divider() // 添加区块实体隔离线

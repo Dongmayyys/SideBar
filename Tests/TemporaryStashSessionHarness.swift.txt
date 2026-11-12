@@ -10,11 +10,31 @@ final class Element: NSObject {
     var events: [String] = []
 }
 final class Timer { var invalidated = false; func invalidate() { invalidated = true } }
-final class Animator { var stopped = false; func stop() { stopped = true } }
+final class Animator {
+    var stopped = false
+    var interpolations = 0
+    func stop() { stopped = true }
+    func animate(element: Element, startX: CGFloat, endX: CGFloat, startY: CGFloat, endY: CGFloat,
+                 duration: TimeInterval, easeIn: Bool, lockedWidth: CGFloat, lockedHeight: CGFloat,
+                 enableSlowPositionCompensation: Bool, onStart: (() -> Void)?, completion: @escaping () -> Void) {
+        interpolations += 1
+        onStart?()
+        completion()
+    }
+}
+final class WindowAlphaManager {
+    static let shared = WindowAlphaManager()
+    var windowID: CGWindowID? = 42
+    func findWindowID(for element: Element, pid: pid_t) -> CGWindowID? { windowID }
+}
+var cgWindows: [[String: Any]] = []
 final class Effect { func stopExpandEffect(closeWindow: Bool, immediate: Bool = false) {} }
 final class Panel { func orderOut(_ sender: Any?) {} }
 struct NSScreen {
     var frame: CGRect
+    var displayID: UInt32 = 1
+    var usableFrame: CGRect?
+    var visibleFrame: CGRect { usableFrame ?? frame }
     static var screens = [NSScreen(frame: CGRect(x: 0, y: 0, width: 1000, height: 1000))]
 }
 struct ActivateOptions: OptionSet {
@@ -74,6 +94,8 @@ final class Session {
     func focusedWindowOfApp() -> Element? { Self.focusedElement }
     func isMainWindowOfApp() -> Bool { Self.mainElement === windowElement }
     var focusReleasePending = false
+    var outsideCollapseCandidateSince: Date?
+    var edgeDetachCandidateSince: Date?
     var tracking = false
     var pendingDockInteraction = false
     var hasReleasedDockClick = false
@@ -89,10 +111,17 @@ final class Session {
     var alpha: CGFloat = 1
     var onTemporaryShortcutStashStateChanged: ((Session, Bool) -> Void)?
     var onTemporaryShortcutSessionEnded: ((Session, Bool, Bool) -> Void)?
+    var isFloatingForCoordination: Bool { state == .floating }
+    var appDisplayName = "test"
+    var temporaryStashOrdinal = 1
+    var fullscreen = false
+    func isInFullscreenSpace(screen: NSScreen) -> Bool { fullscreen }
     var isExpandedForCoordination: Bool { state == .expanded }
     var isSnappedForCoordination: Bool { if case .snapped = state { return true }; return false }
     func getRawWindowFrame() -> CGRect? { rawUnavailable ? nil : windowElement.frame }
     func getWindowFrame() -> CGRect? { getRawWindowFrame() }
+    func getScreenForWindow() -> NSScreen { NSScreen.screens[0] }
+    func notifyTemporaryShortcutStashStateChanged(isStashed: Bool) { onTemporaryShortcutStashStateChanged?(self, isStashed) }
     func detectDisplayBounds() -> CGRect { NSScreen.screens[0].frame }
     func getDisplayBounds() -> CGRect { detectDisplayBounds() }
     func cgBounds(for screen: NSScreen) -> CGRect { screen.frame }
@@ -133,6 +162,12 @@ final class Session {
     func transitionToFloatingFromManagedState() { cancelTemporaryShortcutStash() }
     func destroy() { destroyed = true; animationGenerationToken += 1 }
     func closed() { handleDestroyed() }
+    func CGWindowListCopyWindowInfo(_ options: CGWindowListOption, _ relative: CGWindowID) -> Any? { cgWindows }
+    func sensedOnScreen() -> Bool { isWindowOnScreen() }
+    func runPositionHelper(onStart: (() -> Void)? = nil, completion: @escaping () -> Void) {
+        animateWindowPositionFast(from: 100, to: currentEdge == 1 ? 0 : 600, startY: 200, endY: 250,
+                                  duration: 0.16, easeIn: false, onStart: onStart, completion: completion)
+    }
 
 __METHODS__
 }

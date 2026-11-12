@@ -8,7 +8,7 @@ enum TemporaryStashDefaults {
     static let fontSize: CGFloat = 12
     static let lineHeight: CGFloat = 15
     static let textPadding: CGFloat = 8
-    static let hoverDelay: TimeInterval = 0.18
+    static let labelGap: CGFloat = 4
     static let screenAdjacencyTolerance: CGFloat = 5
 }
 
@@ -32,13 +32,16 @@ enum TemporaryStashGeometry {
         }
     }
 
-    static func nearestEdge(window: CGRect, screen: CGRect, screens: [CGRect]) -> Int? {
-        [1, 2].filter { !hasAdjacentScreen(edge: $0, screen: screen, screens: screens) }
-            .min { left, right in
-                let lhs = left == 1 ? abs(window.minX - screen.minX) : abs(screen.maxX - window.maxX)
-                let rhs = right == 1 ? abs(window.minX - screen.minX) : abs(screen.maxX - window.maxX)
-                return lhs < rhs
-            }
+    static func nearestEdge(window: CGRect, screen: CGRect, visibleWidth: CGFloat, screens: [CGRect]) -> Int? {
+        let leftAvailable = !hasAdjacentScreen(edge: 1, screen: screen, screens: screens)
+        let rightAvailable = !hasAdjacentScreen(edge: 2, screen: screen, screens: screens)
+        guard leftAvailable || rightAvailable else { return nil }
+        if !rightAvailable { return 1 }
+        if !leftAvailable { return 2 }
+        let leftDistance = abs(window.minX - screen.minX)
+        let rightDistance = abs(screen.maxX - window.maxX)
+        if window.width >= visibleWidth - 40 || abs(leftDistance - rightDistance) <= 20 { return 2 }
+        return leftDistance < rightDistance ? 1 : 2
     }
 
     static func restorePosition(original: CGRect, expanded: CGRect, screens: [CGRect]) -> CGPoint {
@@ -49,36 +52,49 @@ enum TemporaryStashGeometry {
         return isVisible ? original.origin : expanded.origin
     }
 
-    /// 输入按窗口中心从低到高排序（AppKit 坐标）；只移动产生冲突的相邻块。
-    /// 对 center[i] - i * height 做 pooled-adjacent-violators，成对碰撞各推一半；
-    /// 连锁碰撞合并成块；给变换后的块施加共同上下界，保证整个标签在可用区域内。
-    /// 可用区域装不下全部标签时不增加溢出机制。
-    static func labelFrames(centers: [CGFloat], edge: Int, visibleFrame: CGRect) -> [CGRect] {
+    /// 列表从上到下排列（AppKit 的 y 向上）；整列居中，与窗口几何无关。
+    static func labelFrames(count: Int, edge: Int, visibleFrame: CGRect) -> [CGRect] {
         let height = TemporaryStashDefaults.labelHeight
-        struct Block { var start: Int; var count: Int; var mean: CGFloat }
-        var blocks: [Block] = []
-        for (index, center) in centers.enumerated() {
-            blocks.append(Block(start: index, count: 1, mean: center - CGFloat(index) * height))
-            while blocks.count >= 2 && blocks[blocks.count - 2].mean > blocks[blocks.count - 1].mean {
-                let last = blocks.removeLast()
-                let prior = blocks.removeLast()
-                let count = prior.count + last.count
-                blocks.append(Block(start: prior.start, count: count,
-                                    mean: (prior.mean * CGFloat(prior.count) + last.mean * CGFloat(last.count)) / CGFloat(count)))
-            }
+        let stride = height + TemporaryStashDefaults.labelGap
+        let totalHeight = CGFloat(count) * height + CGFloat(max(0, count - 1)) * TemporaryStashDefaults.labelGap
+        return (0..<count).map { index in
+            CGRect(x: edge == 1 ? visibleFrame.minX : visibleFrame.maxX - TemporaryStashDefaults.labelWidth,
+                   y: visibleFrame.midY + totalHeight / 2 - height - CGFloat(index) * stride,
+                   width: TemporaryStashDefaults.labelWidth, height: height)
         }
-        let lower = visibleFrame.minY + height / 2
-        let upper = visibleFrame.maxY - height / 2 - CGFloat(max(0, centers.count - 1)) * height
-        var result = Array(repeating: CGRect.zero, count: centers.count)
-        for block in blocks {
-            let base = lower <= upper ? min(max(block.mean, lower), upper) : block.mean
-            for index in block.start..<(block.start + block.count) {
-                result[index] = CGRect(x: edge == 1 ? visibleFrame.minX : visibleFrame.maxX - TemporaryStashDefaults.labelWidth,
-                                       y: base + CGFloat(index) * height - height / 2,
-                                       width: TemporaryStashDefaults.labelWidth, height: height)
-            }
+    }
+
+    static func draggedFrame(initial: CGRect, deltaY: CGFloat, column: CGRect) -> CGRect {
+        CGRect(x: initial.minX, y: min(max(initial.minY + deltaY, column.minY), column.maxY - initial.height),
+               width: initial.width, height: initial.height)
+    }
+
+    /// 松手中心落在哪个槽位就插入该序号；原列包含被拖项，跨过槽位中线时换位。
+    static func insertionIndex(centerY: CGFloat, columnFrames: [CGRect]) -> Int {
+        guard let first = columnFrames.first else { return 0 }
+        let stride = TemporaryStashDefaults.labelHeight + TemporaryStashDefaults.labelGap
+        let index = Int(((first.midY - centerY) / stride).rounded())
+        return min(max(index, 0), columnFrames.count - 1)
+    }
+}
+
+/// AX 与 CG 的位置更新可能不同步；持续离屏才隐藏，回屏立即恢复。
+struct TemporaryStashVisibility {
+    private var offscreenSince: TimeInterval?
+
+    mutating func isVisible(isOnScreen: Bool, now: TimeInterval) -> Bool {
+        if isOnScreen {
+            offscreenSince = nil
+            return true
         }
-        return result
+        let since = offscreenSince ?? now
+        offscreenSince = since
+        return now - since < 0.3
+    }
+
+    /// 切换 Space 或屏幕配置后坐标不会滞后，下一次离屏判定立即隐藏。
+    mutating func expireDebounce() {
+        offscreenSince = -.infinity
     }
 }
 

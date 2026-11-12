@@ -22,7 +22,9 @@ for right in [false, true] {
            "production reveal preserves vertical position and starts tracking")
     s.isTemporarilyPinned = true
     expect(s.hideForTemporaryStashTab() && s.isExpandedForCoordination, "production switch leaves pinned window visible")
+    s.windowElement.events.removeAll()
     s.cancelTemporaryShortcutStash()
+    expect(s.windowElement.events == ["position", "alpha"], "cancel restores position before alpha")
     expect(s.windowElement.frame.origin == original.origin && s.alpha == 1 && s.destroyed && excluded == true,
            "production pinned cancel restores original and excludes only this window")
     expect(!s.isMirrorPinActive && !s.isTemporarilyPinned && !s.focusReleasePending && s.windowAnimator.stopped,
@@ -124,7 +126,7 @@ vertical.windowElement.frame.origin.y = 450
 vertical.isDragging = true
 vertical.handleMouseUp()
 expect(vertical.isTemporaryShortcutManaged && vertical.temporaryLastExpandedFrame?.minY == 450 && !vertical.destroyed,
-       "vertical edge drag retains stash and updates label anchor")
+       "vertical edge drag retains stash and updates expanded window position")
 
 resetScreens()
 let focusedA = Session()
@@ -182,5 +184,58 @@ let hoverReveal = Session()
 _ = hoverReveal.startTemporaryShortcutStash()
 hoverReveal.revealForTemporaryStashTab()
 expect(!hoverReveal.pendingDockInteraction, "hover reveal preserves ordinary pointer-exit collapse behavior")
+resetScreens()
+let sensing = Session()
+_ = sensing.startTemporaryShortcutStash()
+let onscreenWindow: [String: Any] = [
+    kCGWindowNumber as String: CGWindowID(42),
+    kCGWindowOwnerPID as String: sensing.pid,
+    kCGWindowBounds as String: ["X": CGFloat(800), "Y": CGFloat(700), "Width": CGFloat(400), "Height": CGFloat(300)]
+]
+cgWindows = [onscreenWindow]
+sensing.rawUnavailable = true
+expect(sensing.temporaryStashTabDescriptor()?.isOnScreen == true,
+       "stable CG window ID tolerates AX read failure and lagging CG coordinates")
+cgWindows = []
+expect(sensing.temporaryStashTabDescriptor()?.isOnScreen == false,
+       "off-Space retains descriptor with negative visibility sample")
+sensing.rawUnavailable = false
+sensing.fullscreen = true
+cgWindows = [onscreenWindow]
+expect(sensing.temporaryStashTabDescriptor()?.isOnScreen == false, "fullscreen Space hides temporary label")
+sensing.fullscreen = false
+sensing.isTemporaryShortcutManaged = false
+expect(sensing.temporaryStashTabDescriptor() == nil, "configured session never creates shortcut descriptor")
+// Configured windows still use the existing geometry test, not the temporary ID path.
+WindowAlphaManager.shared.windowID = 42
+expect(!sensing.sensedOnScreen(), "configured on-screen logic remains geometry-based")
+WindowAlphaManager.shared.windowID = nil
+sensing.isTemporaryShortcutManaged = true
+let matching: [String: Any] = [kCGWindowOwnerPID as String: sensing.pid,
+    kCGWindowBounds as String: ["X": sensing.windowElement.frame.minX, "Y": sensing.windowElement.frame.minY, "Width": sensing.windowElement.frame.width]]
+cgWindows = [matching]
+expect(sensing.temporaryStashTabDescriptor()?.isOnScreen == true, "temporary sensing falls back to geometry when window ID unavailable")
+WindowAlphaManager.shared.windowID = 42
+
+for edge in [1, 2] {
+    resetScreens()
+    let fast = Session()
+    fast.currentEdge = edge
+    var callbacks: [String] = []
+    fast.runPositionHelper(onStart: { callbacks.append("start") }, completion: { callbacks.append("finish") })
+    expect(fast.windowAnimator.interpolations == 0 && fast.windowElement.frame.minY == 250 && callbacks == ["start", "finish"],
+           "shared position helper skips interpolation and finishes callbacks for temporary pin release edge=\(edge)")
+    fast.isTemporaryShortcutManaged = false
+    fast.runPositionHelper(completion: {})
+    expect(fast.windowAnimator.interpolations == 1, "configured position helper still interpolates edge=\(edge)")
+}
+resetScreens()
+NSScreen.screens[0].usableFrame = CGRect(x: 0, y: 0, width: 900, height: 1000)
+let visiblyWide = Session()
+visiblyWide.windowElement.frame = CGRect(x: 0, y: 100, width: 860, height: 300)
+expect(visiblyWide.startTemporaryShortcutStash() && visiblyWide.currentEdge == 2,
+       "production stash passes visible width into wide-window preference")
+resetScreens()
+
 print("RESULT checks=\(total) failures=\(failures)")
 exit(failures == 0 ? 0 : 1)

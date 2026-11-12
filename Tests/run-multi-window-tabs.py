@@ -33,7 +33,8 @@ methods = []
 for name in ['startTemporaryShortcutStash', 'cancelTemporaryShortcutStash', 'restoreTemporaryShortcutWindow',
              'finishTemporaryShortcutSession', 'hideForTemporaryStashTab', 'revealForTemporaryStashTab',
              'restoreAndDestroy', 'handleDestroyed', 'handleMouseUp', 'isDetachedFromManagedEdge',
-             'canRevealForTemporaryAppActivation', 'beginTargetedActivationWindow']:
+             'canRevealForTemporaryAppActivation', 'beginTargetedActivationWindow',
+             'temporaryStashTabDescriptor', 'isWindowOnScreen', 'animateWindowPositionFast']:
     matches = list(re.finditer(r'(?:    @discardableResult\n)?    (?:private )?func ' + name + r'\(.*?\n    }', session_source, re.S))
     if len(matches) != 1:
         sys.exit(f'Expected exactly one production method: {name}')
@@ -41,6 +42,8 @@ for name in ['startTemporaryShortcutStash', 'cancelTemporaryShortcutStash', 'res
 state = re.search(r'enum SnapState:.*?\n}', session_source, re.S).group()
 session_fixture = (repo / 'Tests/TemporaryStashSessionHarness.swift.txt').read_text()
 session_fixture = session_fixture.replace('__SNAP_STATE__', state).replace('__METHODS__', '\n\n'.join(methods))
+descriptor = coordinator[coordinator.index('struct TemporaryStashTabDescriptor'):coordinator.index('enum TemporaryStashTabEvent')]
+session_fixture += '\n' + descriptor.replace('WindowSession', 'Session')
 session_fixture += '\n' + (source / 'TemporaryStashLogic.swift').read_text()
 session_fixture += '\n' + (repo / 'Tests/TemporaryStashSessionTests.swift.txt').read_text()
 # Top-level Swift statements require a main.swift when compiling an executable.

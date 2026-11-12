@@ -49,7 +49,7 @@ expect(store.load() == snapshot, "archive roundtrip through isolated in-memory d
 store.save(snapshot)
 expect(defaults.writes == 1, "unchanged polling snapshot does not rewrite defaults")
 let rebooted = TemporaryStashRecoveryStore(defaults: defaults, bootSessionID: "boot-b").load()
-expect(rebooted.windows == snapshot.windows.map { $0.waitingForRelaunch() } && rebooted.assignments == snapshot.assignments,
+expect(rebooted.windows == snapshot.windows.map { $0.waitingForRelaunch(afterReboot: true) } && rebooted.assignments == snapshot.assignments,
        "computer reboot retains geometry, ordinals and slots but invalidates exact identities")
 expect(TemporaryStashRecoveryStore(defaults: defaults, bootSessionID: "").load().windows.allSatisfy(\.awaitingRelaunch),
        "unreadable boot identity retains intent in waiting state")
@@ -159,8 +159,8 @@ resetBackend()
 applicationElements[123]!.windows![0].systemWindowID = 999
 let renumbered = RecoveryManager([saved])
 renumbered.run()
-expect(renumbered.sessions.first?.temporaryStashWindowID == 999 && renumbered.pendingTemporaryRecovery.isEmpty,
-       "confirmed missing window ID falls back to main-window matching even when the PID is unchanged")
+expect(renumbered.sessions.isEmpty && renumbered.pendingTemporaryRecovery == [saved],
+       "missing window ID in a live process stays exact and cannot claim a different window")
 
 resetBackend()
 let newStash = RecoveryManager([])
@@ -352,8 +352,8 @@ expect(multi.sessions.count == 2 && multi.pendingTemporaryRecovery.isEmpty
 expect(multi.sessions.first { $0.temporaryStashID == large.id }?.temporaryStashOrdinal == 4,
        "multi-window relaunch preserves noncontiguous ordinals")
 
-let equalA = record("equal-a", ordinal: 1).waitingForRelaunch()
-let equalB = record("equal-b", windowID: 43, ordinal: 2).waitingForRelaunch()
+let equalA = record("equal-a", pid: 122, ordinal: 1).waitingForRelaunch()
+let equalB = record("equal-b", pid: 122, windowID: 43, ordinal: 2).waitingForRelaunch()
 expect(TemporaryStashRecoveryMatcher.uniqueMatches(records: [equalA, equalB], frames: [original, original]).isEmpty,
        "identical sizes and positions are ambiguous in both directions")
 expect(TemporaryStashRecoveryMatcher.uniqueMatches(records: [equalA, equalB], frames: [original]).isEmpty,
@@ -398,7 +398,8 @@ expect(cancelDuringRecovery.sessions.count == 1 && cancelDuringRecovery.sessions
        "remaining waiting intent never reclaims a window the user explicitly canceled")
 
 resetBackend()
-let manualClosest = RecoveryManager([small.waitingForRelaunch(), large.waitingForRelaunch()])
+let manualClosest = RecoveryManager([record("small", pid: 122, ordinal: 1).waitingForRelaunch(),
+                                     record("large", pid: 122, windowID: 43, ordinal: 4, frame: large.matchingFrame).waitingForRelaunch()])
 let manualLarge = applicationElements[123]!.windows![0]
 manualLarge.frame.size = CGSize(width: 590, height: 460)
 expect(manualClosest.stash(manualLarge)
@@ -544,8 +545,8 @@ TemporaryStashWindowSpaces.available = false
 let unknownRecovery = RecoveryManager([spaceRecord])
 unknownRecovery.run()
 expect(unknownRecovery.sessions.first?.temporaryStashSlot == 4
-       && unknownRecovery.temporaryRecovery.windows.first?.spaceIDs == nil,
-       "unknown current membership uses shared column while preserving archived slot when free")
+       && unknownRecovery.temporaryRecovery.windows.first?.spaceIDs == [999],
+       "unknown current membership retains same-window archived column and slot until a trusted sample arrives")
 unknownRecovery.stop()
 
 resetBackend()
@@ -584,6 +585,142 @@ conflictUnknown.run()
 expect(conflictUnknown.sessions.first?.temporaryStashSlot == 1,
        "unknown recovery membership keeps waiting shared reservation and uses topmost free slot on conflict")
 conflictUnknown.stop()
+
+// Normal shutdown must freeze intent before session teardown, including apps
+// hidden by SideBar and records left waiting by earlier versions.
+for wasHidden in [false, true] {
+    resetBackend()
+    let exiting = RecoveryManager([saved])
+    exiting.run()
+    if !wasHidden { _ = exiting.temporaryAppVisibility.restore(pid: 123, reason: "test-visible") }
+    expect(NSRunningApplication.hidden.contains(123) == wasHidden, "shutdown fixture has expected app visibility: \(wasHidden)")
+    let beforeExit = exiting.temporaryRecoveryStore.load()
+    exiting.stop()
+    expect(exiting.temporaryRecoveryStore.load() == beforeExit
+           && !beforeExit.windows[0].awaitingRelaunch && beforeExit.windows[0].closedAt == nil,
+           "normal shutdown does not classify a live process as closed or awaiting relaunch: \(wasHidden)")
+    expect(!NSRunningApplication.hidden.contains(123), "normal shutdown confirms owned app visible: \(wasHidden)")
+    let nextLaunch = RecoveryManager(exiting.temporaryRecoveryStore.load().windows)
+    nextLaunch.run()
+    expect(nextLaunch.sessions.first?.windowElement === applicationElements[123]!.windows![0]
+           && nextLaunch.sessions.first?.temporaryStashSlot == saved.slot,
+           "normal shutdown and restart restore exact window and slot: \(wasHidden)")
+    nextLaunch.stop()
+}
+
+for isWaiting in [false, true] {
+    resetBackend()
+    let exactWindow = applicationElements[123]!.windows![0]
+    let wrongMain = Element(); wrongMain.systemWindowID = 900
+    applicationElements[123]!.windows!.insert(wrongMain, at: 0)
+    applicationElements[123]!.mainWindow = wrongMain
+    let prior = isWaiting ? saved.waitingForRelaunch() : saved
+    let exactRestart = RecoveryManager([prior])
+    exactRestart.run()
+    expect(exactRestart.sessions.first?.windowElement === exactWindow
+           && exactRestart.temporaryRecovery.windows.first?.awaitingRelaunch == false,
+           "live exact identity wins over misleading main window regardless of awaiting flag: \(isWaiting)")
+    exactRestart.stop()
+
+    resetBackend()
+    let temporarilyEmpty = RecoveryManager([prior])
+    let survivingWindow = applicationElements[123]!.windows![0]
+    applicationElements[123]!.windows = []
+    temporarilyEmpty.run()
+    expect(temporarilyEmpty.pendingTemporaryRecovery == [prior],
+           "empty AX list for a live process does not change waiting state: \(isWaiting)")
+    applicationElements[123]!.windows = [survivingWindow]
+    temporarilyEmpty.run()
+    expect(temporarilyEmpty.sessions.first?.windowElement === survivingWindow,
+           "later enumeration restores the same exact identity: \(isWaiting)")
+    temporarilyEmpty.stop()
+
+    resetBackend()
+    let wrongWindow = Element(); wrongWindow.systemWindowID = 900
+    applicationElements[123]!.windows = [wrongWindow]
+    applicationElements[123]!.mainWindow = wrongWindow
+    let missingExact = RecoveryManager([prior])
+    missingExact.run()
+    expect(missingExact.sessions.isEmpty && missingExact.pendingTemporaryRecovery == [prior],
+           "unchanged live process never enters relaunch matching for a different window: \(isWaiting)")
+    missingExact.stop()
+
+    resetBackend()
+    let busyExact = applicationElements[123]!.windows![0]
+    busyExact.frameUnavailable = true
+    applicationElements[123]!.windows!.append(wrongWindow)
+    applicationElements[123]!.mainWindow = wrongWindow
+    let busyRestart = RecoveryManager([prior])
+    busyRestart.run()
+    expect(busyRestart.sessions.isEmpty && busyRestart.pendingTemporaryRecovery == [prior],
+           "busy exact window cannot fall back to an unrelated main window: \(isWaiting)")
+    busyRestart.stop()
+}
+
+resetBackend()
+let pendingLive = RecoveryManager([saved.waitingForRelaunch()])
+pendingLive.stop()
+expect(pendingLive.temporaryRecoveryStore.load().windows == [saved.waitingForRelaunch()],
+       "cleanup leaves an already waiting pending record unchanged")
+
+// Hide/AX transitions can temporarily make SkyLight membership unavailable.
+// Losing that sample must not merge independent desktop columns.
+resetBackend()
+let localA = applicationElements[123]!.windows![0]
+let localB = Element(); localB.systemWindowID = 43
+applicationElements[123]!.windows!.append(localB)
+TemporaryStashWindowSpaces.memberships = [42: [11], 43: [22]]
+var desktopA = record("desktop-a", slot: 1); desktopA.spaceIDs = [11]
+var desktopB = record("desktop-b", windowID: 43, ordinal: 3, slot: 1); desktopB.spaceIDs = [22]
+let desktopManager = RecoveryManager([desktopA, desktopB])
+desktopManager.run()
+TemporaryStashWindowSpaces.available = false
+desktopManager.persist()
+expect(desktopManager.sessions.map(\.temporaryStashSlot) == [1, 1]
+       && desktopManager.temporaryRecovery.windows.map(\.spaceIDs) == [[11], [22]],
+       "transient unknown membership retains desktop-local slot numbers and last known Spaces")
+desktopManager.stop()
+let desktopRestart = RecoveryManager(desktopManager.temporaryRecoveryStore.load().windows)
+desktopRestart.run()
+expect(desktopRestart.sessions.map(\.temporaryStashSlot) == [1, 1],
+       "restart with initially unavailable membership preserves both desktop-local slot ones")
+TemporaryStashWindowSpaces.available = true
+TemporaryStashWindowSpaces.memberships[42] = [22]
+desktopRestart.persist()
+expect(desktopRestart.sessions.first { $0.temporaryStashID == desktopA.id }?.temporaryStashSlot == 2
+       && desktopRestart.sessions.first { $0.temporaryStashID == desktopB.id }?.temporaryStashSlot == 1,
+       "confirmed desktop migration still gives destination resident priority after restart")
+desktopRestart.stop()
+
+// Pre-desktop archives, including the reported 15.7 waiting records, have no
+// membership. Introducing desktop columns must preserve their explicit numbers.
+resetBackend()
+var exportedRecords: [TemporaryStashRecoveryRecord] = []
+for (index, slot) in [4, 5, 3, 1].enumerated() {
+    let pid = Int32(200 + index)
+    let window = Element(); window.systemWindowID = UInt32(300 + index)
+    let misleading = Element(); misleading.systemWindowID = UInt32(400 + index)
+    let app = Element(); app.windows = [misleading, window]; app.mainWindow = misleading
+    NSRunningApplication.bundles[pid] = "exported-\(index).app"
+    applicationElements[pid] = app
+    TemporaryStashWindowSpaces.memberships[window.systemWindowID!] = [33]
+    exportedRecords.append(record("exported-\(index)", pid: pid, bundle: "exported-\(index).app",
+                                  windowID: window.systemWindowID!, ordinal: 1, slot: slot).waitingForRelaunch())
+}
+let exportedRestart = RecoveryManager(exportedRecords)
+exportedRestart.run()
+expect(exportedRestart.sessions.map(\.temporaryStashWindowID) == exportedRecords.map { Optional($0.windowID) }
+       && exportedRestart.pendingTemporaryRecovery.isEmpty,
+       "all four legacy waiting records recover their exact still-running windows without manual stash")
+expect(exportedRestart.sessions.map(\.temporaryStashSlot) == [4, 5, 3, 1]
+       && exportedRestart.temporaryRecovery.windows.allSatisfy { $0.spaceIDs == [33] && !$0.awaitingRelaunch },
+       "shared-to-desktop migration keeps all explicit slots and clears obsolete waiting flags")
+exportedRestart.stop()
+let exportedAgain = RecoveryManager(exportedRestart.temporaryRecoveryStore.load().windows)
+exportedAgain.run()
+expect(exportedAgain.sessions.map(\.temporaryStashSlot) == [4, 5, 3, 1],
+       "second restart preserves migrated slots instead of compacting or moving them")
+exportedAgain.stop()
 
 print("RESULT checks=\(total) failures=\(failures)")
 exit(failures == 0 ? 0 : 1)

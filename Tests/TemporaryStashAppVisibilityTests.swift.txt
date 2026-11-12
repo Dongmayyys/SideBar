@@ -755,5 +755,46 @@ expect(inlineSession.isExpandedForCoordination && inlineSession.alpha == 1
 NSRunningApplication.onUnhide = nil
 inlineConfirmation.restoreAll(reason: "cleanup")
 
+// Exercise normal exit through the real session/visibility/recovery entry points,
+// including a reentrant workspace notification while unhide is in progress.
+resetVisibilityBackend()
+let cleanExit = RecoveryManager([])
+cleanExit.sessions = collapsedSessions(visibility: cleanExit.temporaryAppVisibility)
+cleanExit.sessions.forEach { cleanExit.attachSessionLifecycle(to: $0) }
+cleanExit.reconcileIndicators()
+let cleanExitSnapshot = cleanExit.temporaryRecoveryStore.load()
+expect(NSRunningApplication.hidden.contains(123), "restart regression starts with an app hidden by SideBar")
+NSRunningApplication.onUnhide = { pid in cleanExit.terminated(pid: pid) }
+cleanExit.stop()
+NSRunningApplication.onUnhide = nil
+expect(cleanExit.pendingTemporaryRecovery.isEmpty
+       && cleanExit.temporaryRecoveryStore.load() == cleanExitSnapshot,
+       "cleanup freezes recovery before session-ended and reentrant termination callbacks")
+expect(!NSRunningApplication.hidden.contains(123), "cleanup confirms SideBar-owned app is visible before restart")
+let emptyOwnership = TemporaryStashHiddenAppStore(defaults: testHiddenDefaults)
+let normalRestartRescue = RescueProbe(store: emptyOwnership)
+expect(emptyOwnership.load().isEmpty, "confirmed cleanup leaves no app hide ownership to rescue")
+normalRestartRescue.recoverOwnedApplications(reason: "normal-restart")
+let afterCleanExit = RecoveryManager(cleanExit.temporaryRecoveryStore.load().windows)
+afterCleanExit.run()
+expect(afterCleanExit.sessions.first?.windowElement === applicationElements[123]!.windows![0]
+       && afterCleanExit.sessions.first?.temporaryStashSlot == cleanExitSnapshot.windows[0].slot,
+       "records=0 app rescue does not prevent exact shortcut and slot restoration")
+afterCleanExit.stop()
+
+resetVisibilityBackend()
+let hiddenSurvivor = collapsedSessions(visibility: TemporaryStashAppVisibility())[0]
+let waitingSurvivor = hiddenSurvivor.temporaryStashRecoveryRecord()!.waitingForRelaunch()
+NSRunningApplication.hidden.insert(123)
+appVisibilityEvents.removeAll()
+let stillHidden = RecoveryManager([waitingSurvivor])
+stillHidden.run()
+expect(stillHidden.sessions.first?.windowElement === hiddenSurvivor.windowElement
+       && stillHidden.pendingTemporaryRecovery.isEmpty,
+       "hidden app with live exact window restores shortcut even when legacy record awaits relaunch")
+expect(NSRunningApplication.hidden.contains(123) && !appVisibilityEvents.contains("unhide:123"),
+       "exact shortcut restoration does not require or bypass geometry rescue unhide ownership")
+stillHidden.stop()
+
 print("RESULT app-visibility checks=\(total) failures=\(failures)")
 exit(failures == 0 ? 0 : 1)

@@ -15,6 +15,8 @@ struct TemporaryStashRecoveryRecord: Codable, Equatable {
 
     // Missing fields in V1 archives retain the old same-boot exact-identity path.
     var awaitingRelaunch: Bool = false
+    // A reboot invalidates physical identities even if macOS reuses all three IDs.
+    var identityInvalidatedByReboot: Bool = false
     var closedAt: Date? = nil
     var slot: Int = 0
     var windowFrame: CGRect? = nil
@@ -22,7 +24,7 @@ struct TemporaryStashRecoveryRecord: Codable, Equatable {
     var matchingFrame: CGRect { windowFrame ?? originalFrame }
 
     private enum CodingKeys: String, CodingKey {
-        case id, bundleID, pid, windowID, edge, screenID, originalFrame, ordinal, originalSize, awaitingRelaunch, closedAt, slot, windowFrame, spaceIDs
+        case id, bundleID, pid, windowID, edge, screenID, originalFrame, ordinal, originalSize, awaitingRelaunch, identityInvalidatedByReboot, closedAt, slot, windowFrame, spaceIDs
     }
 
     private enum LegacyKeys: String, CodingKey { case waitForProcessExit }
@@ -57,6 +59,7 @@ struct TemporaryStashRecoveryRecord: Codable, Equatable {
         ordinal = try values.decode(Int.self, forKey: .ordinal)
         originalSize = try values.decodeIfPresent(CGSize.self, forKey: .originalSize)
         awaitingRelaunch = try values.decodeIfPresent(Bool.self, forKey: .awaitingRelaunch) ?? false
+        identityInvalidatedByReboot = try values.decodeIfPresent(Bool.self, forKey: .identityInvalidatedByReboot) ?? false
         closedAt = try values.decodeIfPresent(Date.self, forKey: .closedAt)
         let legacy = try decoder.container(keyedBy: LegacyKeys.self)
         if closedAt == nil, try legacy.decodeIfPresent(Bool.self, forKey: .waitForProcessExit) == true {
@@ -67,9 +70,10 @@ struct TemporaryStashRecoveryRecord: Codable, Equatable {
         spaceIDs = try values.decodeIfPresent(Set<UInt64>.self, forKey: .spaceIDs)
     }
 
-    func waitingForRelaunch() -> Self {
+    func waitingForRelaunch(afterReboot: Bool = false) -> Self {
         var record = self
         record.awaitingRelaunch = true
+        record.identityInvalidatedByReboot = record.identityInvalidatedByReboot || afterReboot
         record.closedAt = nil
         return record
     }
@@ -162,7 +166,7 @@ final class TemporaryStashRecoveryStore {
         var ids: Set<String> = []
         let sameBoot = !bootSessionID.isEmpty && archive.bootSessionID == bootSessionID
         let valid = snapshot.windows.filter { $0.isValid && ids.insert($0.id).inserted }
-            .map { sameBoot ? $0 : $0.waitingForRelaunch() }
+            .map { sameBoot ? $0 : $0.waitingForRelaunch(afterReboot: true) }
         snapshot.update(windows: valid)
         return snapshot
     }

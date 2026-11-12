@@ -91,9 +91,12 @@ final class WindowRescueManager {
     private func recoverStructuredRecord(_ record: WindowRescueRecord) -> Bool {
         for pid in candidatePIDs(for: record) {
             let appElement = AXUIElementCreateApplication(pid)
-            guard let match = matchWindow(in: appElement, pid: pid, record: record),
-                  let app = NSRunningApplication(processIdentifier: pid), !app.isHidden else {
-                StashDebugLog.write("rescue geometry pending pid=\(pid) window=\(record.windowID) reason=window-unmatched-or-app-hidden ownership-required=true")
+            guard let match = matchWindow(in: appElement, pid: pid, record: record) else {
+                StashDebugLog.write("rescue geometry pending pid=\(pid) window=\(record.windowID) reason=window-unmatched")
+                continue
+            }
+            guard let app = NSRunningApplication(processIdentifier: pid), !app.isHidden else {
+                StashDebugLog.write("rescue geometry pending pid=\(pid) window=\(record.windowID) reason=app-hidden ownership-required=true")
                 continue
             }
 

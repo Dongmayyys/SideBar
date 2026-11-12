@@ -3990,6 +3990,13 @@ class WindowSession {
         temporaryOriginalFrame = record?.originalFrame ?? frame
         temporaryOriginalSize = record == nil ? frame.size : record?.originalSize
         temporaryStashWindowID = WindowAlphaManager.shared.findWindowID(for: windowElement, pid: pid)
+        // The same surviving window may be hidden while SkyLight is unavailable.
+        // Retain its last known column until a fresh membership sample arrives.
+        // A relaunched app must establish its own membership instead.
+        if let record, !record.identityInvalidatedByReboot, let windowID = temporaryStashWindowID,
+           record.matches(pid: pid, bundleID: bundleID, windowID: windowID) {
+            temporaryStashSpaceIDs = record.spaceIDs
+        }
         lockedWidth = frame.width
         initialFrameCaptured = true
         snappedScreen = screen
@@ -4084,7 +4091,9 @@ class WindowSession {
         if temporaryStashWindowID == nil {
             temporaryStashWindowID = WindowAlphaManager.shared.findWindowID(for: windowElement, pid: pid)
         }
-        temporaryStashSpaceIDs = temporaryStashWindowID.flatMap { TemporaryStashWindowSpaces.spaceIDs(for: $0) }
+        if let spaces = temporaryStashWindowID.flatMap({ TemporaryStashWindowSpaces.spaceIDs(for: $0) }) {
+            temporaryStashSpaceIDs = spaces
+        }
     }
 
     func temporaryStashTabDescriptor() -> TemporaryStashTabDescriptor? {

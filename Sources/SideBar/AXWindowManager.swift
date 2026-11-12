@@ -126,6 +126,7 @@ class AXWindowManager {
     }
 
     private func retainTemporaryRecoveryAfterTermination(pid: pid_t) {
+        guard !hasCleanedUp else { return }
         // The archive also covers AX-destroy notifications delivered before the
         // workspace termination notification and sessions already being torn down.
         for record in temporaryRecovery.windows where record.pid == pid {
@@ -728,6 +729,8 @@ class AXWindowManager {
 
     private func stopTemporaryRecovery() {
         persistTemporaryRecovery()
+        // Freeze intent before restoring windows: unhide confirmation pumps the
+        // run loop and can deliver lifecycle notifications during teardown.
         hasCleanedUp = true
         temporaryRecoveryRetry?.cancel()
         temporaryRecoveryRetry = nil
@@ -740,19 +743,25 @@ class AXWindowManager {
         refreshTemporaryDockExclusion(bundleID: record.bundleID)
     }
 
-    /// Exact identities always get first refusal. Only confirmed missing identities
-    /// enter relaunch matching; a busy AX application keeps its exact record.
+    /// A waiting flag is not evidence that the process exited. Always try the
+    /// exact identity first; only a changed process permits relaunch matching.
     private func restoreTemporaryShortcuts(attemptsRemaining: Int) {
         guard !hasCleanedUp else { return }
         temporaryRecoveryRetry?.cancel()
         temporaryRecoveryRetry = nil
         resolveClosedTemporaryRecovery()
         var exactWindows: [AXUIElement] = []
-        for record in pendingTemporaryRecovery where !record.awaitingRelaunch && record.closedAt == nil {
+        var relaunchedRecords: [TemporaryStashRecoveryRecord] = []
+        for record in pendingTemporaryRecovery where record.closedAt == nil {
             guard !AppConfig.shared.isAppEnabled(bundleID: record.bundleID) else { continue }
+            if record.identityInvalidatedByReboot {
+                relaunchedRecords.append(record)
+                continue
+            }
             guard let app = NSRunningApplication(processIdentifier: record.pid), !app.isTerminated,
                   app.bundleIdentifier == record.bundleID else {
                 markTemporaryRecoveryWaiting(record)
+                relaunchedRecords.append(record.waitingForRelaunch())
                 continue
             }
             guard let windows = temporaryRecoveryWindows(pid: record.pid) else { continue }
@@ -761,14 +770,12 @@ class AXWindowManager {
             }) {
                 exactWindows.append(window)
                 restoreTemporaryShortcut(record, window: window, pid: record.pid)
-            } else if windows.allSatisfy({ WindowAlphaManager.shared.findWindowID(for: $0, pid: record.pid) != nil }) {
-                markTemporaryRecoveryWaiting(record)
+            } else {
+                StashDebugLog.write("shortcut recovery pending pid=\(record.pid) window=\(record.windowID) reason=exact-window-unavailable process-alive=true hidden=\(app.isHidden) awaiting=\(record.awaitingRelaunch)")
             }
         }
 
-        let groups = Dictionary(grouping: pendingTemporaryRecovery.filter {
-            $0.awaitingRelaunch && $0.closedAt == nil
-        }, by: \.bundleID)
+        let groups = Dictionary(grouping: relaunchedRecords, by: \.bundleID)
         for (bundleID, records) in groups {
             guard !AppConfig.shared.isAppEnabled(bundleID: bundleID) else { continue }
             var candidates: [(pid: pid_t, window: AXUIElement, frame: CGRect)] = []
@@ -837,6 +844,7 @@ class AXWindowManager {
         sessions.append(session)
         temporaryTabCoordinator.suppressRestoredHover(for: session)
         pendingTemporaryRecovery.removeAll { $0.id == record.id }
+        StashDebugLog.write("shortcut recovery restored id=\(record.id) pid=\(pid) window=\(WindowAlphaManager.shared.findWindowID(for: window, pid: pid) ?? 0) slot=\(session.temporaryStashSlot) previous-awaiting=\(record.awaitingRelaunch)")
         refreshTemporaryDockExclusion(bundleID: record.bundleID)
     }
 
@@ -875,11 +883,13 @@ class AXWindowManager {
     private func pendingTemporaryReplacement(for window: AXUIElement, pid: pid_t, bundleID: String) -> TemporaryStashRecoveryRecord? {
         let records = pendingTemporaryRecovery.filter { $0.bundleID == bundleID }
         if let windowID = WindowAlphaManager.shared.findWindowID(for: window, pid: pid),
-           let exact = records.first(where: { !$0.awaitingRelaunch && $0.matches(pid: pid, bundleID: bundleID, windowID: windowID) }) {
+           let exact = records.first(where: { !$0.identityInvalidatedByReboot && $0.matches(pid: pid, bundleID: bundleID, windowID: windowID) }) {
             return exact
         }
         guard let frame = temporaryRecoveryFrame(window) else { return nil }
-        return TemporaryStashRecoveryMatcher.replacement(in: records.filter(\.awaitingRelaunch), frame: frame)
+        return TemporaryStashRecoveryMatcher.replacement(in: records.filter {
+            $0.awaitingRelaunch && ($0.identityInvalidatedByReboot || $0.pid != pid)
+        }, frame: frame)
     }
 
     private func refreshTemporaryDockExclusion(bundleID: String) {

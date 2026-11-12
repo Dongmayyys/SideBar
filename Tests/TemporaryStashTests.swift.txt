@@ -333,7 +333,8 @@ dragCoordinator.reconcile(sessions: [d3, rightLabel, d2, d1])
 expect(TemporaryStashTabWindow.live == initialFrames, "AX enumeration cannot change fixed slots")
 let from = tabPoint("d3"), to = tabPoint("d1")
 TemporaryStashTabWindow.emit("d3", .down(from))
-expect(TemporaryStashTabWindow.placeholders.count == 4, "press shows all used slots and one additional empty slot")
+expect(TemporaryStashTabWindow.placeholders.count == TemporaryStashGeometry.slotCapacity(visibleFrame: mainScreen),
+       "press shows every slot the dragged edge can hold, including all empty slots")
 transitions.removeAll()
 TemporaryStashTabWindow.emit("d3", .dragged(to))
 expect(transitions.isEmpty && dragSessions.allSatisfy(\.hoverLock), "slot drag blocks hover reveal and collapse")
@@ -405,6 +406,69 @@ dragCoordinator.reconcile(sessions: dragSessions)
 expect(!d4.hoverLock, "polling recovers lost mouse-up after dragged panel closes")
 dragCoordinator.tearDownAll()
 expect(TemporaryStashTabWindow.live.isEmpty, "teardown closes reordered and hidden panels")
+
+// A sparse edge still offers its entire usable column, not just the slot after
+// the last occupant. Exercise every empty destination, starting at the bottom.
+for edge in [1, 2] {
+    for height: CGFloat in [260, 900, 1000] {
+        let fullColumnCoordinator = TemporaryStashTabCoordinator()
+        let label = WindowSession("full-column", edge: edge)
+        let otherEdge = WindowSession("other-edge", edge: edge == 1 ? 2 : 1)
+        let visible = CGRect(x: 60, y: 50, width: 900, height: height)
+        label.visibleFrame = visible
+        let capacity = TemporaryStashGeometry.slotCapacity(visibleFrame: visible)
+        let expectedFrames = (1...capacity).compactMap {
+            TemporaryStashGeometry.slotFrame(slot: $0, edge: edge, visibleFrame: visible)
+        }
+        var publishedSlots: [Int] = []
+        fullColumnCoordinator.onSlotsChanged = { assignments in
+            if let slot = assignments.first(where: { $0.id == label.temporaryStashID })?.slot {
+                publishedSlots.append(slot)
+            }
+        }
+        NSEvent.mouseLocation = CGPoint(x: visible.midX, y: visible.midY)
+        fullColumnCoordinator.reconcile(sessions: [label, otherEdge])
+        let otherFrame = TemporaryStashTabWindow.live[otherEdge.temporaryStashID]
+        transitions.removeAll()
+        let targets = [capacity] + Array(2..<capacity) + [1]
+        for targetSlot in targets {
+            TemporaryStashTabWindow.emit(label.temporaryStashID, .down(tabPoint(label.temporaryStashID)))
+            let placeholders = TemporaryStashTabWindow.placeholders.values.sorted { $0.midY > $1.midY }
+            expect(placeholders == expectedFrames,
+                   "sparse drag displays exactly slotCapacity placeholders on its own edge edge=\(edge) height=\(height)")
+            let target = expectedFrames[targetSlot - 1]
+            TemporaryStashTabWindow.emit(label.temporaryStashID, .up(CGPoint(x: target.midX, y: target.midY)))
+            expect(label.temporaryStashSlot == targetSlot && publishedSlots.last == targetSlot
+                   && TemporaryStashTabWindow.live[label.temporaryStashID] == target
+                   && TemporaryStashTabWindow.placeholders.isEmpty,
+                   "drop into any empty slot moves and persists label then removes placeholders slot=\(targetSlot) edge=\(edge) height=\(height)")
+        }
+        expect(publishedSlots == targets && TemporaryStashTabWindow.live[otherEdge.temporaryStashID] == otherFrame
+               && otherEdge.temporaryStashSlot == 1 && transitions.isEmpty,
+               "whole-column drag changes only dragged label and never triggers hover edge=\(edge) height=\(height)")
+        let first = expectedFrames[0]
+        for invalidPoint in [CGPoint(x: first.midX, y: first.minY - 2),
+                             CGPoint(x: first.midX, y: visible.minY - 1)] {
+            TemporaryStashTabWindow.emit(label.temporaryStashID, .down(tabPoint(label.temporaryStashID)))
+            TemporaryStashTabWindow.emit(label.temporaryStashID, .up(invalidPoint))
+            expect(label.temporaryStashSlot == 1 && publishedSlots == targets,
+                   "gap and below-capacity drops remain invalid edge=\(edge) height=\(height)")
+        }
+        // A shorter usable area can leave slot one's frame unchanged. Its old
+        // bottom slots must still be invalidated before accepting a drop.
+        TemporaryStashTabWindow.emit(label.temporaryStashID, .down(tabPoint(label.temporaryStashID)))
+        label.visibleFrame = CGRect(x: visible.minX, y: visible.maxY - TemporaryStashDefaults.labelHeight,
+                                    width: visible.width, height: TemporaryStashDefaults.labelHeight)
+        fullColumnCoordinator.reconcile(sessions: [label, otherEdge])
+        expect(TemporaryStashTabWindow.placeholders.isEmpty && label.hoverLock,
+               "usable-area shrink cancels stale full-column drag even when occupied frame is unchanged edge=\(edge) height=\(height)")
+        let oldBottom = expectedFrames[capacity - 1]
+        TemporaryStashTabWindow.emit(label.temporaryStashID, .up(CGPoint(x: oldBottom.midX, y: oldBottom.midY)))
+        expect(label.temporaryStashSlot == 1 && publishedSlots == targets,
+               "cancelled drag cannot drop into a slot outside the new usable capacity edge=\(edge) height=\(height)")
+        fullColumnCoordinator.tearDownAll()
+    }
+}
 
 for edge in [1, 2] {
     let stableCoordinator = TemporaryStashTabCoordinator()

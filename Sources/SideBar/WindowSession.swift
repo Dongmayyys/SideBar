@@ -370,7 +370,7 @@ class WindowSession {
     /// blocks it. Only losing that display selects a new right-first edge.
     private func reseatTemporaryShortcutGeometry(in activeScreens: [NSScreen]) -> Bool {
         guard isTemporaryShortcutManaged, !isFloatingForCoordination,
-              let saved = snappedScreen, let frame = getRawWindowFrame() else { return false }
+              let saved = snappedScreen else { return false }
         let sameScreen = activeScreens.first { $0.displayID == saved.displayID }
         guard let screen = sameScreen ?? activeScreens.first else { return false }
         let bounds = cgBounds(for: screen)
@@ -396,13 +396,13 @@ class WindowSession {
         snappedScreenFrame = screen.frame
         snappedDisplayBounds = bounds
         currentEdge = edge
-        let adjusted = clampFrameYToBounds(frame, bounds: bounds)
-        guard let geometry = edgeGeometry(for: adjusted) else { return false }
         invalidatePendingFocusRelease()
         windowAnimator.stop()
         animationGenerationToken &+= 1
         isAnimating = false
-        let expanded = CGRect(origin: geometry.expanded, size: frame.size)
+        guard let adjusted = prepareTemporaryShortcutFrame(),
+              let geometry = edgeGeometry(for: adjusted) else { return false }
+        let expanded = CGRect(origin: geometry.expanded, size: adjusted.size)
         let wasExpanded = isExpandedForCoordination
         guard setWindowPositionWithoutSystemAnimation(position: wasExpanded ? geometry.expanded : geometry.visualHidden,
                   context: "WindowSession.reseatTemporaryShortcutGeometry.position") == .success else { return false }
@@ -610,6 +610,8 @@ class WindowSession {
     var temporaryStashSlot: Int = 0
     var temporaryStashSlotCapacity: Int { TemporaryStashGeometry.slotCapacity(visibleFrame: getScreenForWindow().visibleFrame) }
     private var temporaryOriginalFrame: CGRect?
+    private var temporaryOriginalSize: CGSize?
+    weak var temporaryAppVisibility: TemporaryStashAppVisibility?
     private var temporaryLastExpandedFrame: CGRect?
     let temporaryStashID: String
     private var temporaryStashWindowID: CGWindowID?
@@ -798,8 +800,7 @@ class WindowSession {
 
     @discardableResult
     func relinquishToDockMinimizeIfDetachedFromEdge() -> Bool {
-        // 快捷键窗口只在真实拖动结束时判定取消，不把应用自己的布局调整当作拖离。
-        // 同时不让拖动中的 AX 回调触发软件级控制权转移。
+        // 快捷键窗口始终保留收纳，不因拖动或应用布局调整转移软件级控制权。
         if isTemporaryShortcutManaged { return false }
         guard !isAnimating else {
             // 动画过程中 frame 一定会临时偏离最终锚点，禁止任何脱离判定，
@@ -3983,6 +3984,7 @@ class WindowSession {
         guard let edge = TemporaryStashGeometry.recoveryEdge(savedEdge: savedScreen == nil ? nil : record?.edge,
                     screen: bounds, screens: NSScreen.screens.map { cgBounds(for: $0) }) else { return false }
         temporaryOriginalFrame = record?.originalFrame ?? frame
+        temporaryOriginalSize = record == nil ? frame.size : record?.originalSize
         temporaryStashWindowID = WindowAlphaManager.shared.findWindowID(for: windowElement, pid: pid)
         lockedWidth = frame.width
         initialFrameCaptured = true
@@ -3990,13 +3992,8 @@ class WindowSession {
         snappedScreenFrame = screen.frame
         snappedDisplayBounds = bounds
         currentEdge = edge
-        let expanded = record == nil ? frame : clampFrameYToBounds(frame, bounds: bounds)
-        temporaryLastExpandedFrame = CGRect(x: edge == 1 ? bounds.minX : bounds.maxX - frame.width,
-                                            y: expanded.minY, width: frame.width, height: frame.height)
-        if record != nil && expanded.minY != frame.minY {
-            guard setWindowPositionWithoutSystemAnimation(position: expanded.origin,
-                      context: "WindowSession.startTemporaryShortcutStash.restoreY") == .success else { return false }
-        }
+        guard let expanded = prepareTemporaryShortcutFrame() else { return false }
+        temporaryLastExpandedFrame = expanded
         guard collapseWindow(immediate: true, triggerEffects: false) else { return false }
         // Automatic restoration must not activate an app or schedule a focus handoff.
         if record == nil { scheduleFocusRelease(after: 0.5) }
@@ -4014,17 +4011,17 @@ class WindowSession {
         // never the collapsed window's offscreen coordinates.
         return TemporaryStashRecoveryRecord(id: temporaryStashID, bundleID: bundleID, pid: pid,
                     windowID: windowID, edge: currentEdge, screenID: getScreenForWindow().displayID,
-                    originalFrame: original, ordinal: temporaryStashOrdinal, slot: temporaryStashSlot,
+                    originalFrame: original, ordinal: temporaryStashOrdinal, originalSize: temporaryOriginalSize, slot: temporaryStashSlot,
                     windowFrame: CGRect(origin: original.origin, size: temporaryLastExpandedFrame?.size ?? original.size))
     }
 
-    func cancelTemporaryShortcutStash(keepingFrame: CGRect? = nil) {
+    func cancelTemporaryShortcutStash() {
         guard isTemporaryShortcutManaged else { return }
-        restoreTemporaryShortcutWindow(excludeWindow: true, keepingFrame: keepingFrame)
+        restoreTemporaryShortcutWindow(excludeWindow: true)
         destroy()
     }
 
-    private func restoreTemporaryShortcutWindow(excludeWindow: Bool, keepingFrame: CGRect? = nil) {
+    private func restoreTemporaryShortcutWindow(excludeWindow: Bool) {
         // 先终止所有位置写入，再恢复。防止退出后仍有动画/焦点回调把窗口拉回边缘。
         invalidatePendingFocusRelease()
         queuedForwardedHotkeyToggle = false
@@ -4040,36 +4037,35 @@ class WindowSession {
         pinnedAnchor = nil
         teardownMirrorCapture()
         effectWindow.stopExpandEffect(closeWindow: true, immediate: true)
-        let current = keepingFrame ?? getRawWindowFrame() ?? temporaryLastExpandedFrame ?? temporaryOriginalFrame
+        let current = getRawWindowFrame() ?? temporaryLastExpandedFrame ?? temporaryOriginalFrame
         if let current {
-            if keepingFrame != nil {
-                // 拖离取消时不再写位置，保留用户松手后的几何。
-                clearTrackedWindowRecoveryState(frameHint: current)
-            } else {
-                let expanded = temporaryLastExpandedFrame
-                    ?? CGRect(origin: edgeGeometry(for: current)?.expanded ?? current.origin, size: current.size)
-                let position = temporaryOriginalFrame.map {
-                    TemporaryStashGeometry.restorePosition(original: $0, expanded: expanded,
-                                                           screens: NSScreen.screens.map { cgBounds(for: $0) })
-                } ?? current.origin
-                // 短暂 cannotComplete 重试一次；失败时保留已有救援记录。
-                var result = setWindowPositionWithoutSystemAnimation(position: position,
-                                                    context: "WindowSession.restoreTemporaryShortcutWindow.position")
-                if result == .cannotComplete {
-                    result = setWindowPositionWithoutSystemAnimation(position: position,
-                                                     context: "WindowSession.restoreTemporaryShortcutWindow.retry")
-                }
-                if result == .success { clearTrackedWindowRecoveryState(frameHint: current) }
+            let expanded = temporaryLastExpandedFrame
+                ?? CGRect(origin: edgeGeometry(for: current)?.expanded ?? current.origin, size: current.size)
+            let position = temporaryOriginalFrame.map {
+                TemporaryStashGeometry.restorePosition(original: $0, expanded: expanded,
+                                                       screens: NSScreen.screens.map { cgBounds(for: $0) })
+            } ?? current.origin
+            // 短暂 cannotComplete 重试一次；失败时保留已有救援记录。
+            var result = setWindowPositionWithoutSystemAnimation(position: position,
+                                                size: temporaryOriginalSize,
+                                                context: "WindowSession.restoreTemporaryShortcutWindow.position")
+            if result == .cannotComplete {
+                result = setWindowPositionWithoutSystemAnimation(position: position,
+                                                 size: temporaryOriginalSize,
+                                                 context: "WindowSession.restoreTemporaryShortcutWindow.retry")
             }
+            if result == .success { clearTrackedWindowRecoveryState(frameHint: current) }
             // 保持隐藏直到恢复位置写完，避免取消时在屏幕边缘露出一帧。
             setWindowAlpha(1, isHidden: false, frameHint: current, preserveRecoveryRecord: true)
         }
+        _ = temporaryAppVisibility?.restore(pid: pid, reason: excludeWindow ? "cancel" : "session-cleanup")
         state = .floating
         indicatorWindow.orderOut(nil)
         pinControlWindow.orderOut(nil)
         fusionHoverLock = false
         unlockScreen()
         temporaryOriginalFrame = nil
+        temporaryOriginalSize = nil
         temporaryLastExpandedFrame = nil
         finishTemporaryShortcutSession(excludeWindow: excludeWindow, removeSession: true)
     }
@@ -4082,7 +4078,8 @@ class WindowSession {
         }
         return TemporaryStashTabDescriptor(session: self, edge: currentEdge, screenID: screen.displayID,
                                            visibleFrame: screen.visibleFrame,
-                                           isOnScreen: !isInFullscreenSpace(screen: screen) && isWindowOnScreen(),
+                                           isOnScreen: !isInFullscreenSpace(screen: screen)
+                                                && (temporaryAppVisibility?.isOnScreen(sessionID: temporaryStashID, pid: pid) ?? isWindowOnScreen()),
                                            title: TemporaryStashOrdinals.title(appName: appDisplayName, ordinal: temporaryStashOrdinal))
     }
 
@@ -4138,7 +4135,8 @@ class WindowSession {
 
     func revealForTemporaryStashTab(isAppActivated: Bool = false) {
         guard isTemporaryShortcutManaged, !isAnimating, isSnappedForCoordination,
-              let frame = getRawWindowFrame(), let geometry = edgeGeometry(for: frame) else {
+              temporaryAppVisibility?.prepareToReveal(pid: pid) != false,
+              let frame = prepareTemporaryShortcutFrame() else {
             StashDebugLog.write("reveal skipped \(bundleID) id=\(temporaryStashID.prefix(8)) appActivated=\(isAppActivated) \(debugStateSummary)")
             return
         }
@@ -4153,13 +4151,14 @@ class WindowSession {
         // ⌘Tab/Dock 激活时鼠标可能仍在窗外，沿用原 Dock 等待首次交互的门禁。
         pendingDockInteraction = isAppActivated
         hasReleasedDockClick = NSEvent.pressedMouseButtons & 1 == 0
-        state = .expanded
-        notifyTemporaryShortcutStashStateChanged(isStashed: false)
         effectWindow.stopExpandEffect(closeWindow: true, immediate: true)
         indicatorWindow.orderOut(nil)
         // 切换标签时使用同步几何，保证前一个已收回后再显示目标，且无延迟回调复活会话。
-        setWindowPosition(position: geometry.expanded)
-        temporaryLastExpandedFrame = CGRect(origin: geometry.expanded, size: frame.size)
+        guard setWindowPositionWithoutSystemAnimation(position: frame.origin,
+                  context: "WindowSession.revealForTemporaryStashTab.position") == .success else { return }
+        state = .expanded
+        notifyTemporaryShortcutStashStateChanged(isStashed: false)
+        temporaryLastExpandedFrame = frame
         setWindowAlpha(1, isHidden: false, frameHint: temporaryLastExpandedFrame)
         focusForTemporaryStashTab()
         startMouseTrackingTimer()
@@ -4179,7 +4178,22 @@ class WindowSession {
     func handleMouseUp() {
         let wasDragging = isDragging
         isDragging = false
-        
+
+        if isTemporaryShortcutManaged {
+            guard wasDragging, isExpandedForCoordination, let frame = getRawWindowFrame() else { return }
+            // 松手不写位置；同步宽度与恢复兜底几何，下次展开重新计算可用高度。
+            temporaryLastExpandedFrame = frame
+            lockedWidth = frame.width
+            initialFrameCaptured = true
+            observedGeometryChangeToken &+= 1
+            lastCheckedMouseLocation = nil
+            lastCheckedIsOutside = nil
+            cachedInteractionHitFrame = nil
+            outsideCollapseCandidateSince = nil
+            showIndicator(animated: false)
+            return
+        }
+
         guard let frame = getWindowFrame() else { return }
         // 浮动状态下动态检测屏幕（此时窗口在可见位置，检测可靠）
         let displayBounds = detectDisplayBounds()
@@ -4188,16 +4202,6 @@ class WindowSession {
         let maxX = displayBounds.maxX
         
         if !wasDragging { return }
-        if isTemporaryShortcutManaged {
-            // 拖动只更新这个窗口；拖离后取消收纳，不重新选择边缘或联动同软件窗口。
-            if isDetachedFromManagedEdge(frame) {
-                cancelTemporaryShortcutStash(keepingFrame: frame)
-            } else {
-                temporaryLastExpandedFrame = frame
-                showIndicator(animated: false)
-            }
-            return
-        }
         if isTemporarilyPinned {
             if let rawFrame = getRawWindowFrame(), abs(rawFrame.width - lockedWidth) > 1 {
                 lockedWidth = rawFrame.width
@@ -4242,10 +4246,30 @@ class WindowSession {
         }
     }
     
+    /// Request the usable height, then trust the app's read-back size rather than
+    /// assuming it accepted the request (some apps enforce a smaller maximum).
+    private func prepareTemporaryShortcutFrame() -> CGRect? {
+        guard isTemporaryShortcutManaged, let frame = getRawWindowFrame() else { return nil }
+        let visible = getScreenForWindow().visibleFrame
+        guard visible.height > 0 else { return nil }
+        let top = primaryScreenHeight - visible.maxY
+        setWindowPositionWithoutSystemAnimation(position: CGPoint(x: frame.minX, y: top),
+            size: CGSize(width: frame.width, height: visible.height),
+            context: "WindowSession.prepareTemporaryShortcutFrame")
+        guard let actual = getRawWindowFrame(), let geometry = edgeGeometry(for: actual) else { return nil }
+        lockedWidth = actual.width
+        initialFrameCaptured = true
+        return CGRect(origin: geometry.expanded, size: actual.size)
+    }
+
     private func edgeGeometry(for frame: CGRect? = nil) -> (expanded: CGPoint, hidden: CGPoint, visualHidden: CGPoint)? {
-        guard let frame = frame ?? getWindowFrame() else { return nil }
+        guard var frame = frame ?? getWindowFrame() else { return nil }
         let displayBounds = getDisplayBounds()
-        let lockedOrCurrentWidth = lockedWidth > 0 ? lockedWidth : frame.width
+        if isTemporaryShortcutManaged {
+            let visible = getScreenForWindow().visibleFrame
+            frame.origin.y = primaryScreenHeight - visible.maxY + max(0, (visible.height - frame.height) / 2)
+        }
+        let lockedOrCurrentWidth = !isTemporaryShortcutManaged && lockedWidth > 0 ? lockedWidth : frame.width
         let hideOffset: CGFloat = 20000
         let visualHideOffset: CGFloat = 1
 
@@ -4405,6 +4429,7 @@ class WindowSession {
         }
         if isTemporarilyPinned { return false }
         if isAnimating { return false } // 正在动画中，拒绝新指令
+        if isTemporaryShortcutManaged, isExpandedForCoordination, NSEvent.pressedMouseButtons != 0 { return false }
         queuedForwardedHotkeyToggle = false
         excludeFromFocusReturn(for: 0.6)
         lastCollapseTime = Date() // 记录折叠时间戳用于防抖
@@ -4416,9 +4441,10 @@ class WindowSession {
         // 必须在计算坐标前抓取最新尺寸
         guard let rawFrame = getRawWindowFrame() else { return false }
         
-        // 核心修复: 平衡手动缩放记忆与系统渲染抖动引起的宽度雪崩累加
-        // 系统推移导致的变宽一般<4px，大于15px则说明人类拖拽过窗口边缘
-        if abs(rawFrame.width - lockedWidth) > 15 {
+        // 快捷键窗口同步实际宽度；设置托管窗口仍过滤系统推移造成的小幅尺寸抖动。
+        if isTemporaryShortcutManaged {
+            lockedWidth = rawFrame.width
+        } else if abs(rawFrame.width - lockedWidth) > 15 {
             print("🎚️ 尺寸更新: 检测到手动缩放 (差异 > 15px)，更新锁从 \(lockedWidth) 到 \(rawFrame.width)")
             lockedWidth = rawFrame.width
         }
@@ -4718,6 +4744,11 @@ class WindowSession {
     }
     
     private func checkMouseForCollapse() {
+        // 拖动/缩放期间不启动鼠标离开收回或 Dock 外部点击收回。
+        if isTemporaryShortcutManaged, NSEvent.pressedMouseButtons != 0 {
+            outsideCollapseCandidateSince = nil
+            return
+        }
         // 切到其他普通应用后，窗口即使仍在鼠标所在矩形内，也可能已被遮挡。
         // 不能沿用“鼠标还在窗内”的缓存或快捷键等待；按现有宽限期真正收回。
         let frontmostApp = NSWorkspace.shared.frontmostApplication
@@ -4737,7 +4768,7 @@ class WindowSession {
             y: (rawMouseLoc.y / Self.mouseCacheQuantum).rounded()
         )
         let geometryUnchanged = observedGeometryChangeToken == lastCheckedObservedGeometryToken
-        if !hasOtherForegroundApp,
+        if !isTemporaryShortcutManaged, !hasOtherForegroundApp,
            let lastLoc = lastCheckedMouseLocation, lastLoc == quantizedMouse,
            geometryUnchanged, lastCheckedIsOutside == false {
             return
@@ -4865,8 +4896,8 @@ class WindowSession {
     private func getWindowFrame() -> CGRect? {
         guard var frame = getRawWindowFrame() else { return nil }
         
-        // 首次抓取并锁死宽度
-        if !initialFrameCaptured && frame.width > 0 {
+        // 快捷键窗口跟随当前宽度；设置托管窗口仍在首次抓取后锁定宽度。
+        if (isTemporaryShortcutManaged || !initialFrameCaptured) && frame.width > 0 {
             lockedWidth = frame.width
             initialFrameCaptured = true
         }
@@ -4879,6 +4910,9 @@ class WindowSession {
     }
 
     private func interactionHitTestFrame() -> CGRect? {
+        // 拖动后的 CG bounds 及缓存可能滞后于 AX。快捷键窗口用当前真实几何，
+        // 避免鼠标仍在移动后的窗口内时，被旧范围误判为离开。
+        if isTemporaryShortcutManaged { return getRawWindowFrame() }
         // 性能优化：展开稳态期间，AX Observer 不会上报几何变化（observedGeometryChangeToken
         // 不变），此时窗口在 CGWindowList 中的 bounds 也不会变。复用 200ms 内的缓存结果，
         // 完全跳过 CGWindowListCopyWindowInfo 的全量枚举（这是 checkMouseForCollapse 里
@@ -4993,7 +5027,12 @@ class WindowSession {
     }
 
     @discardableResult
-    private func setWindowPositionWithoutSystemAnimation(position: CGPoint, context: String) -> AXError {
+    private func setWindowPositionWithoutSystemAnimation(position: CGPoint, size: CGSize? = nil, context: String) -> AXError {
+        func writeGeometry() -> AXError {
+            let sizeResult = size.map { axSetSizeAttribute(on: windowElement, size: $0, context: context + ".size") } ?? .success
+            let positionResult = axSetPositionAttribute(on: windowElement, position: position, context: context)
+            return positionResult == .success ? sizeResult : positionResult
+        }
         let attribute = "AXEnhancedUserInterface" as CFString
         var originalValue: CFTypeRef?
         guard isTemporaryShortcutManaged,
@@ -5002,13 +5041,13 @@ class WindowSession {
               let enhancedUI = originalValue as? Bool, enhancedUI,
               axSetBoolAttribute(on: appElement, attribute: attribute, value: false,
                                  context: context + ".enhancedUI.disable") == .success else {
-            return axSetPositionAttribute(on: windowElement, position: position, context: context)
+            return writeGeometry()
         }
         defer {
             axSetBoolAttribute(on: appElement, attribute: attribute, value: enhancedUI,
                                context: context + ".enhancedUI.restore")
         }
-        return axSetPositionAttribute(on: windowElement, position: position, context: context)
+        return writeGeometry()
     }
 
     func suspendForAccessibilityLoss() {
@@ -5029,6 +5068,7 @@ class WindowSession {
         indicatorWindow.orderOut(nil)
         pinControlWindow.orderOut(nil)
         setWindowAlpha(1.0, isHidden: false, preserveRecoveryRecord: true)
+        _ = temporaryAppVisibility?.restore(pid: pid, reason: "accessibility-loss")
         destroy()
     }
 }

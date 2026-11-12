@@ -10,6 +10,8 @@ struct TemporaryStashRecoveryRecord: Codable, Equatable {
     let screenID: UInt32
     let originalFrame: CGRect
     let ordinal: Int
+    // Optional so archives written before size restoration remain position-only.
+    var originalSize: CGSize? = nil
 
     // Missing fields in V1 archives retain the old same-boot exact-identity path.
     var awaitingRelaunch: Bool = false
@@ -19,13 +21,14 @@ struct TemporaryStashRecoveryRecord: Codable, Equatable {
     var matchingFrame: CGRect { windowFrame ?? originalFrame }
 
     private enum CodingKeys: String, CodingKey {
-        case id, bundleID, pid, windowID, edge, screenID, originalFrame, ordinal, awaitingRelaunch, closedAt, slot, windowFrame
+        case id, bundleID, pid, windowID, edge, screenID, originalFrame, ordinal, originalSize, awaitingRelaunch, closedAt, slot, windowFrame
     }
 
     private enum LegacyKeys: String, CodingKey { case waitForProcessExit }
 
     init(id: String, bundleID: String, pid: Int32, windowID: UInt32, edge: Int, screenID: UInt32,
-         originalFrame: CGRect, ordinal: Int, awaitingRelaunch: Bool = false, slot: Int = 0, windowFrame: CGRect? = nil) {
+         originalFrame: CGRect, ordinal: Int, originalSize: CGSize? = nil,
+         awaitingRelaunch: Bool = false, slot: Int = 0, windowFrame: CGRect? = nil) {
         self.id = id
         self.bundleID = bundleID
         self.pid = pid
@@ -34,6 +37,7 @@ struct TemporaryStashRecoveryRecord: Codable, Equatable {
         self.screenID = screenID
         self.originalFrame = originalFrame
         self.ordinal = ordinal
+        self.originalSize = originalSize
         self.awaitingRelaunch = awaitingRelaunch
         self.slot = slot
         self.windowFrame = windowFrame
@@ -49,6 +53,7 @@ struct TemporaryStashRecoveryRecord: Codable, Equatable {
         screenID = try values.decode(UInt32.self, forKey: .screenID)
         originalFrame = try values.decode(CGRect.self, forKey: .originalFrame)
         ordinal = try values.decode(Int.self, forKey: .ordinal)
+        originalSize = try values.decodeIfPresent(CGSize.self, forKey: .originalSize)
         awaitingRelaunch = try values.decodeIfPresent(Bool.self, forKey: .awaitingRelaunch) ?? false
         closedAt = try values.decodeIfPresent(Date.self, forKey: .closedAt)
         let legacy = try decoder.container(keyedBy: LegacyKeys.self)
@@ -76,6 +81,7 @@ struct TemporaryStashRecoveryRecord: Codable, Equatable {
             && (edge == 1 || edge == 2)
             && [originalFrame.minX, originalFrame.minY, originalFrame.width, originalFrame.height].allSatisfy(\.isFinite)
             && originalFrame.width > 0 && originalFrame.height > 0
+            && (originalSize.map { $0.width.isFinite && $0.height.isFinite && $0.width > 0 && $0.height > 0 } ?? true)
             && [matchingFrame.minX, matchingFrame.minY, matchingFrame.width, matchingFrame.height].allSatisfy(\.isFinite)
             && matchingFrame.width > 0 && matchingFrame.height > 0
     }

@@ -66,6 +66,7 @@ final class TemporaryStashTabCoordinator {
     private var hoverTimer: Timer?
     private var hoverSuppressedUntilExit: Set<ObjectIdentifier> = []
     private weak var pendingAppActivation: WindowSession?
+    var pendingActivationPID: pid_t? { pendingAppActivation?.pid }
     // 只限制等待 Workspace 前台更新的时间；前台到位后的 AX 忙沿用原有重试。
     private var appActivationDeadline: Date?
     private var appActivationRetryTimer: Timer?
@@ -209,7 +210,9 @@ final class TemporaryStashTabCoordinator {
         }
         for (id, panel) in panels where layoutFrames[id] == nil { panel.orderOut(nil) }
         // 成员或屏幕几何变化时取消本次拖动，避免用过期的列范围插入。
-        if let current = drag, previousFrames != layoutFrames || current.assignments != assignments {
+        if let current = drag,
+           previousFrames != layoutFrames || current.assignments != assignments
+            || descriptors.first(where: { ObjectIdentifier($0.session) == current.id })?.visibleFrame != current.visibleFrame {
             drag?.cancelled = true
             resetHover()
         }
@@ -279,8 +282,7 @@ final class TemporaryStashTabCoordinator {
             guard drag == nil, let frame = layoutFrames[id], frame.contains(point),
                   let descriptor = sessions.first(where: { ObjectIdentifier($0) == id })?.temporaryStashTabDescriptor() else { return }
             let key = EdgeKey(descriptor)
-            let highest = assignments.filter { $0.screenID == key.screenID && $0.edge == key.edge }.map(\.slot).max() ?? 0
-            let count = min(highest + 1, TemporaryStashGeometry.slotCapacity(visibleFrame: descriptor.visibleFrame))
+            let count = TemporaryStashGeometry.slotCapacity(visibleFrame: descriptor.visibleFrame)
             drag = Drag(id: id, key: key, start: point, initialFrame: frame, visibleFrame: descriptor.visibleFrame,
                         slotCount: count, assignments: assignments, frame: frame)
             resetHover()

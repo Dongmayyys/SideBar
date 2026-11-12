@@ -6,21 +6,15 @@ final class UserDefaults {
     func data(forKey key: String) -> Data? { values[key] }
     func set(_ data: Data, forKey key: String) { values[key] = data; writes += 1 }
 }
-typealias AXUIElement = Element
 var applicationElements: [Int32: Element] = [:]
 func testApplicationElement(_ pid: Int32) -> Element { applicationElements[pid] ?? Element() }
-enum WindowCapabilityProfiler {
-    struct Profile { let isStandardWindow: Bool }
-    static func profile(of window: Element, bundleID: String, context: String) -> Profile {
-        Profile(isStandardWindow: window.standard)
-    }
-}
 final class AppConfig {
     static let shared = AppConfig()
     var enabled: Set<String> = []
     func isAppEnabled(bundleID: String) -> Bool { enabled.contains(bundleID) }
 }
 final class TemporaryStashTabCoordinator {
+    var pendingActivationPID: pid_t? { nil }
     var assignments: [TemporaryStashSlotAssignment] = []
     var suppressedIDs: Set<String> = []
     func restoreSlots(_ assignments: [TemporaryStashSlotAssignment], pendingIDs: Set<String> = []) { self.assignments = assignments }
@@ -29,6 +23,7 @@ final class TemporaryStashTabCoordinator {
 final class RecoveryManager {
     var sessions: [Session] = []
     let temporaryTabCoordinator = TemporaryStashTabCoordinator()
+    let temporaryAppVisibility = TemporaryStashAppVisibility()
     var temporaryOrdinals = TemporaryStashOrdinals()
     let temporaryRecoveryStore: TemporaryStashRecoveryStore
     var temporaryRecovery: TemporaryStashRecoverySnapshot
@@ -48,11 +43,15 @@ final class RecoveryManager {
         temporaryTabCoordinator.restoreSlots(temporaryRecovery.assignments)
     }
     func attachSessionLifecycle(to session: Session) {
+        session.temporaryAppVisibility = temporaryAppVisibility
         session.onTemporaryShortcutSessionEnded = { [weak self] session, exclude, remove in
             self?.handleTemporaryShortcutSessionEnded(session, excludeWindow: exclude, removeSession: remove)
         }
     }
-    func reconcileIndicators() { persistTemporaryRecovery() }
+    func reconcileIndicators() {
+        persistTemporaryRecovery()
+        temporaryAppVisibility.reconcile(sessions: sessions)
+    }
     func monitorApp(pid: pid_t, bundleID: String) {}
     var focusedTarget: (appElement: Element, windowElement: Element, pid: pid_t, bundleID: String)?
     func currentFocusedStandardWindow() -> (appElement: Element, windowElement: Element, pid: pid_t, bundleID: String)? { focusedTarget }
@@ -77,6 +76,7 @@ final class RecoveryManager {
     func stop() {
         stopTemporaryRecovery()
         sessions.forEach { $0.restoreAndDestroy() }
+        temporaryAppVisibility.restoreAll(reason: "cleanup")
         sessions.removeAll()
     }
 

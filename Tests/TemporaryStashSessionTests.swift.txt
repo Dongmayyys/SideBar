@@ -16,17 +16,20 @@ for right in [false, true] {
     s.onTemporaryShortcutSessionEnded = { _, exclude, _ in excluded = exclude }
     expect(s.startTemporaryShortcutStash() && s.isSnappedForCoordination && s.alpha == 0,
            "production start hides left/right positioned window at right edge")
-    expect(s.temporaryOriginalFrame == original && s.currentEdge == 2, "start stores original and always chooses right")
+    expect(s.temporaryOriginalFrame == original && s.temporaryOriginalSize == original.size && s.currentEdge == 2,
+           "start stores original position and size and always chooses right")
+    expect(s.windowElement.frame.height == 1000 && s.windowElement.frame.minY == 0 && s.windowElement.frame.width == original.width,
+           "initial stash fills usable height and keeps original width")
     s.revealForTemporaryStashTab()
-    expect(s.isExpandedForCoordination && s.alpha == 1 && s.windowElement.frame.minY == original.minY && s.tracking,
-           "production reveal preserves vertical position and starts tracking")
+    expect(s.isExpandedForCoordination && s.alpha == 1 && s.windowElement.frame == CGRect(x: 600, y: 0, width: 400, height: 1000) && s.tracking,
+           "production reveal fills usable height on managed edge and starts tracking")
     s.isTemporarilyPinned = true
     expect(s.hideForTemporaryStashTab() && s.isExpandedForCoordination, "production switch leaves pinned window visible")
     s.windowElement.events.removeAll()
     s.cancelTemporaryShortcutStash()
-    expect(s.windowElement.events == ["position", "alpha"], "cancel restores position before alpha")
-    expect(s.windowElement.frame.origin == original.origin && s.alpha == 1 && s.destroyed && excluded == true,
-           "production pinned cancel restores original and excludes only this window")
+    expect(s.windowElement.events == ["size", "position", "alpha"], "cancel restores size and position before alpha")
+    expect(s.windowElement.frame == original && s.alpha == 1 && s.destroyed && excluded == true,
+           "production pinned cancel restores original position and size and excludes only this window")
     expect(!s.isMirrorPinActive && !s.isTemporarilyPinned && !s.focusReleasePending && s.windowAnimator.stopped,
            "cancel clears pin and pending focus/animation work")
     expect(s.clearedRecovery && !s.screenLocked && s.mouseTrackingTimer?.invalidated == true,
@@ -34,12 +37,89 @@ for right in [false, true] {
 }
 
 resetScreens()
+for maximum: CGFloat? in [nil, 560] {
+    NSScreen.screens[0].usableFrame = CGRect(x: 0, y: 40, width: 1000, height: 930)
+    let fullHeight = Session()
+    let original = fullHeight.windowElement.frame
+    fullHeight.windowElement.maximumHeight = maximum
+    let height = maximum ?? 930
+    let y: CGFloat = maximum == nil ? 30 : 215
+    expect(fullHeight.startTemporaryShortcutStash()
+           && fullHeight.windowElement.frame.size == CGSize(width: original.width, height: height)
+           && fullHeight.windowElement.frame.minY == y,
+           "stash requests usable height, reads actual height and centers when constrained max=\(String(describing: maximum))")
+    let saved = fullHeight.temporaryStashRecoveryRecord()!
+    expect(saved.originalSize == original.size,
+           "recovery records the original size before normalizing stash height")
+    fullHeight.revealForTemporaryStashTab()
+    expect(fullHeight.windowElement.frame == CGRect(x: 600, y: y, width: 400, height: height),
+           "every reveal uses usable top or centers actual constrained height")
+    fullHeight.windowElement.frame = CGRect(x: 250, y: 650, width: 430, height: 200)
+    fullHeight.isDragging = true
+    fullHeight.handleMouseUp()
+    _ = fullHeight.hideForTemporaryStashTab()
+    fullHeight.revealForTemporaryStashTab()
+    expect(fullHeight.windowElement.frame == CGRect(x: 570, y: y, width: 430, height: height),
+           "drag and resize are temporary except width, including constrained apps")
+    fullHeight.cancelTemporaryShortcutStash()
+    expect(fullHeight.windowElement.frame == original,
+           "cancel after normalizing and resizing restores original position and size")
+
+    let recovered = Session()
+    recovered.windowElement.maximumHeight = maximum
+    expect(recovered.startTemporaryShortcutStash(restoring: saved)
+           && recovered.windowElement.frame.height == height && recovered.windowElement.frame.minY == y,
+           "recovery applies the same usable height and constrained centering without focusing")
+    recovered.cancelTemporaryShortcutStash()
+    expect(recovered.windowElement.frame == original, "recovery cancellation restores archived original size")
+}
+
+resetScreens()
+let legacyOriginal = CGRect(x: 120, y: 230, width: 420, height: 310)
+let modernRecord = TemporaryStashRecoveryRecord(id: "legacy-size", bundleID: "same.app", pid: 123, windowID: 42,
+    edge: 1, screenID: 1, originalFrame: legacyOriginal, ordinal: 1, originalSize: legacyOriginal.size)
+var legacyJSON = try! JSONSerialization.jsonObject(with: JSONEncoder().encode(modernRecord)) as! [String: Any]
+legacyJSON.removeValue(forKey: "originalSize")
+let legacyRecord = try! JSONDecoder().decode(TemporaryStashRecoveryRecord.self, from: JSONSerialization.data(withJSONObject: legacyJSON))
+let legacySize = Session()
+expect(legacyRecord.originalSize == nil && legacySize.startTemporaryShortcutStash(restoring: legacyRecord),
+       "legacy record without original size still decodes and restores stash")
+expect(legacySize.temporaryStashRecoveryRecord()?.originalSize == nil,
+       "repersisting a legacy record does not invent an original size from normalized height")
+let legacyCurrentSize = legacySize.windowElement.frame.size
+legacySize.windowElement.events.removeAll()
+legacySize.cancelTemporaryShortcutStash()
+expect(legacySize.windowElement.frame.origin == legacyOriginal.origin && legacySize.windowElement.frame.size == legacyCurrentSize
+       && legacySize.windowElement.events == ["position", "alpha"],
+       "legacy cancellation restores only position, never writes a guessed size")
+
+resetScreens()
+let failedReveal = Session()
+_ = failedReveal.startTemporaryShortcutStash()
+failedReveal.windowElement.positionResults = [.success, .cannotComplete]
+failedReveal.revealForTemporaryStashTab()
+expect(failedReveal.isSnappedForCoordination && failedReveal.alpha == 0,
+       "failed final reveal positioning keeps stash hidden and retryable after height preparation")
+failedReveal.revealForTemporaryStashTab()
+expect(failedReveal.isExpandedForCoordination && failedReveal.alpha == 1,
+       "later reveal retries normalized geometry after a transient position failure")
+
+resetScreens()
+let failedSizeRestore = Session()
+_ = failedSizeRestore.startTemporaryShortcutStash()
+failedSizeRestore.windowElement.sizeResults = [.failure]
+failedSizeRestore.cancelTemporaryShortcutStash()
+expect(!failedSizeRestore.clearedRecovery && failedSizeRestore.alpha == 1
+       && failedSizeRestore.windowElement.frame.origin == CGPoint(x: 100, y: 200),
+       "failed size restoration still restores position and visibility but retains rescue record")
+
+resetScreens()
 let quit = Session()
-let beforeQuit = quit.windowElement.frame.origin
+let beforeQuit = quit.windowElement.frame
 _ = quit.startTemporaryShortcutStash()
 quit.restoreAndDestroy()
-expect(quit.windowElement.frame.origin == beforeQuit && quit.alpha == 1 && quit.destroyed,
-       "production quit restores collapsed window before destroying")
+expect(quit.windowElement.frame == beforeQuit && quit.alpha == 1 && quit.destroyed,
+       "production quit restores collapsed window position and size before destroying")
 
 resetScreens()
 let readingFailure = Session()
@@ -106,18 +186,53 @@ for pinned in [false, true] {
     var dragExcluded = false
     drag.onTemporaryShortcutSessionEnded = { _, excluded, _ in dragExcluded = excluded }
     _ = drag.startTemporaryShortcutStash()
+    let original = drag.temporaryOriginalFrame
     drag.revealForTemporaryStashTab()
     drag.isTemporarilyPinned = pinned
-    drag.windowElement.frame.origin.x = 250
+    drag.windowElement.frame = CGRect(x: 250, y: 450, width: 410, height: 320)
     let dropped = drag.windowElement.frame
     drag.windowElement.writes = 0
     drag.isDragging = true
     drag.handleMouseUp()
-    expect(drag.destroyed && drag.windowElement.frame == dropped && !drag.isTemporaryShortcutManaged,
-           "production drag detach cancels at dropped frame pinned=\(pinned)")
-    expect(drag.windowElement.writes == 0 && drag.alpha == 1 && dragExcluded && drag.clearedRecovery,
-           "drag cancel restores visibility and exclusion without position writes pinned=\(pinned)")
+    expect(drag.isTemporaryShortcutManaged && drag.isExpandedForCoordination && !drag.destroyed,
+           "dragging temporary window to middle retains stash pinned=\(pinned)")
+    expect(drag.windowElement.frame == dropped && drag.windowElement.writes == 0 && drag.alpha == 1,
+           "mouse release leaves temporary window at dropped frame without writes pinned=\(pinned)")
+    expect(!dragExcluded && !drag.clearedRecovery && drag.temporaryOriginalFrame == original,
+           "drag retains recovery and unchanged original restore position pinned=\(pinned)")
+    expect(drag.temporaryLastExpandedFrame == dropped && drag.lockedWidth == 410,
+           "drag caches current frame for restore fallback and synchronizes small width change pinned=\(pinned)")
+    expect(!drag.relinquishToDockMinimizeIfDetachedFromEdge() && drag.isTemporaryShortcutManaged,
+           "temporary detached window never relinquishes management pinned=\(pinned)")
+    drag.isTemporarilyPinned = false
+    expect(drag.hideForTemporaryStashTab(), "dragged temporary window can still collapse pinned=\(pinned)")
+    drag.revealForTemporaryStashTab()
+    expect(drag.windowElement.frame == CGRect(x: 590, y: 0, width: 410, height: 1000),
+           "reveal ignores dragged height and Y but keeps new width on original edge pinned=\(pinned)")
+    drag.cancelTemporaryShortcutStash()
+    expect(drag.windowElement.frame == original && drag.destroyed,
+           "shortcut cancellation after dragging restores original position and size pinned=\(pinned)")
 }
+
+resetScreens()
+let configuredDrag = Session(temporaryShortcut: false)
+configuredDrag.state = .expanded
+configuredDrag.currentEdge = 2
+configuredDrag.windowElement.frame.origin.x = 250
+configuredDrag.isDragging = true
+configuredDrag.handleMouseUp()
+expect(configuredDrag.isFloatingForCoordination && !configuredDrag.isDragging,
+       "settings-managed window still detaches on mouse release away from edge")
+
+let configuredObserved = Session(temporaryShortcut: false)
+configuredObserved.state = .expanded
+configuredObserved.currentEdge = 2
+configuredObserved.windowElement.frame.origin.x = 250
+expect(!configuredObserved.relinquishToDockMinimizeIfDetachedFromEdge() && configuredObserved.edgeDetachCandidateSince != nil,
+       "settings-managed observed detach still starts confirmation interval")
+configuredObserved.edgeDetachCandidateSince = Date().addingTimeInterval(-1)
+expect(configuredObserved.relinquishToDockMinimizeIfDetachedFromEdge() && configuredObserved.isFloatingForCoordination,
+       "settings-managed sustained detach still relinquishes management")
 resetScreens()
 let vertical = Session()
 _ = vertical.startTemporaryShortcutStash()
@@ -126,7 +241,11 @@ vertical.windowElement.frame.origin.y = 450
 vertical.isDragging = true
 vertical.handleMouseUp()
 expect(vertical.isTemporaryShortcutManaged && vertical.temporaryLastExpandedFrame?.minY == 450 && !vertical.destroyed,
-       "vertical edge drag retains stash and updates expanded window position")
+       "vertical edge drag is temporary and retains stash")
+_ = vertical.hideForTemporaryStashTab()
+vertical.revealForTemporaryStashTab()
+expect(vertical.windowElement.frame.minY == 0 && vertical.windowElement.frame.height == 1000,
+       "vertical edge drag does not change next reveal geometry")
 
 resetScreens()
 let focusedA = Session()
@@ -337,19 +456,13 @@ _ = animatedReveal.startTemporaryShortcutStash()
 animatedReveal.appElement.enhancedUI = true
 axEvents.removeAll()
 animatedReveal.revealForTemporaryStashTab()
-expect(axEvents == ["read", "disable", "position", "restore"], "production reveal routes through enhanced UI suppression")
+expect(axEvents == ["read", "disable", "size", "position", "restore", "read", "disable", "position", "restore"],
+       "production reveal resizes and positions through enhanced UI suppression")
 animatedReveal.windowElement.positionResults = [.cannotComplete, .success]
 axEvents.removeAll()
 animatedReveal.cancelTemporaryShortcutStash()
-expect(axEvents == ["read", "disable", "position", "restore", "read", "disable", "position", "restore"],
-       "cancel and retry each restore enhanced UI before returning")
-let dragWithoutWrite = Session()
-_ = dragWithoutWrite.startTemporaryShortcutStash()
-dragWithoutWrite.appElement.enhancedUI = true
-axEvents.removeAll()
-dragWithoutWrite.cancelTemporaryShortcutStash(keepingFrame: dragWithoutWrite.windowElement.frame)
-expect(axEvents.isEmpty, "drag-away cancellation still writes neither position nor enhanced UI")
-
+expect(axEvents == ["read", "disable", "size", "position", "restore", "read", "disable", "size", "position", "restore"],
+       "cancel and retry each restore original size with enhanced UI restored before returning")
 let shortcutDismissed = Session()
 expect(shortcutDismissed.startTemporaryShortcutStash(), "prepare toggle focus-release cancellation")
 shortcutDismissed.revealForTemporaryStashTab(isAppActivated: true)

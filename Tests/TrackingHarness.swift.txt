@@ -60,7 +60,10 @@ func advance(_ ticks: Int) {
 }
 enum NSEvent { static var mouseLocation = CGPoint(x: 900, y: 700); static var pressedMouseButtons = 0 }
 struct Color {}
-struct Screen { let frame = CGRect(x: 0, y: 0, width: 1000, height: 800) }
+struct Screen {
+    let frame = CGRect(x: 0, y: 0, width: 1000, height: 800)
+    var visibleFrame = CGRect(x: 0, y: 40, width: 1000, height: 730)
+}
 enum SnapEdge { case left, right }
 final class AppConfig {
     static let shared = AppConfig()
@@ -72,6 +75,10 @@ final class Window { var alphaValue: CGFloat = 1; func orderOut(_ sender: Any?) 
 final class Effect { func stopExpandEffect(closeWindow: Bool, immediate: Bool = false) {} }
 final class Animator { func stop() {} }
 final class AXUIElement { var size = CGSize(width: 400, height: 300) }
+final class WindowAlphaManager {
+    static let shared = WindowAlphaManager()
+    func findWindowID(for element: AXUIElement, pid: pid_t) -> CGWindowID? { 42 }
+}
 struct ActivationOptions: OptionSet { let rawValue: Int; static let activateIgnoringOtherApps = ActivationOptions(rawValue: 1) }
 final class NSRunningApplication {
     enum Policy { case regular, accessory, prohibited }
@@ -86,6 +93,9 @@ final class NSWorkspace { static let shared = NSWorkspace(); var frontmostApplic
 @discardableResult func axSetSizeAttribute(on element: AXUIElement, size: CGSize, context: String) -> Bool { element.size = size; return true }
 @discardableResult func axSetBoolAttribute(on element: AXUIElement, attribute: CFString, value: Bool, context: String) -> Bool { true }
 struct Pins { let safeRect: CGRect }
+final class TemporaryStashAppVisibility {
+    func prepareToReveal(pid: pid_t) -> Bool { true }
+}
 
 __SNAP_STATE__
 
@@ -97,8 +107,10 @@ final class Session {
     var animationGenerationToken = 0
     var mouseTrackingTimer: Timer?
     var rawFrameUnavailable = false
-    var geometryUnavailable = false
     var frame: CGRect
+    var maximumHeight: CGFloat?
+    var cgFrameOverride: CGRect?
+    var screen = Screen()
     var rawReads = 0
     var collapseAnimations = 0
     var focusReleases = 0
@@ -106,6 +118,7 @@ final class Session {
     var expandAnimations = 0
     var alpha: CGFloat = 1
     var temporaryLastExpandedFrame: CGRect?
+    var temporaryAppVisibility: TemporaryStashAppVisibility?
     var isSnappedForCoordination: Bool { snapped }
     var isExpandedForCoordination: Bool { state == .expanded }
     var pendingDockInteraction = false
@@ -136,6 +149,7 @@ final class Session {
     let pid: Int32 = 123
     var currentEdge: Int
     var lockedWidth: CGFloat = 400
+    var initialFrameCaptured = true
     let indicatorWindow = Window()
     let effectWindow = Effect()
     let windowAnimator = Animator()
@@ -151,28 +165,37 @@ final class Session {
     func hover() -> Bool { expandWindow() }
     func dockReveal() -> Bool { expandWindow(isDockActivated: true) }
     func directCollapse() -> Bool { collapseWindow() }
+    func measuredFrame() -> CGRect? { getWindowFrame() }
     func updatePinControlWindow() {}
     func relinquishToDockMinimizeIfDetachedFromEdge() -> Bool { false }
-    func interactionHitTestFrame() -> CGRect? { frame } // CG geometry remains readable while AX read fails.
+    func CGWindowListCopyWindowInfo(_ options: CGWindowListOption, _ relative: CGWindowID) -> Any? {
+        let cgFrame = cgFrameOverride ?? frame
+        return [[kCGWindowNumber as String: CGWindowID(42),
+                 kCGWindowBounds as String: ["X": cgFrame.minX, "Y": cgFrame.minY,
+                                             "Width": cgFrame.width, "Height": cgFrame.height]]]
+    }
     func getRawWindowFrame() -> CGRect? { rawReads += 1; return rawFrameUnavailable ? nil : frame }
-    func getWindowFrame() -> CGRect? { getRawWindowFrame() }
     func pinControlFrames(for frame: CGRect) -> Pins? { nil }
     func isMouseInsideAnyVisibleSiblingWindow(_ point: CGPoint) -> Bool { siblingUnderMouse }
     func hasFocusedSiblingWindowOfApp() -> Bool { siblingFocused }
     func isWithinSiblingWindowPostInteractionGrace(_ now: Date) -> Bool { false }
     func scheduleFocusRelease(after delay: Double) { focusReleases += 1 }
     func excludeFromFocusReturn(for duration: Double) {}
-    func edgeGeometry(for frame: CGRect) -> (expanded: CGPoint, hidden: CGPoint, visualHidden: CGPoint)? {
-        guard !geometryUnavailable else { return nil }
-        let x: CGFloat = currentEdge == 1 ? 0 : 1000 - lockedWidth
-        let hiddenX: CGFloat = currentEdge == 1 ? -frame.width + 1 : 999
-        return (CGPoint(x: x, y: frame.minY), CGPoint(x: currentEdge == 1 ? -20400 : 21000, y: frame.minY), CGPoint(x: hiddenX, y: frame.minY))
-    }
+    func getDisplayBounds() -> CGRect { screen.frame }
     func notifyTemporaryShortcutStashStateChanged(isStashed: Bool) {}
-    func getScreenForWindow() -> Screen { Screen() }
+    func getScreenForWindow() -> Screen { screen }
     func collapsedWindowAlpha() -> Double { isTemporaryShortcutManaged ? 0 : 0.01 }
     func setWindowAlpha(_ alpha: CGFloat, isHidden: Bool, frameHint: CGRect? = nil) { self.alpha = alpha; geometryEvents.append("alpha:\(alpha)") }
     func setWindowPosition(position: CGPoint) { frame.origin = position; geometryEvents.append("position"); observedGeometryChangeToken += 1 }
+    @discardableResult
+    func setWindowPositionWithoutSystemAnimation(position: CGPoint, size: CGSize? = nil, context: String) -> AXError {
+        if let size {
+            frame.size = CGSize(width: size.width, height: min(size.height, maximumHeight ?? size.height))
+            geometryEvents.append("size")
+        }
+        setWindowPosition(position: position)
+        return .success
+    }
     func triggerCollapseEffect(edge: SnapEdge, point: CGPoint, color: Color) {}
     func triggerExpandEffect(edge: SnapEdge, frame: CGRect, color: Color) {}
     func showIndicator(animated: Bool = false) {}

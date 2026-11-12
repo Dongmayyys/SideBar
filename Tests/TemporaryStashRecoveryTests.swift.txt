@@ -10,13 +10,16 @@ let original = CGRect(x: 130, y: 200, width: 400, height: 300)
 func record(_ id: String = "saved", pid: Int32 = 123, bundle: String = "same.app", windowID: UInt32 = 42,
             edge: Int = 2, screenID: UInt32 = 1, ordinal: Int = 2, frame: CGRect = original, slot: Int = 1) -> TemporaryStashRecoveryRecord {
     TemporaryStashRecoveryRecord(id: id, bundleID: bundle, pid: pid, windowID: windowID,
-                                 edge: edge, screenID: screenID, originalFrame: original, ordinal: ordinal, slot: slot, windowFrame: frame)
+                                 edge: edge, screenID: screenID, originalFrame: original, ordinal: ordinal,
+                                 originalSize: original.size, slot: slot, windowFrame: frame)
 }
 func resetBackend() {
+    NSWorkspace.shared.frontmostApplication = nil
     NSScreen.screens = [NSScreen(frame: primary)]
     NSRunningApplication.knownAppsOnly = true
     NSRunningApplication.bundles = [123: "same.app"]
     NSRunningApplication.terminated = []
+    NSRunningApplication.hidden = []
     AppConfig.shared.enabled = []
     WindowAlphaManager.shared.windowID = nil
     let app = Element()
@@ -52,12 +55,14 @@ legacy["windows"] = (legacy["windows"] as! [[String: Any]]).map { entry in
     entry.removeValue(forKey: "awaitingRelaunch")
     entry.removeValue(forKey: "windowFrame")
     entry.removeValue(forKey: "slot")
+    entry.removeValue(forKey: "originalSize")
     return entry
 }
 legacy["orders"] = [["screenID": 1, "edge": 2, "ids": [saved.id, "one"]]]
 let legacySnapshot = try! JSONDecoder().decode(TemporaryStashRecoverySnapshot.self, from: JSONSerialization.data(withJSONObject: legacy))
 expect(legacySnapshot.windows.allSatisfy { !$0.awaitingRelaunch && $0.matchingFrame == original },
        "pre-change archives decode with exact identity and original-frame matching fallback")
+expect(legacySnapshot.windows.allSatisfy { $0.originalSize == nil }, "legacy archives without original size remain position-only")
 expect(legacySnapshot.windows.first { $0.id == saved.id }?.slot == 1 && legacySnapshot.windows.first { $0.id == "one" }?.slot == 2,
        "legacy order migrates to explicit one-based slots")
 expect((try! JSONSerialization.jsonObject(with: JSONEncoder().encode(legacySnapshot)) as! [String: Any])["orders"] == nil,
@@ -111,10 +116,13 @@ expect(!restored.focusReleasePending && NSWorkspace.shared.frontmostApplication 
 expect(manager.temporaryTabCoordinator.suppressedIDs == [saved.id], "stationary pointer cannot auto-reveal restored tab")
 expect(manager.temporaryOrdinals.assign(bundleID: "same.app", windowID: "new") == 3,
        "manager reserves saved ordinal before accepting any new stash")
-expect(manager.temporaryRecoveryStore.load().windows == [saved], "successful restoration persists original identity and geometry")
+var normalizedSaved = saved
+normalizedSaved.windowFrame = CGRect(origin: original.origin, size: CGSize(width: original.width, height: 1000))
+expect(manager.temporaryRecoveryStore.load().windows == [normalizedSaved],
+       "restoration persists normalized matching size without changing original identity or restore geometry")
 restored.cancelTemporaryShortcutStash()
-expect(restored.windowElement.frame.origin == original.origin && restored.alpha == 1,
-       "cancel restored window returns to earliest original, not rescue/re-stash position")
+expect(restored.windowElement.frame == original && restored.alpha == 1,
+       "cancel restored window returns to earliest original position and size")
 expect(manager.temporaryRecoveryStore.load().windows.isEmpty, "user cancellation immediately removes archive entry")
 
 resetBackend()
@@ -122,9 +130,9 @@ let shutdown = RecoveryManager([saved])
 shutdown.run()
 shutdown.sessions[0].isTemporarilyPinned = true
 shutdown.stop()
-expect(shutdown.temporaryRecoveryStore.load().windows == [saved], "normal cleanup preserves intent despite session-ended callback")
-expect(applicationElements[123]!.windows![0].frame.origin == original.origin,
-       "normal cleanup still physically returns window to its original position")
+expect(shutdown.temporaryRecoveryStore.load().windows == [normalizedSaved], "normal cleanup preserves intent despite session-ended callback")
+expect(applicationElements[123]!.windows![0].frame == original,
+       "normal cleanup physically returns window to its original position and size")
 let reopen = RecoveryManager(shutdown.temporaryRecoveryStore.load().windows)
 reopen.run()
 expect(reopen.sessions.count == 1 && !reopen.sessions[0].isTemporarilyPinned, "manual exit and reopen resets pin state")
@@ -162,8 +170,17 @@ expect(newStash.temporaryRecoveryStore.load().windows.first?.originalFrame == or
 fresh.currentEdge = 2
 newStash.persist()
 expect(newStash.temporaryRecoveryStore.load().windows.first?.edge == 2, "live edge change updates archive")
-fresh.cancelTemporaryShortcutStash(keepingFrame: CGRect(x: 350, y: 400, width: 400, height: 300))
-expect(newStash.temporaryRecoveryStore.load().windows.isEmpty, "drag-away cancellation deletes recovery too")
+fresh.revealForTemporaryStashTab()
+fresh.windowElement.frame = CGRect(x: 350, y: 400, width: 410, height: 320)
+fresh.isDragging = true
+fresh.handleMouseUp()
+newStash.persist()
+expect(newStash.temporaryRecoveryStore.load().windows.first?.originalFrame == original.offsetBy(dx: -30, dy: 0),
+       "dragging retains recovery and does not overwrite original restore position")
+expect(newStash.temporaryRecoveryStore.load().windows.first?.windowFrame?.size == CGSize(width: 410, height: 320),
+       "dragged size is persisted for recovery matching")
+fresh.cancelTemporaryShortcutStash()
+expect(newStash.temporaryRecoveryStore.load().windows.isEmpty, "shortcut cancellation deletes recovery after dragging")
 
 for mismatch in ["absent", "pid", "bundle", "unknownID", "nonstandard", "configured", "terminated"] {
     resetBackend()

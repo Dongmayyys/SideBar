@@ -195,6 +195,7 @@ final class SideBarBridge {
 final class MainInterfaceManager {
     var sessions: [WindowSession] = []
     let temporaryTabCoordinator = TemporaryStashTabCoordinator()
+    let temporaryAppVisibility = MainAppVisibility()
     private var mainInterfaceHistory: [(app: NSRunningApplication, window: AXUIElement)] = []
     var stashCalls = 0
     func handleTemporaryShortcut() -> Bool { stashCalls += 1; return true }
@@ -208,4 +209,7 @@ final class MainInterfaceManager {
         handleGlobalKeyDown(event: NSEvent(keyCode: keyCode, modifierFlags: .init(rawValue: modifiers)))
     }
 __MAIN_INTERFACE_METHODS__
+}
+final class MainAppVisibility {
+    func applicationWasActivated(pid: pid_t) {}
 }

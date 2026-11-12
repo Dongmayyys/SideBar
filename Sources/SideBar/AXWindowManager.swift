@@ -5,6 +5,7 @@ class AXWindowManager {
     private var sessions: [WindowSession] = []
     private let fusionCoordinator = FusionStripCoordinator()
     private let temporaryTabCoordinator = TemporaryStashTabCoordinator()
+    private let temporaryAppVisibility = TemporaryStashAppVisibility()
     private var temporaryOrdinals = TemporaryStashOrdinals()
     private let temporaryRecoveryStore = TemporaryStashRecoveryStore()
     private var temporaryRecovery = TemporaryStashRecoverySnapshot()
@@ -56,6 +57,8 @@ class AXWindowManager {
         // 监听新应用启动
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(appDidLaunch), name: NSWorkspace.didLaunchApplicationNotification, object: nil)
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(appDidTerminate), name: NSWorkspace.didTerminateApplicationNotification, object: nil)
+        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(appDidUnhide), name: NSWorkspace.didUnhideApplicationNotification, object: nil)
+        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(appDidHide), name: NSWorkspace.didHideApplicationNotification, object: nil)
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(handleActiveSpaceDidChange), name: NSWorkspace.activeSpaceDidChangeNotification, object: nil)
 
         // 关键修复：监听屏幕配置变化（外接显示器热插拔、分辨率切换、显示器排列调整）。
@@ -108,6 +111,16 @@ class AXWindowManager {
         retainTemporaryRecoveryAfterTermination(pid: app.processIdentifier)
         synchronizeSessions()
         restoreTemporaryShortcuts(attemptsRemaining: 20)
+    }
+
+    @objc private func appDidUnhide(_ notification: Notification) {
+        guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+        temporaryAppVisibility.applicationWasUnhidden(pid: app.processIdentifier)
+    }
+
+    @objc private func appDidHide(_ notification: Notification) {
+        guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+        temporaryAppVisibility.applicationWasHidden(pid: app.processIdentifier)
     }
 
     private func retainTemporaryRecoveryAfterTermination(pid: pid_t) {
@@ -196,6 +209,7 @@ class AXWindowManager {
     }
 
     @objc private func handleActiveSpaceDidChange() {
+        temporaryAppVisibility.spaceDidChange()
         temporaryTabCoordinator.reconcileAfterSpaceChange(sessions: sessions)
         fusionCoordinator.resetForSpaceChange(sessions: sessions.filter { !$0.isManagedByTemporaryShortcut })
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { [weak self] in
@@ -209,6 +223,7 @@ class AXWindowManager {
     /// 找不到对应新屏时才退化为"复位到主屏可见区域 + 状态机降级为 floating"的安全兜底。
     /// 同时让融合条按新的屏幕几何重新组装，避免快照条出现在"幽灵屏幕"的坐标上。
     @objc private func handleScreenParametersChanged() {
+        temporaryAppVisibility.spaceDidChange()
         let activeScreens = NSScreen.screens
         var reseated = 0
         var recovered = 0
@@ -238,6 +253,7 @@ class AXWindowManager {
     
     private func handleAppActivation(app: NSRunningApplication, isActivationNotification: Bool) {
         if isActivationNotification {
+            temporaryAppVisibility.applicationWasActivated(pid: app.processIdentifier)
             recordMainInterfaceActivation(app)
             temporaryTabCoordinator.handleAppActivation(activatedPID: app.processIdentifier,
                                                        activationPolicy: app.activationPolicy, sessions: sessions)
@@ -258,6 +274,7 @@ class AXWindowManager {
         for session in sessions {
             session.restoreAndDestroy()
         }
+        temporaryAppVisibility.restoreAll(reason: "cleanup")
         sessions.removeAll()
         mainInterfaceHistory.removeAll()
         bundleControlOwnerOverrides.removeAll()
@@ -312,6 +329,7 @@ class AXWindowManager {
         for session in sessions {
             session.suspendForAccessibilityLoss()
         }
+        temporaryAppVisibility.restoreAll(reason: "accessibility-loss")
         sessions.removeAll()
         bundleControlOwnerOverrides.removeAll()
         bundlePreferredClaimSessionIDs.removeAll()
@@ -639,6 +657,7 @@ class AXWindowManager {
     private func reconcileIndicators() {
         fusionCoordinator.reconcile(sessions: sessions.filter { !$0.isManagedByTemporaryShortcut })
         persistTemporaryRecovery()
+        temporaryAppVisibility.reconcile(sessions: sessions, activatingPID: temporaryTabCoordinator.pendingActivationPID)
         temporaryTabCoordinator.reconcile(sessions: sessions)
     }
 
@@ -882,6 +901,7 @@ class AXWindowManager {
     }
 
     private func attachSessionLifecycle(to session: WindowSession) {
+        session.temporaryAppVisibility = temporaryAppVisibility
         session.onHotkeyRuntimeStateChanged = { [weak self] _ in
             self?.handleSessionRuntimeStateChanged()
         }

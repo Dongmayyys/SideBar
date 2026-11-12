@@ -15,13 +15,31 @@ final class Element: NSObject {
     var mainWindow: Element?
     var focusedWindow: Element?
     var standard = true
+    var subroleUnavailable = false
     var writes = 0
+    var maximumHeight: CGFloat?
+    var sizeResults: [AXResult] = []
     var events: [String] = []
     var enhancedUI: Bool? = false
     var enhancedUIReadResult: AXError = .success
     var boolResults: [AXError] = []
     var boolAttributes: [String: Bool] = [:]
 }
+typealias AXUIElement = Element
+enum WindowCapabilityProfiler {
+    struct Profile { let isStandardWindow: Bool; let subrole: String? }
+    static func profile(of window: Element, bundleID: String, context: String) -> Profile {
+        Profile(isStandardWindow: window.standard, subrole: window.subroleUnavailable ? nil : (window.standard ? "AXStandardWindow" : "AXDialog"))
+    }
+}
+enum TemporaryStashWindowSpaces {
+    static var active: Set<UInt64>? = [1]
+    static var memberships: [CGWindowID: Set<UInt64>] = [:]
+    static var available = true
+    static func activeSpaceIDs() -> Set<UInt64>? { available ? active : nil }
+    static func spaceIDs(for windowID: CGWindowID) -> Set<UInt64>? { available ? (memberships[windowID] ?? [1]) : nil }
+}
+var appVisibilityEvents: [String] = []
 enum AccessibilityRuntimeGuard {
     static func copyAttributeValue(of element: Element, attribute: CFString, value: inout CFTypeRef?, context: String) -> AXError {
         if attribute as String == "AXWindows" {
@@ -72,7 +90,10 @@ struct NSScreen {
     var frame: CGRect
     var displayID: UInt32 = 1
     var usableFrame: CGRect?
-    var visibleFrame: CGRect { usableFrame ?? frame }
+    // Screen fixtures store CG bounds; expose visibleFrame in AppKit coordinates.
+    var visibleFrame: CGRect {
+        usableFrame ?? CGRect(x: frame.minX, y: 1000 - frame.maxY, width: frame.width, height: frame.height)
+    }
     static var screens = [NSScreen(frame: CGRect(x: 0, y: 0, width: 1000, height: 1000))]
 }
 struct ActivateOptions: OptionSet {
@@ -84,13 +105,38 @@ final class NSRunningApplication {
     static var knownAppsOnly = false
     static var bundles: [Int32: String] = [:]
     static var terminated: Set<Int32> = []
+    static var hidden: Set<Int32> = []
+    static var hideSucceeds = true
+    static var unhideSucceeds = true
+    static var hideIsImmediate = true
+    static var pendingHides: Set<Int32> = []
+    var isHidden: Bool { Self.hidden.contains(processIdentifier) }
     var bundleIdentifier: String? { Self.bundles[processIdentifier] ?? "same.app" }
     var isTerminated: Bool { Self.terminated.contains(processIdentifier) }
     init?(processIdentifier: Int32) {
         if Self.knownAppsOnly && Self.bundles[processIdentifier] == nil { return nil }
         self.processIdentifier = processIdentifier
     }
-    func activate(options: ActivateOptions) { NSWorkspace.shared.frontmostApplication = self }
+    func activate(options: ActivateOptions) {
+        Self.hidden.remove(processIdentifier)
+        NSWorkspace.shared.frontmostApplication = self
+    }
+    func hide() -> Bool {
+        appVisibilityEvents.append("hide:\(processIdentifier)")
+        if Self.hideSucceeds {
+            if Self.hideIsImmediate { Self.hidden.insert(processIdentifier) }
+            else { Self.pendingHides.insert(processIdentifier) }
+        }
+        return Self.hideSucceeds
+    }
+    func unhide() -> Bool {
+        appVisibilityEvents.append("unhide:\(processIdentifier)")
+        if Self.unhideSucceeds {
+            Self.hidden.remove(processIdentifier)
+            Self.pendingHides.remove(processIdentifier)
+        }
+        return Self.unhideSucceeds
+    }
 }
 final class NSWorkspace {
     static let shared = NSWorkspace()
@@ -102,11 +148,23 @@ final class NSWorkspace {
 }
 @discardableResult
 func axSetPositionAttribute(on element: Element, position: CGPoint, context: String) -> AXResult {
+    appVisibilityEvents.append("position")
     element.writes += 1
     element.events.append("position")
     axEvents.append("position")
     let result = element.positionResults.isEmpty ? .success : element.positionResults.removeFirst()
     if result == .success { element.frame.origin = position }
+    return result
+}
+@discardableResult
+func axSetSizeAttribute(on element: Element, size: CGSize, context: String) -> AXResult {
+    appVisibilityEvents.append("size")
+    element.events.append("size")
+    axEvents.append("size")
+    let result = element.sizeResults.isEmpty ? .success : element.sizeResults.removeFirst()
+    if result == .success {
+        element.frame.size = CGSize(width: size.width, height: min(size.height, element.maximumHeight ?? size.height))
+    }
     return result
 }
 @discardableResult
@@ -147,6 +205,8 @@ final class Session {
     var temporaryStashSlot = 0
     var temporaryStashSlotCapacity: Int { TemporaryStashGeometry.slotCapacity(visibleFrame: getScreenForWindow().visibleFrame) }
     var temporaryOriginalFrame: CGRect?
+    var temporaryOriginalSize: CGSize?
+    weak var temporaryAppVisibility: TemporaryStashAppVisibility?
     var temporaryLastExpandedFrame: CGRect?
     var lockedWidth: CGFloat = 0
     var initialFrameCaptured = false
@@ -163,8 +223,14 @@ final class Session {
     var screenLocked = false
     var fusionHoverLock = false
     var isDragging = false
+    var observedGeometryChangeToken = 0
+    var lastCheckedMouseLocation: CGPoint?
+    var lastCheckedIsOutside: Bool?
+    var cachedInteractionHitFrame: CGRect?
     var pinControlRevealSuppressionUntil = Date.distantPast
     static let managedEdgeDetachTolerance: CGFloat = 72
+    static let managedEdgeDetachConfirmInterval: TimeInterval = 0.22
+    let primaryScreenHeight: CGFloat = 1000
     static var focusedElement: Element?
     static var mainElement: Element?
     static var targetedActivationByPID: [pid_t: (sessionID: ObjectIdentifier, expiresAt: Date)] = [:]
@@ -190,6 +256,7 @@ final class Session {
     var mouseTrackingTimer: Timer? = Timer()
     var hoverDelayTimer: Timer? = Timer()
     var hoverInterruptTimer: Timer? = Timer()
+    var pinnedRaiseTimer: Timer? = Timer()
     let windowAnimator = Animator()
     let effectWindow = Effect()
     let indicatorWindow = Panel()
@@ -205,7 +272,6 @@ final class Session {
     var isExpandedForCoordination: Bool { state == .expanded }
     var isSnappedForCoordination: Bool { if case .snapped = state { return true }; return false }
     func getRawWindowFrame() -> CGRect? { (rawUnavailable || windowElement.frameUnavailable) ? nil : windowElement.frame }
-    func getWindowFrame() -> CGRect? { getRawWindowFrame() }
     func getScreenForWindow() -> NSScreen { snappedScreen ?? NSScreen.screens[0] }
     func notifyTemporaryShortcutStashStateChanged(isStashed: Bool) { onTemporaryShortcutStashStateChanged?(self, isStashed) }
     func detectScreen() -> NSScreen { NSScreen.screens[0] }
@@ -214,12 +280,6 @@ final class Session {
     func cgBounds(for screen: NSScreen) -> CGRect { screen.frame }
     func lockCurrentScreen() { screenLocked = true }
     func unlockScreen() { screenLocked = false }
-    func edgeGeometry(for frame: CGRect) -> (expanded: CGPoint, hidden: CGPoint, visualHidden: CGPoint)? {
-        let screen = detectDisplayBounds()
-        let x = currentEdge == 1 ? screen.minX : screen.maxX - frame.width
-        let hidden = currentEdge == 1 ? screen.minX - frame.width + 1 : screen.maxX - 1
-        return (CGPoint(x: x, y: frame.minY), .zero, CGPoint(x: hidden, y: frame.minY))
-    }
     // Collapse's real control flow has its own production extraction suite.
     func collapseWindow(immediate: Bool, triggerEffects: Bool) -> Bool {
         guard !isAnimating, let frame = getRawWindowFrame(), let geometry = edgeGeometry(for: frame) else { return false }
@@ -229,6 +289,7 @@ final class Session {
         return true
     }
     func setWindowAlpha(_ value: CGFloat, isHidden: Bool, frameHint: CGRect? = nil, preserveRecoveryRecord: Bool = false) {
+        appVisibilityEvents.append("alpha:\(value)")
         alpha = value; windowElement.events.append("alpha")
     }
     func clearTrackedWindowRecoveryState(frameHint: CGRect) { clearedRecovery = true }
@@ -246,7 +307,13 @@ final class Session {
     func hasAdjacentScreen(at edge: Int, bounds: CGRect) -> Bool { false }
     func edgePriority(_ edge: Int) -> Int { edge }
     func snapToEdge(edgeConfig: Int, frame: CGRect, displayBounds: CGRect) {}
-    func transitionToFloatingFromManagedState() { cancelTemporaryShortcutStash() }
+    func transitionToFloatingFromManagedState() {
+        if isTemporaryShortcutManaged {
+            cancelTemporaryShortcutStash()
+        } else {
+            state = .floating
+        }
+    }
     func destroy() { destroyed = true; animationGenerationToken += 1 }
     func closed() { handleDestroyed() }
     func reseat(in screens: [NSScreen]) -> Bool { reseatTemporaryShortcutGeometry(in: screens) }

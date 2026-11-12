@@ -40,10 +40,10 @@ for edge in [1, 2] {
 }
 reset()
 let geometry = Session()
-geometry.geometryUnavailable = true
+geometry.currentEdge = 0
 advance(10)
 expect(geometry.tracking && geometry.state == .expanded && geometry.collapseAnimations == 0, "geometry preparation failure keeps tracking")
-geometry.geometryUnavailable = false
+geometry.currentEdge = 1
 advance(10)
 expect(geometry.snapped && geometry.collapseAnimations == 1, "geometry recovery uses the existing timer")
 
@@ -182,14 +182,99 @@ for edge in [1, 2] {
     instant.geometryEvents.removeAll()
     expect(instant.hover() && instant.state == .expanded && !instant.isAnimating && instant.tracking && instant.expandAnimations == 0,
            "shared hover entry uses synchronous temporary reveal edge=\(edge)")
-    expect(instant.geometryEvents == ["position", "alpha:1.0"] && instant.alpha == 1,
-           "temporary reveal positions before restoring alpha edge=\(edge)")
+    expect(instant.geometryEvents == ["size", "position", "position", "alpha:1.0"] && instant.alpha == 1,
+           "temporary reveal resizes and positions before restoring alpha edge=\(edge)")
     _ = instant.directCollapse()
     expect(instant.dockReveal() && instant.pendingDockInteraction && !instant.isAnimating,
            "shared Dock entry is synchronous with interaction gate edge=\(edge)")
     advance(10)
     expect(!instant.isAnimating && instant.expandAnimations == 0 && instant.collapseAnimations == 0,
            "temporary transitions never queue animation callbacks edge=\(edge)")
+}
+
+for edge in [1, 2] {
+    reset(edge: edge)
+    let moved = Session(edge: edge)
+    moved.isTemporaryShortcutManaged = true
+    moved.pendingDockInteraction = true
+    moved.hasReleasedDockClick = true
+    moved.outsideCollapseCandidateSince = Date(-1)
+    NSEvent.pressedMouseButtons = 1
+    advance(10)
+    expect(moved.state == .expanded && moved.geometryEvents.isEmpty && moved.outsideCollapseCandidateSince == nil,
+           "dragging outside old frame never collapses even during Dock interaction wait edge=\(edge)")
+    expect(!moved.directCollapse(), "other collapse entry points reject temporary window during drag edge=\(edge)")
+
+    moved.cgFrameOverride = moved.frame // Simulate CG still reporting the pre-drag edge frame.
+    moved.cachedInteractionHitFrame = moved.frame
+    moved.cachedInteractionHitFrameAt = Date()
+    moved.frame = CGRect(x: 250, y: 180, width: 410, height: 320)
+    NSEvent.mouseLocation = CGPoint(x: 450, y: 420)
+    advance(3)
+    NSEvent.pressedMouseButtons = 0
+    advance(10) // Deliberately do not deliver an AX geometry notification.
+    expect(moved.state == .expanded && moved.frame == CGRect(x: 250, y: 180, width: 410, height: 320)
+           && moved.geometryEvents.isEmpty && !moved.pendingDockInteraction,
+           "drop stays put and hit testing uses current AX frame despite stale CG bounds edge=\(edge)")
+    expect(moved.measuredFrame()?.width == 410 && moved.lockedWidth == 410,
+           "temporary geometry tracks small width changes without stale width lock edge=\(edge)")
+
+    expect(moved.directCollapse() && moved.snapped, "dragged window collapses normally edge=\(edge)")
+    moved.revealForTemporaryStashTab()
+    expect(moved.frame == CGRect(x: edge == 1 ? 0 : 590, y: 30, width: 410, height: 730),
+           "production reveal ignores dragged Y and height, fills usable height and retains width on original edge=\(edge)")
+
+    // A stationary pointer outside a window moved by the app must not stay
+    // indefinitely inside the old cached frame when AX notifications are late.
+    NSEvent.mouseLocation = CGPoint(x: moved.frame.midX, y: 800 - moved.frame.midY)
+    advance(2)
+    moved.frame.origin.y = 550
+    advance(10)
+    expect(moved.snapped, "stationary pointer uses new geometry without AX notification edge=\(edge)")
+}
+
+for edge in [1, 2] {
+    for y: CGFloat in [-200, 750] {
+        reset(edge: edge)
+        let clamped = Session(edge: edge)
+        clamped.isTemporaryShortcutManaged = true
+        clamped.frame = CGRect(x: 250, y: y, width: 409, height: 320)
+        expect(clamped.directCollapse(), "collapse accepts dragged offscreen Y edge=\(edge) y=\(y)")
+        clamped.revealForTemporaryStashTab()
+        expect(clamped.frame == CGRect(x: edge == 1 ? 0 : 591, y: 30, width: 409, height: 730),
+               "reveal normalizes offscreen dragged Y and height while retaining small width change edge=\(edge) y=\(y)")
+    }
+}
+
+for edge in [1, 2] {
+    reset(edge: edge)
+    let constrained = Session(edge: edge)
+    constrained.isTemporaryShortcutManaged = true
+    constrained.maximumHeight = 500
+    _ = constrained.directCollapse()
+    constrained.revealForTemporaryStashTab()
+    expect(constrained.frame == CGRect(x: edge == 1 ? 0 : 600, y: 145, width: 400, height: 500),
+           "production reveal centers read-back maximum height in usable area edge=\(edge)")
+    constrained.frame = CGRect(x: 250, y: 650, width: 417, height: 240)
+    _ = constrained.directCollapse()
+    constrained.revealForTemporaryStashTab()
+    expect(constrained.frame == CGRect(x: edge == 1 ? 0 : 583, y: 145, width: 417, height: 500),
+           "constrained reveal ignores dragged height and Y while retaining new width edge=\(edge)")
+    constrained.screen.visibleFrame = CGRect(x: 0, y: 40, width: 1000, height: 300)
+    _ = constrained.directCollapse()
+    constrained.revealForTemporaryStashTab()
+    expect(constrained.frame == CGRect(x: edge == 1 ? 0 : 583, y: 460, width: 417, height: 300),
+           "reveal recomputes usable geometry after visible area changes edge=\(edge)")
+
+    reset(edge: edge)
+    let configured = Session(edge: edge)
+    configured.frame.origin.y = 80
+    _ = configured.directCollapse()
+    advance(4)
+    let configuredRevealed = configured.dockReveal()
+    advance(5)
+    expect(configuredRevealed && configured.frame.height == 300 && configured.frame.minY == 80,
+           "settings-managed window retains original height and Y instead of normalizing to usable area edge=\(edge)")
 }
 
 print("RESULT checks=\(total) failures=\(failures)")

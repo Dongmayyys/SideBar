@@ -41,7 +41,8 @@ session_source = (source / 'WindowSession.swift').read_text()
 methods = []
 for name in ['snappedScreenIsStale', 'reseatTemporaryShortcutGeometry', 'startTemporaryShortcutStash', 'cancelTemporaryShortcutStash', 'restoreTemporaryShortcutWindow',
              'finishTemporaryShortcutSession', 'hideForTemporaryStashTab', 'revealForTemporaryStashTab', 'focusForTemporaryStashTab',
-             'restoreAndDestroy', 'handleDestroyed', 'handleMouseUp', 'isDetachedFromManagedEdge',
+             'restoreAndDestroy', 'handleDestroyed', 'handleMouseUp', 'suspendForAccessibilityLoss', 'isDetachedFromManagedEdge',
+             'relinquishToDockMinimizeIfDetachedFromEdge', 'prepareTemporaryShortcutFrame', 'edgeGeometry', 'getWindowFrame',
              'canRevealForTemporaryAppActivation', 'beginTargetedActivationWindow',
              'shouldIgnoreTemporaryAppActivation', 'hideForTemporaryAppActivation',
              'setWindowPosition', 'setWindowPositionWithoutSystemAnimation',
@@ -57,6 +58,9 @@ descriptor = coordinator[coordinator.index('struct TemporaryStashTabDescriptor')
 session_fixture += '\n' + descriptor.replace('WindowSession', 'Session')
 session_fixture += '\n' + (source / 'TemporaryStashRecovery.swift').read_text()
 session_fixture += '\n' + (source / 'TemporaryStashLogic.swift').read_text()
+visibility_source = (source / 'TemporaryStashAppVisibility.swift').read_text()
+visibility_class = visibility_source[visibility_source.index('final class TemporaryStashAppVisibility'):]
+session_fixture += '\n' + visibility_class.replace('WindowSession', 'Session')
 session_base = session_fixture
 session_fixture += '\n' + (repo / 'Tests/TemporaryStashSessionTests.swift.txt').read_text()
 # Top-level Swift statements require a main.swift when compiling an executable.
@@ -106,6 +110,25 @@ if compiled.returncode:
     sys.exit(compiled.returncode)
 result = subprocess.run([str(recovery_output / 'tests')], capture_output=True, text=True)
 (recovery_output / 'tests.log').write_text(result.stdout + result.stderr)
+print(result.stdout, end='')
+print(result.stderr, end='', file=sys.stderr)
+if result.returncode:
+    sys.exit(result.returncode)
+
+# Exercise the production visibility coordinator and session/recovery entry points.
+visibility_fixture = session_base + '\n' + recovery_harness
+visibility_fixture += '\n' + (repo / 'Tests/TemporaryStashAppVisibilityTests.swift.txt').read_text()
+visibility_output = output / 'app-visibility'
+visibility_output.mkdir(exist_ok=True)
+(visibility_output / 'main.swift').write_text(visibility_fixture)
+compiled = subprocess.run(['swiftc', str(visibility_output / 'main.swift'), '-framework', 'ApplicationServices',
+                           '-o', str(visibility_output / 'tests')], capture_output=True, text=True)
+(visibility_output / 'compile.log').write_text(compiled.stdout + compiled.stderr)
+if compiled.returncode:
+    print(compiled.stdout + compiled.stderr, file=sys.stderr)
+    sys.exit(compiled.returncode)
+result = subprocess.run([str(visibility_output / 'tests')], capture_output=True, text=True)
+(visibility_output / 'tests.log').write_text(result.stdout + result.stderr)
 print(result.stdout, end='')
 print(result.stderr, end='', file=sys.stderr)
 if result.returncode:

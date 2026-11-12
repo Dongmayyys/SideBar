@@ -32,24 +32,16 @@ enum TemporaryStashGeometry {
         }
     }
 
-    static func nearestEdge(window: CGRect, screen: CGRect, visibleWidth: CGFloat, screens: [CGRect]) -> Int? {
-        let leftAvailable = !hasAdjacentScreen(edge: 1, screen: screen, screens: screens)
-        let rightAvailable = !hasAdjacentScreen(edge: 2, screen: screen, screens: screens)
-        guard leftAvailable || rightAvailable else { return nil }
-        if !rightAvailable { return 1 }
-        if !leftAvailable { return 2 }
-        let leftDistance = abs(window.minX - screen.minX)
-        let rightDistance = abs(screen.maxX - window.maxX)
-        if window.width >= visibleWidth - 40 || abs(leftDistance - rightDistance) <= 20 { return 2 }
-        return leftDistance < rightDistance ? 1 : 2
+    static func preferredEdge(screen: CGRect, screens: [CGRect]) -> Int? {
+        if !hasAdjacentScreen(edge: 2, screen: screen, screens: screens) { return 2 }
+        if !hasAdjacentScreen(edge: 1, screen: screen, screens: screens) { return 1 }
+        return nil
     }
 
-    static func recoveryEdge(savedEdge: Int?, window: CGRect, screen: CGRect,
-                             visibleWidth: CGFloat, screens: [CGRect]) -> Int? {
-        if let savedEdge, !hasAdjacentScreen(edge: savedEdge, screen: screen, screens: screens) {
-            return savedEdge
-        }
-        return nearestEdge(window: window, screen: screen, visibleWidth: visibleWidth, screens: screens)
+    static func recoveryEdge(savedEdge: Int?, screen: CGRect, screens: [CGRect]) -> Int? {
+        if let savedEdge, (savedEdge == 1 || savedEdge == 2),
+           !hasAdjacentScreen(edge: savedEdge, screen: screen, screens: screens) { return savedEdge }
+        return preferredEdge(screen: screen, screens: screens)
     }
 
     static func restorePosition(original: CGRect, expanded: CGRect, screens: [CGRect]) -> CGPoint {
@@ -60,29 +52,65 @@ enum TemporaryStashGeometry {
         return isVisible ? original.origin : expanded.origin
     }
 
-    /// 列表从上到下排列（AppKit 的 y 向上）；整列居中，与窗口几何无关。
-    static func labelFrames(count: Int, edge: Int, visibleFrame: CGRect) -> [CGRect] {
-        let height = TemporaryStashDefaults.labelHeight
-        let stride = height + TemporaryStashDefaults.labelGap
-        let totalHeight = CGFloat(count) * height + CGFloat(max(0, count - 1)) * TemporaryStashDefaults.labelGap
-        return (0..<count).map { index in
-            CGRect(x: edge == 1 ? visibleFrame.minX : visibleFrame.maxX - TemporaryStashDefaults.labelWidth,
-                   y: visibleFrame.midY + totalHeight / 2 - height - CGFloat(index) * stride,
-                   width: TemporaryStashDefaults.labelWidth, height: height)
+    static func slotCapacity(visibleFrame: CGRect) -> Int {
+        max(0, Int((visibleFrame.height + TemporaryStashDefaults.labelGap)
+            / (TemporaryStashDefaults.labelHeight + TemporaryStashDefaults.labelGap)))
+    }
+
+    static func slotFrame(slot: Int, edge: Int, visibleFrame: CGRect) -> CGRect? {
+        guard slot > 0, slot <= slotCapacity(visibleFrame: visibleFrame) else { return nil }
+        return CGRect(x: edge == 1 ? visibleFrame.minX : visibleFrame.maxX - TemporaryStashDefaults.labelWidth,
+                      y: visibleFrame.maxY - TemporaryStashDefaults.labelHeight
+                        - CGFloat(slot - 1) * (TemporaryStashDefaults.labelHeight + TemporaryStashDefaults.labelGap),
+                      width: TemporaryStashDefaults.labelWidth, height: TemporaryStashDefaults.labelHeight)
+    }
+
+    static func slot(at point: CGPoint, edge: Int, visibleFrame: CGRect, count: Int) -> Int? {
+        (1...max(1, count)).first { slot in
+            slot <= count && slotFrame(slot: slot, edge: edge, visibleFrame: visibleFrame)?.contains(point) == true
         }
     }
+}
 
-    static func draggedFrame(initial: CGRect, deltaY: CGFloat, column: CGRect) -> CGRect {
-        CGRect(x: initial.minX, y: min(max(initial.minY + deltaY, column.minY), column.maxY - initial.height),
-               width: initial.width, height: initial.height)
+struct TemporaryStashSlotAssignment: Codable, Equatable {
+    let id: String
+    let screenID: UInt32
+    let edge: Int
+    var slot: Int
+
+    func sharesColumn(with other: Self) -> Bool { screenID == other.screenID && edge == other.edge }
+}
+
+enum TemporaryStashSlots {
+    static func allocate(preferred: Int = 0, occupied: Set<Int>, capacity: Int = Int.max - 1) -> Int? {
+        if preferred > 0 && preferred <= capacity && !occupied.contains(preferred) { return preferred }
+        var slot = 1
+        while slot <= capacity && occupied.contains(slot) { slot += 1 }
+        return slot <= capacity ? slot : nil
     }
 
-    /// 松手中心落在哪个槽位就插入该序号；原列包含被拖项，跨过槽位中线时换位。
-    static func insertionIndex(centerY: CGFloat, columnFrames: [CGRect]) -> Int {
-        guard let first = columnFrames.first else { return 0 }
-        let stride = TemporaryStashDefaults.labelHeight + TemporaryStashDefaults.labelGap
-        let index = Int(((first.midY - centerY) / stride).rounded())
-        return min(max(index, 0), columnFrames.count - 1)
+    /// Existing residents claim their slots before windows arriving from another display.
+    static func resolve(existing: [TemporaryStashSlotAssignment], requested: [TemporaryStashSlotAssignment]) -> [TemporaryStashSlotAssignment] {
+        let residents = requested.filter { item in existing.contains { $0.id == item.id && $0.sharesColumn(with: item) } }
+        let arrivals = requested.filter { item in !residents.contains { $0.id == item.id } }
+        var resolved: [TemporaryStashSlotAssignment] = []
+        for var item in residents + arrivals {
+            let previous = existing.first { $0.id == item.id }
+            let occupied = Set(resolved.filter { $0.sharesColumn(with: item) }.map(\.slot))
+            item.slot = allocate(preferred: item.slot > 0 ? item.slot : previous?.slot ?? 0, occupied: occupied) ?? 0
+            resolved.append(item)
+        }
+        return requested.compactMap { item in resolved.first { $0.id == item.id } }
+    }
+
+    static func move(id: String, to slot: Int, assignments: [TemporaryStashSlotAssignment]) -> [TemporaryStashSlotAssignment] {
+        guard slot > 0, let source = assignments.first(where: { $0.id == id }) else { return assignments }
+        return assignments.map { item in
+            var item = item
+            if item.id == id { item.slot = slot }
+            else if item.sharesColumn(with: source) && item.slot == slot { item.slot = source.slot }
+            return item
+        }
     }
 }
 

@@ -1,7 +1,7 @@
 import Foundation
 
 enum Clock { static var now: Double = 0 }
-struct Date: Comparable {
+struct Date: Comparable, Codable {
     let value: Double
     init() { value = Clock.now }
     init(_ value: Double) { self.value = value }
@@ -60,6 +60,7 @@ final class WindowSession {
     func focusForTemporaryStashTab() { focusCount += 1 }
     var focusCount = 0
     func toggleExpandCollapse() {}
+    var temporaryStashSlot = 0
     let temporaryStashID: String
     var isManagedByTemporaryShortcut = true
     var isExpandedForCoordination = false
@@ -146,13 +147,15 @@ final class RunLoop {
 final class TemporaryStashTabWindow {
     static var live: [String: CGRect] = [:]
     static var instances: [String: TemporaryStashTabWindow] = [:]
+    static var placeholders: [ObjectIdentifier: CGRect] = [:]
     static var created = 0
     static var closed = 0
     var title = ""
     var frame = CGRect.zero
     var onEvent: ((TemporaryStashTabEvent) -> Void)?
     init() { Self.created += 1 }
-    func update(frame: CGRect, title: String, expanded: Bool) {
+    func update(frame: CGRect, title: String, expanded: Bool, isPlaceholder: Bool = false) {
+        if isPlaceholder { Self.placeholders[ObjectIdentifier(self)] = frame; return }
         self.title = title
         self.frame = frame
         Self.live[title] = frame
@@ -160,7 +163,7 @@ final class TemporaryStashTabWindow {
     }
     func orderFrontRegardless() { Self.live[title] = frame }
     func orderOut(_ sender: Any?) { Self.live[title] = nil }
-    func close() { Self.closed += 1; Self.live[title] = nil; Self.instances[title] = nil }
+    func close() { Self.placeholders[ObjectIdentifier(self)] = nil; Self.closed += 1; Self.live[title] = nil; Self.instances[title] = nil }
     static func emit(_ title: String, _ event: TemporaryStashTabEvent) {
         switch event {
         case .down: NSEvent.pressedMouseButtons = 1

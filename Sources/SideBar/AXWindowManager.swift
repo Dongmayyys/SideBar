@@ -38,8 +38,10 @@ class AXWindowManager {
         for record in pendingTemporaryRecovery {
             temporaryOrdinals.reserve(bundleID: record.bundleID, windowID: record.id, ordinal: record.ordinal)
         }
-        temporaryTabCoordinator.restoreOrder(temporaryRecovery.orders)
-        temporaryTabCoordinator.onOrderChanged = { [weak self] in self?.persistTemporaryRecovery() }
+        temporaryTabCoordinator.restoreSlots(temporaryRecovery.assignments, pendingIDs: Set(pendingTemporaryRecovery.map(\.id)))
+        temporaryTabCoordinator.onSlotsChanged = { [weak self] assignments in
+            self?.handleTemporarySlotsChanged(assignments)
+        }
 
         SideBarBridge.shared.hotkeyActionHandler = { [weak self] bundleID in
             self?.handleForwardedHotkeyAction(bundleID: bundleID) ?? .unhandled
@@ -53,6 +55,7 @@ class AXWindowManager {
         
         // 监听新应用启动
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(appDidLaunch), name: NSWorkspace.didLaunchApplicationNotification, object: nil)
+        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(appDidTerminate), name: NSWorkspace.didTerminateApplicationNotification, object: nil)
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(handleActiveSpaceDidChange), name: NSWorkspace.activeSpaceDidChangeNotification, object: nil)
 
         // 关键修复：监听屏幕配置变化（外接显示器热插拔、分辨率切换、显示器排列调整）。
@@ -68,7 +71,7 @@ class AXWindowManager {
         // 启动时同步一次所有运行中应用
         synchronizeSessions()
         refreshSideBarHotkeyRuntime()
-        restoreTemporaryShortcuts(attemptsRemaining: 6)
+        restoreTemporaryShortcuts(attemptsRemaining: 20)
         if let app = NSWorkspace.shared.frontmostApplication { recordMainInterfaceActivation(app) }
 
         fusionRefreshTimer = Timer.scheduledTimer(withTimeInterval: 0.12, repeats: true) { [weak self] _ in
@@ -96,9 +99,26 @@ class AXWindowManager {
     @objc private func appDidLaunch(_ notification: Notification) {
         if let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication {
             handleAppActivation(app: app, isActivationNotification: false)
+            restoreTemporaryShortcuts(attemptsRemaining: 20)
         }
     }
     
+    @objc private func appDidTerminate(_ notification: Notification) {
+        guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+        retainTemporaryRecoveryAfterTermination(pid: app.processIdentifier)
+        synchronizeSessions()
+        restoreTemporaryShortcuts(attemptsRemaining: 20)
+    }
+
+    private func retainTemporaryRecoveryAfterTermination(pid: pid_t) {
+        // The archive also covers AX-destroy notifications delivered before the
+        // workspace termination notification and sessions already being torn down.
+        for record in temporaryRecovery.windows where record.pid == pid {
+            pendingTemporaryRecovery.removeAll { $0.id == record.id }
+            pendingTemporaryRecovery.append(record.waitingForRelaunch())
+        }
+    }
+
     @objc private func synchronizeSessions() {
         let runningApps = NSWorkspace.shared.runningApplications
         let runningPIDs = Set(runningApps.map { $0.processIdentifier })
@@ -159,7 +179,8 @@ class AXWindowManager {
         // 2. 上线当前允许且在运行的会话
         for app in runningApps {
             guard let bundleID = app.bundleIdentifier, app.activationPolicy == .regular else { continue }
-            if AppConfig.shared.isAppEnabled(bundleID: bundleID) {
+            if AppConfig.shared.isAppEnabled(bundleID: bundleID)
+                || pendingTemporaryRecovery.contains(where: { $0.bundleID == bundleID }) {
                 monitorApp(pid: app.processIdentifier, bundleID: bundleID, maxRetries: 1)
             }
         }
@@ -340,6 +361,9 @@ class AXWindowManager {
     // 允许通过 AX 通知自己回调
     func handleFocusedWindowChanged(pid: pid_t) {
         if let app = NSRunningApplication(processIdentifier: pid), let bundleID = app.bundleIdentifier {
+            if pendingTemporaryRecovery.contains(where: { $0.bundleID == bundleID }) {
+                restoreTemporaryShortcuts(attemptsRemaining: 20)
+            }
             WindowSession.recordObservedFocusSnapshot(for: app)
             if AppConfig.shared.isAppEnabled(bundleID: bundleID) {
                 monitorApp(pid: pid, bundleID: bundleID)
@@ -361,7 +385,8 @@ class AXWindowManager {
                 let manager = Unmanaged<AXWindowManager>.fromOpaque(context!).takeUnretainedValue()
                 var pid: pid_t = 0
                 AXUIElementGetPid(element, &pid)
-                if notification == kAXFocusedWindowChangedNotification as CFString {
+                if notification == kAXFocusedWindowChangedNotification as CFString
+                    || notification == kAXWindowCreatedNotification as CFString {
                     DispatchQueue.main.async { manager.handleFocusedWindowChanged(pid: pid) }
                 }
             }
@@ -379,7 +404,11 @@ class AXWindowManager {
                     context: "AXWindowManager.monitorApp.addFocusedWindowObserver",
                     refcon: selfPtr
                 )
-                guard addResult == .success else { return }
+                let createdResult = AccessibilityRuntimeGuard.addObserverNotification(
+                    observer, element: appElement, notification: kAXWindowCreatedNotification as CFString,
+                    context: "AXWindowManager.monitorApp.addWindowCreatedObserver", refcon: selfPtr
+                )
+                guard addResult == .success || createdResult == .success else { return }
                 let runLoopSource = AXObserverGetRunLoopSource(observer)
                 // 显式绑定到主 run loop：保证 AX 回调始终在主线程，且 cleanup/suspend 时
                 // 能从同一 run loop 上拆除，避免在错误的 run loop 上调用造成 source 残留。
@@ -388,6 +417,8 @@ class AXWindowManager {
             }
         }
         
+        guard AppConfig.shared.isAppEnabled(bundleID: bundleID) else { return }
+
         // 获取主窗口并为其添加移动监听
         var windowValue: CFTypeRef?
         if AccessibilityRuntimeGuard.copyAttributeValue(
@@ -583,19 +614,18 @@ class AXWindowManager {
             existing?.cancelTemporaryShortcutStash()
             return true
         case .stash:
-            // A user's new stash supersedes a not-yet-restored record for this exact window.
-            if let windowID = WindowAlphaManager.shared.findWindowID(for: target.windowElement, pid: target.pid) {
-                for record in pendingTemporaryRecovery where record.matches(pid: target.pid, bundleID: target.bundleID, windowID: windowID) {
-                    discardPendingTemporaryRecovery(record)
-                }
-            }
+            let replacement = pendingTemporaryReplacement(for: target.windowElement, pid: target.pid, bundleID: target.bundleID)
             let session = WindowSession(appElement: target.appElement, windowElement: target.windowElement,
-                                        pid: target.pid, bundleID: target.bundleID, temporaryShortcut: true)
-            attachSessionLifecycle(to: session)
-            guard session.startTemporaryShortcutStash() else {
+                                        pid: target.pid, bundleID: target.bundleID, temporaryShortcut: true,
+                                        temporaryStashID: replacement?.id ?? UUID().uuidString)
+            guard session.startTemporaryShortcutStash(), claimTemporarySlot(for: session, preferred: replacement?.slot ?? 0) else {
                 session.restoreAndDestroy()
                 return false
             }
+            if let replacement {
+                pendingTemporaryRecovery.removeAll { $0.id == replacement.id }
+            }
+            attachSessionLifecycle(to: session)
             clearTemporarilyExcludedWindow(for: target.windowElement, pid: target.pid)
             session.temporaryStashOrdinal = temporaryOrdinals.assign(bundleID: target.bundleID, windowID: session.temporaryStashID)
             sessions.append(session)
@@ -608,17 +638,50 @@ class AXWindowManager {
 
     private func reconcileIndicators() {
         fusionCoordinator.reconcile(sessions: sessions.filter { !$0.isManagedByTemporaryShortcut })
-        temporaryTabCoordinator.reconcile(sessions: sessions)
         persistTemporaryRecovery()
+        temporaryTabCoordinator.reconcile(sessions: sessions)
     }
 
     private func persistTemporaryRecovery() {
         guard !hasCleanedUp else { return }
         let live = sessions.compactMap { $0.temporaryStashRecoveryRecord() }
-        temporaryRecovery.update(windows: pendingTemporaryRecovery + live,
-                                 liveOrders: temporaryTabCoordinator.snapshotOrder())
+        let liveIDs = Set(live.map(\.id))
+        temporaryRecovery.update(windows: pendingTemporaryRecovery.filter { !liveIDs.contains($0.id) } + live)
+        for session in sessions {
+            if let record = temporaryRecovery.windows.first(where: { $0.id == session.temporaryStashID }) {
+                session.temporaryStashSlot = record.slot
+            }
+        }
         temporaryRecoveryStore.save(temporaryRecovery)
-        temporaryTabCoordinator.restoreOrder(temporaryRecovery.orders)
+        temporaryTabCoordinator.restoreSlots(temporaryRecovery.assignments, pendingIDs: Set(pendingTemporaryRecovery.map(\.id)))
+    }
+
+    private func handleTemporarySlotsChanged(_ assignments: [TemporaryStashSlotAssignment]) {
+        for index in pendingTemporaryRecovery.indices {
+            if let assignment = assignments.first(where: { $0.id == pendingTemporaryRecovery[index].id }) {
+                pendingTemporaryRecovery[index].slot = assignment.slot
+            }
+        }
+        persistTemporaryRecovery()
+    }
+
+    private func claimTemporarySlot(for session: WindowSession, preferred: Int) -> Bool {
+        guard let record = session.temporaryStashRecoveryRecord() else { return false }
+        let live = sessions.compactMap { $0.temporaryStashRecoveryRecord() }
+        let liveIDs = Set(live.map(\.id))
+        let allRecords = temporaryRecovery.windows.filter { !liveIDs.contains($0.id) } + live
+        let occupied = Set(allRecords.filter {
+            $0.id != record.id && $0.screenID == record.screenID && $0.edge == record.edge
+        }.map(\.slot))
+        let existing = temporaryRecovery.windows.first { $0.id == record.id }
+        let retainsSlot = existing?.screenID == record.screenID && existing?.edge == record.edge && existing?.slot == preferred
+        // A shorter visible area may temporarily hide an established slot. It
+        // must not renumber that reservation when SideBar or the app restarts.
+        let capacity = retainsSlot ? max(session.temporaryStashSlotCapacity, preferred) : session.temporaryStashSlotCapacity
+        guard let slot = TemporaryStashSlots.allocate(preferred: preferred, occupied: occupied,
+                                                       capacity: capacity) else { return false }
+        session.temporaryStashSlot = slot
+        return true
     }
 
     private func stopTemporaryRecovery() {
@@ -635,36 +698,62 @@ class AXWindowManager {
         refreshTemporaryDockExclusion(bundleID: record.bundleID)
     }
 
-    /// Runs only after crash rescue, and never calls rescue again after re-stashing.
-    /// AX/window enumeration can lag startup; retry for at most three seconds.
+    /// Exact identities always get first refusal. Only confirmed missing identities
+    /// enter relaunch matching; a busy AX application keeps its exact record.
     private func restoreTemporaryShortcuts(attemptsRemaining: Int) {
         guard !hasCleanedUp else { return }
-        for record in pendingTemporaryRecovery {
+        temporaryRecoveryRetry?.cancel()
+        temporaryRecoveryRetry = nil
+        resolveClosedTemporaryRecovery()
+        var exactWindows: [AXUIElement] = []
+        for record in pendingTemporaryRecovery where !record.awaitingRelaunch && record.closedAt == nil {
+            guard !AppConfig.shared.isAppEnabled(bundleID: record.bundleID) else { continue }
             guard let app = NSRunningApplication(processIdentifier: record.pid), !app.isTerminated,
-                  app.bundleIdentifier == record.bundleID,
-                  !AppConfig.shared.isAppEnabled(bundleID: record.bundleID) else {
-                discardPendingTemporaryRecovery(record)
+                  app.bundleIdentifier == record.bundleID else {
+                markTemporaryRecoveryWaiting(record)
                 continue
             }
-            if let window = findTemporaryRecoveryWindow(record) {
-                let session = WindowSession(appElement: AXUIElementCreateApplication(record.pid), windowElement: window,
-                                            pid: record.pid, bundleID: record.bundleID, temporaryShortcut: true,
-                                            temporaryStashID: record.id)
-                session.temporaryStashOrdinal = record.ordinal
-                if session.startTemporaryShortcutStash(restoring: record) {
-                    attachSessionLifecycle(to: session)
-                    sessions.append(session)
-                    temporaryTabCoordinator.suppressRestoredHover(for: session)
-                    pendingTemporaryRecovery.removeAll { $0.id == record.id }
-                    refreshTemporaryDockExclusion(bundleID: record.bundleID)
-                    continue
-                }
-                session.restoreAndDestroy()
+            guard let windows = temporaryRecoveryWindows(pid: record.pid) else { continue }
+            if let window = windows.first(where: {
+                WindowAlphaManager.shared.findWindowID(for: $0, pid: record.pid) == record.windowID
+            }) {
+                exactWindows.append(window)
+                restoreTemporaryShortcut(record, window: window, pid: record.pid)
+            } else if windows.allSatisfy({ WindowAlphaManager.shared.findWindowID(for: $0, pid: record.pid) != nil }) {
+                markTemporaryRecoveryWaiting(record)
             }
-            if attemptsRemaining == 0 { discardPendingTemporaryRecovery(record) }
+        }
+
+        let groups = Dictionary(grouping: pendingTemporaryRecovery.filter {
+            $0.awaitingRelaunch && $0.closedAt == nil
+        }, by: \.bundleID)
+        for (bundleID, records) in groups {
+            guard !AppConfig.shared.isAppEnabled(bundleID: bundleID) else { continue }
+            var candidates: [(pid: pid_t, window: AXUIElement, frame: CGRect)] = []
+            for app in NSWorkspace.shared.runningApplications where app.bundleIdentifier == bundleID && !app.isTerminated {
+                monitorApp(pid: app.processIdentifier, bundleID: bundleID)
+                guard let windows = temporaryRecoveryWindows(pid: app.processIdentifier) else { continue }
+                for window in windows where !exactWindows.contains(where: { CFEqual($0, window) }) {
+                    guard isTemporaryRecoveryCandidate(window, pid: app.processIdentifier, bundleID: bundleID),
+                          let frame = temporaryRecoveryFrame(window) else { continue }
+                    candidates.append((app.processIdentifier, window, frame))
+                }
+            }
+            let bundleCount = temporaryRecovery.windows.filter { $0.bundleID == bundleID }.count
+            if bundleCount == 1, let record = records.first {
+                if let candidate = primaryTemporaryRecoveryCandidate(candidates) {
+                    restoreTemporaryShortcut(record, window: candidate.window, pid: candidate.pid)
+                }
+            } else {
+                let matches = TemporaryStashRecoveryMatcher.uniqueMatches(records: records, frames: candidates.map(\.frame))
+                for record in records {
+                    guard let index = matches[record.id] else { continue }
+                    restoreTemporaryShortcut(record, window: candidates[index].window, pid: candidates[index].pid)
+                }
+            }
         }
         reconcileIndicators()
-        guard !pendingTemporaryRecovery.isEmpty else { return }
+        guard attemptsRemaining > 0, !pendingTemporaryRecovery.isEmpty else { return }
         let retry = DispatchWorkItem { [weak self] in
             self?.restoreTemporaryShortcuts(attemptsRemaining: attemptsRemaining - 1)
         }
@@ -672,18 +761,83 @@ class AXWindowManager {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: retry)
     }
 
-    private func findTemporaryRecoveryWindow(_ record: TemporaryStashRecoveryRecord) -> AXUIElement? {
-        let appElement = AXUIElementCreateApplication(record.pid)
+    private func markTemporaryRecoveryWaiting(_ record: TemporaryStashRecoveryRecord) {
+        guard let index = pendingTemporaryRecovery.firstIndex(where: { $0.id == record.id }) else { return }
+        pendingTemporaryRecovery[index] = record.waitingForRelaunch()
+    }
+
+    private func temporaryRecoveryWindows(pid: pid_t) -> [AXUIElement]? {
         var value: CFTypeRef?
-        guard AccessibilityRuntimeGuard.copyAttributeValue(of: appElement, attribute: kAXWindowsAttribute as CFString,
-                    value: &value, context: "AXWindowManager.findTemporaryRecoveryWindow.windows") == .success,
-              let windows = value as? [AXUIElement] else { return nil }
-        return windows.first { window in
-            guard let windowID = WindowAlphaManager.shared.findWindowID(for: window, pid: record.pid),
-                  record.matches(pid: record.pid, bundleID: record.bundleID, windowID: windowID) else { return false }
-            return WindowCapabilityProfiler.profile(of: window, bundleID: record.bundleID,
-                       context: "AXWindowManager.findTemporaryRecoveryWindow.profile").isStandardWindow
+        guard AccessibilityRuntimeGuard.copyAttributeValue(of: AXUIElementCreateApplication(pid),
+                  attribute: kAXWindowsAttribute as CFString, value: &value,
+                  context: "AXWindowManager.temporaryRecoveryWindows") == .success else { return nil }
+        return value as? [AXUIElement]
+    }
+
+    private func isTemporaryRecoveryCandidate(_ window: AXUIElement, pid: pid_t, bundleID: String) -> Bool {
+        if let key = windowKey(for: window, pid: pid), temporarilyExcludedWindowKeys.contains(key) { return false }
+        return !sessions.contains(where: { CFEqual($0.windowElement, window) })
+            && WindowCapabilityProfiler.profile(of: window, bundleID: bundleID,
+                       context: "AXWindowManager.isTemporaryRecoveryCandidate").isStandardWindow
+    }
+
+    private func restoreTemporaryShortcut(_ record: TemporaryStashRecoveryRecord, window: AXUIElement, pid: pid_t) {
+        guard isTemporaryRecoveryCandidate(window, pid: pid, bundleID: record.bundleID),
+              WindowAlphaManager.shared.findWindowID(for: window, pid: pid) != nil else { return }
+        let session = WindowSession(appElement: AXUIElementCreateApplication(pid), windowElement: window,
+                                    pid: pid, bundleID: record.bundleID, temporaryShortcut: true, temporaryStashID: record.id)
+        session.temporaryStashOrdinal = record.ordinal
+        guard session.startTemporaryShortcutStash(restoring: record), claimTemporarySlot(for: session, preferred: record.slot) else {
+            session.restoreAndDestroy()
+            return
         }
+        attachSessionLifecycle(to: session)
+        sessions.append(session)
+        temporaryTabCoordinator.suppressRestoredHover(for: session)
+        pendingTemporaryRecovery.removeAll { $0.id == record.id }
+        refreshTemporaryDockExclusion(bundleID: record.bundleID)
+    }
+
+    private func primaryTemporaryRecoveryCandidate(_ candidates: [(pid: pid_t, window: AXUIElement, frame: CGRect)])
+        -> (pid: pid_t, window: AXUIElement, frame: CGRect)? {
+        for attribute in [kAXMainWindowAttribute, kAXFocusedWindowAttribute] {
+            for candidate in candidates {
+                var value: CFTypeRef?
+                if AccessibilityRuntimeGuard.copyAttributeValue(of: AXUIElementCreateApplication(candidate.pid),
+                       attribute: attribute as CFString, value: &value,
+                       context: "AXWindowManager.primaryTemporaryRecoveryCandidate") == .success,
+                   let value, CFEqual(value, candidate.window) { return candidate }
+            }
+        }
+        return candidates.first
+    }
+
+    private func temporaryRecoveryFrame(_ window: AXUIElement) -> CGRect? {
+        var positionValue: CFTypeRef?
+        var sizeValue: CFTypeRef?
+        guard AccessibilityRuntimeGuard.copyAttributeValue(of: window, attribute: kAXPositionAttribute as CFString,
+                  value: &positionValue, context: "AXWindowManager.temporaryRecoveryFrame.position") == .success,
+              AccessibilityRuntimeGuard.copyAttributeValue(of: window, attribute: kAXSizeAttribute as CFString,
+                  value: &sizeValue, context: "AXWindowManager.temporaryRecoveryFrame.size") == .success,
+              let positionValue, let sizeValue,
+              CFGetTypeID(positionValue) == AXValueGetTypeID(), CFGetTypeID(sizeValue) == AXValueGetTypeID() else { return nil }
+        var position = CGPoint.zero
+        var size = CGSize.zero
+        guard AXValueGetValue(positionValue as! AXValue, .cgPoint, &position),
+              AXValueGetValue(sizeValue as! AXValue, .cgSize, &size),
+              [position.x, position.y, size.width, size.height].allSatisfy(\.isFinite),
+              size.width > 0, size.height > 0 else { return nil }
+        return CGRect(origin: position, size: size)
+    }
+
+    private func pendingTemporaryReplacement(for window: AXUIElement, pid: pid_t, bundleID: String) -> TemporaryStashRecoveryRecord? {
+        let records = pendingTemporaryRecovery.filter { $0.bundleID == bundleID }
+        if let windowID = WindowAlphaManager.shared.findWindowID(for: window, pid: pid),
+           let exact = records.first(where: { !$0.awaitingRelaunch && $0.matches(pid: pid, bundleID: bundleID, windowID: windowID) }) {
+            return exact
+        }
+        guard let frame = temporaryRecoveryFrame(window) else { return nil }
+        return TemporaryStashRecoveryMatcher.replacement(in: records.filter(\.awaitingRelaunch), frame: frame)
     }
 
     private func refreshTemporaryDockExclusion(bundleID: String) {
@@ -761,10 +915,23 @@ class AXWindowManager {
         }
         if !hasCleanedUp {
             // Do not read sessions here: this callback can run inside sessions.removeAll.
-            temporaryRecovery.remove(id: session.temporaryStashID)
+            if !excludeWindow, let record = temporaryRecovery.windows.first(where: { $0.id == session.temporaryStashID }) {
+                pendingTemporaryRecovery.removeAll { $0.id == record.id }
+                var closing = record
+                closing.closedAt = Date()
+                pendingTemporaryRecovery.append(closing)
+                temporaryRecovery.update(windows: temporaryRecovery.windows.filter { $0.id != record.id } + [closing])
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                    guard let self, !self.hasCleanedUp else { return }
+                    self.resolveClosedTemporaryRecovery()
+                    self.reconcileIndicators()
+                }
+            } else {
+                temporaryRecovery.remove(id: session.temporaryStashID)
+                temporaryOrdinals.release(bundleID: session.bundleID, windowID: session.temporaryStashID)
+            }
             temporaryRecoveryStore.save(temporaryRecovery)
         }
-        temporaryOrdinals.release(bundleID: session.bundleID, windowID: session.temporaryStashID)
         refreshTemporaryDockExclusion(bundleID: session.bundleID)
 
         guard removeSession else { return }
@@ -774,6 +941,16 @@ class AXWindowManager {
             self.sessions.removeAll { $0 === session }
             self.reconcileIndicators()
             self.refreshSideBarHotkeyRuntime()
+        }
+    }
+
+    private func resolveClosedTemporaryRecovery(now: Date = Date()) {
+        for record in pendingTemporaryRecovery {
+            guard let closedAt = record.closedAt else { continue }
+            let app = NSRunningApplication(processIdentifier: record.pid)
+            let stillRunning = app?.isTerminated == false && app?.bundleIdentifier == record.bundleID
+            if !stillRunning { markTemporaryRecoveryWaiting(record) }
+            else if now.timeIntervalSince(closedAt) >= 2 { discardPendingTemporaryRecovery(record) }
         }
     }
 

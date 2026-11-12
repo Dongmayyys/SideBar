@@ -31,43 +31,31 @@ final class TemporaryStashTabCoordinator {
     private struct Drag {
         let id: ObjectIdentifier
         let key: EdgeKey
-        let startY: CGFloat
+        let start: CGPoint
         let initialFrame: CGRect
-        let column: CGRect
+        let visibleFrame: CGRect
+        let slotCount: Int
+        let assignments: [TemporaryStashSlotAssignment]
         var frame: CGRect
         var moved = false
         var cancelled = false
     }
 
-    var onOrderChanged: (() -> Void)?
-    private var recoveryOrder: [TemporaryStashTabOrder] = []
-    private var recoveryRanks: [String: Int] = [:]
-    private var restoringIDs: Set<ObjectIdentifier> = []
+    var onSlotsChanged: (([TemporaryStashSlotAssignment]) -> Void)?
+    private var assignments: [TemporaryStashSlotAssignment] = []
+    private var pendingRecoveryIDs: Set<String> = []
+    private var slotPanels: [Int: TemporaryStashTabWindow] = [:]
 
-    func restoreOrder(_ orders: [TemporaryStashTabOrder]) {
-        recoveryOrder = orders
-        // Retain source-column ranks when a missing display/blocked edge moves a
-        // restored window to another column, including windows arriving on retry.
-        for id in orders.flatMap(\.ids) where recoveryRanks[id] == nil {
-            recoveryRanks[id] = recoveryRanks.count
-        }
+    func restoreSlots(_ assignments: [TemporaryStashSlotAssignment], pendingIDs: Set<String> = []) {
+        self.assignments = assignments
+        pendingRecoveryIDs = pendingIDs
     }
 
     func suppressRestoredHover(for session: WindowSession) {
-        // Restoring under a stationary pointer must not immediately reveal/focus it.
-        restoringIDs.insert(ObjectIdentifier(session))
         hoverSuppressedUntilExit.insert(ObjectIdentifier(session))
     }
 
-    func snapshotOrder() -> [TemporaryStashTabOrder] {
-        let stableIDs = Dictionary(uniqueKeysWithValues: sessions.map { (ObjectIdentifier($0), $0.temporaryStashID) })
-        return order.map { key, ids in
-            TemporaryStashTabOrder(screenID: key.screenID, edge: key.edge, ids: ids.compactMap { stableIDs[$0] })
-        }.sorted { ($0.screenID, $0.edge) < ($1.screenID, $1.edge) }
-    }
-
     private var panels: [ObjectIdentifier: TemporaryStashTabWindow] = [:]
-    private var order: [EdgeKey: [ObjectIdentifier]] = [:]
     private var visibility: [ObjectIdentifier: TemporaryStashVisibility] = [:]
     private var layoutFrames: [ObjectIdentifier: CGRect] = [:]
     private var drag: Drag?
@@ -189,26 +177,20 @@ final class TemporaryStashTabCoordinator {
             panels.removeValue(forKey: id)?.close()
             visibility[id] = nil
         }
-        let groups = Dictionary(grouping: descriptors, by: EdgeKey.init)
-        for key in Array(order.keys) {
-            order[key]?.removeAll { id in
-                !descriptors.contains { ObjectIdentifier($0.session) == id && EdgeKey($0) == key }
-            }
-            if order[key]?.isEmpty == true { order[key] = nil }
+        // Waiting records reserve slots without creating panels or hit targets.
+        let stableIDs = Set(self.sessions.map(\.temporaryStashID))
+        let existing = assignments.filter { stableIDs.contains($0.id) || pendingRecoveryIDs.contains($0.id) }
+        var requested = existing.filter { pendingRecoveryIDs.contains($0.id) && !stableIDs.contains($0.id) }
+        requested += descriptors.map { descriptor in
+            TemporaryStashSlotAssignment(id: descriptor.session.temporaryStashID, screenID: descriptor.screenID,
+                                        edge: descriptor.edge, slot: descriptor.session.temporaryStashSlot)
         }
-        for descriptor in descriptors {
-            let key = EdgeKey(descriptor)
-            let id = ObjectIdentifier(descriptor.session)
-            if !order[key, default: []].contains(id) {
-                let saved = recoveryOrder.first { $0.screenID == key.screenID && $0.edge == key.edge }?.ids ?? []
-                let isRestoring = restoringIDs.remove(id) != nil
-                let ranks = isRestoring ? recoveryRanks : Dictionary(saved.enumerated().map { ($0.element, $0.offset) }, uniquingKeysWith: { first, _ in first })
-                let rank = ranks[descriptor.session.temporaryStashID] ?? Int.max
-                let insertion = order[key, default: []].firstIndex { existing in
-                    guard let session = self.sessions.first(where: { ObjectIdentifier($0) == existing }) else { return false }
-                    return (ranks[session.temporaryStashID] ?? Int.max) > rank
-                } ?? order[key, default: []].count
-                order[key, default: []].insert(id, at: insertion)
+        // A transient missing descriptor must not release an established live slot.
+        requested += existing.filter { item in !requested.contains { $0.id == item.id } }
+        assignments = TemporaryStashSlots.resolve(existing: existing, requested: requested)
+        for session in self.sessions {
+            if let assignment = assignments.first(where: { $0.id == session.temporaryStashID }) {
+                session.temporaryStashSlot = assignment.slot
             }
         }
 
@@ -217,21 +199,21 @@ final class TemporaryStashTabCoordinator {
             return visibility[id, default: TemporaryStashVisibility()].isVisible(
                 isOnScreen: descriptor.isOnScreen, now: now.timeIntervalSinceReferenceDate)
         }
-        let visibleIDs = Set(visible.map { ObjectIdentifier($0.session) })
-        for (id, panel) in panels where !visibleIDs.contains(id) { panel.orderOut(nil) }
         let previousFrames = layoutFrames
         layoutFrames.removeAll()
-        for (key, members) in groups {
-            guard let first = members.first else { continue }
-            let ids = order[key, default: []].filter { visibleIDs.contains($0) }
-            let frames = TemporaryStashGeometry.labelFrames(count: ids.count, edge: first.edge, visibleFrame: first.visibleFrame)
-            for (id, frame) in zip(ids, frames) { layoutFrames[id] = frame }
+        for descriptor in visible {
+            guard let assignment = assignments.first(where: { $0.id == descriptor.session.temporaryStashID }),
+                  let frame = TemporaryStashGeometry.slotFrame(slot: assignment.slot, edge: descriptor.edge,
+                                                               visibleFrame: descriptor.visibleFrame) else { continue }
+            layoutFrames[ObjectIdentifier(descriptor.session)] = frame
         }
+        for (id, panel) in panels where layoutFrames[id] == nil { panel.orderOut(nil) }
         // 成员或屏幕几何变化时取消本次拖动，避免用过期的列范围插入。
-        if drag != nil && previousFrames != layoutFrames {
+        if let current = drag, previousFrames != layoutFrames || current.assignments != assignments {
             drag?.cancelled = true
             resetHover()
         }
+        updateSlotPlaceholders()
         for descriptor in visible {
             let id = ObjectIdentifier(descriptor.session)
             guard let frame = layoutFrames[id] else { continue }
@@ -295,9 +277,12 @@ final class TemporaryStashTabCoordinator {
             reconcile(sessions: sessions)
         case .down(let point):
             guard drag == nil, let frame = layoutFrames[id], frame.contains(point),
-                  let key = order.first(where: { $0.value.contains(id) })?.key else { return }
-            let column = order[key, default: []].compactMap { layoutFrames[$0] }.reduce(frame) { $0.union($1) }
-            drag = Drag(id: id, key: key, startY: point.y, initialFrame: frame, column: column, frame: frame)
+                  let descriptor = sessions.first(where: { ObjectIdentifier($0) == id })?.temporaryStashTabDescriptor() else { return }
+            let key = EdgeKey(descriptor)
+            let highest = assignments.filter { $0.screenID == key.screenID && $0.edge == key.edge }.map(\.slot).max() ?? 0
+            let count = min(highest + 1, TemporaryStashGeometry.slotCapacity(visibleFrame: descriptor.visibleFrame))
+            drag = Drag(id: id, key: key, start: point, initialFrame: frame, visibleFrame: descriptor.visibleFrame,
+                        slotCount: count, assignments: assignments, frame: frame)
             resetHover()
             reconcile(sessions: sessions)
         case .dragged(let point):
@@ -308,41 +293,43 @@ final class TemporaryStashTabCoordinator {
             guard drag?.id == id else { return }
             updateDrag(at: point)
             guard let current = drag else { return }
-            if current.moved && !current.cancelled {
-                var ids = order[current.key, default: []].filter { $0 != id }
-                let visibleIDs = ids.filter { layoutFrames[$0] != nil }
-                let index = TemporaryStashGeometry.insertionIndex(centerY: current.frame.midY,
-                                                                  columnFrames: order[current.key, default: []].compactMap { layoutFrames[$0] })
-                let destination: Int
-                if index < visibleIDs.count {
-                    destination = ids.firstIndex(of: visibleIDs[index])!
-                } else if let last = visibleIDs.last {
-                    destination = ids.firstIndex(of: last)! + 1
-                } else {
-                    destination = 0
+            if current.moved && !current.cancelled,
+               let slot = TemporaryStashGeometry.slot(at: point, edge: current.key.edge,
+                                                     visibleFrame: current.visibleFrame, count: current.slotCount),
+               let session = sessions.first(where: { ObjectIdentifier($0) == id }) {
+                assignments = TemporaryStashSlots.move(id: session.temporaryStashID, to: slot, assignments: assignments)
+                for session in sessions {
+                    session.temporaryStashSlot = assignments.first { $0.id == session.temporaryStashID }?.slot ?? session.temporaryStashSlot
                 }
-                ids.insert(id, at: destination)
-                order[current.key] = ids
-                let stableIDs = ids.compactMap { id in self.sessions.first { ObjectIdentifier($0) == id }?.temporaryStashID }
-                    .filter { recoveryRanks[$0] != nil }
-                let ranks = stableIDs.compactMap { recoveryRanks[$0] }.sorted()
-                for (stableID, rank) in zip(stableIDs, ranks) { recoveryRanks[stableID] = rank }
+                onSlotsChanged?(assignments)
             }
             drag = nil
             resetHover()
             reconcile(sessions: sessions)
-            onOrderChanged?()
         }
     }
 
     private func updateDrag(at point: CGPoint) {
         guard var current = drag, !current.cancelled else { return }
-        let delta = point.y - current.startY
-        current.moved = current.moved || abs(delta) >= 3
-        if current.moved {
-            current.frame = TemporaryStashGeometry.draggedFrame(initial: current.initialFrame, deltaY: delta, column: current.column)
-        }
+        let delta = point.y - current.start.y
+        current.moved = current.moved || abs(delta) >= 3 || abs(point.x - current.start.x) >= 3
+        if current.moved { current.frame = current.initialFrame.offsetBy(dx: 0, dy: delta) }
         drag = current
+    }
+
+    private func updateSlotPlaceholders() {
+        guard let drag, !drag.cancelled else {
+            slotPanels.values.forEach { $0.close() }
+            slotPanels.removeAll()
+            return
+        }
+        for slot in 1...max(1, drag.slotCount) {
+            guard slot <= drag.slotCount,
+                  let frame = TemporaryStashGeometry.slotFrame(slot: slot, edge: drag.key.edge, visibleFrame: drag.visibleFrame) else { continue }
+            let panel = slotPanels[slot] ?? TemporaryStashTabWindow()
+            slotPanels[slot] = panel
+            panel.update(frame: frame, title: "", expanded: false, isPlaceholder: true)
+        }
     }
 
     private func resetHover() {
@@ -391,10 +378,10 @@ final class TemporaryStashTabCoordinator {
     func tearDownAll() {
         panels.values.forEach { $0.close() }
         panels.removeAll()
-        order.removeAll()
-        recoveryOrder.removeAll()
-        recoveryRanks.removeAll()
-        restoringIDs.removeAll()
+        assignments.removeAll()
+        pendingRecoveryIDs.removeAll()
+        slotPanels.values.forEach { $0.close() }
+        slotPanels.removeAll()
         visibility.removeAll()
         layoutFrames.removeAll()
         hoverSuppressedUntilExit.removeAll()
@@ -429,9 +416,11 @@ private final class TemporaryStashTabWindow: NSPanel {
         contentView = label
     }
 
-    func update(frame: CGRect, title: String, expanded: Bool) {
+    func update(frame: CGRect, title: String, expanded: Bool, isPlaceholder: Bool = false) {
         if self.frame != frame { setFrame(frame, display: true) }
-        if label.title != title || label.expanded != expanded {
+        ignoresMouseEvents = isPlaceholder
+        if label.title != title || label.expanded != expanded || label.isPlaceholder != isPlaceholder {
+            label.isPlaceholder = isPlaceholder
             label.title = title
             label.expanded = expanded
             label.needsDisplay = true
@@ -443,6 +432,7 @@ private final class TemporaryStashTabWindow: NSPanel {
 private final class TemporaryStashTabView: NSView {
     var title = ""
     var expanded = false
+    var isPlaceholder = false
     var onEvent: ((TemporaryStashTabEvent) -> Void)?
     private var hoverTrackingArea: NSTrackingArea?
 
@@ -465,6 +455,14 @@ private final class TemporaryStashTabView: NSView {
     override func mouseUp(with event: NSEvent) { onEvent?(.up(NSEvent.mouseLocation)) }
 
     override func draw(_ dirtyRect: NSRect) {
+        if isPlaceholder {
+            NSColor.white.withAlphaComponent(0.3).setStroke()
+            NSColor.black.withAlphaComponent(0.12).setFill()
+            let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 5, yRadius: 5)
+            path.fill()
+            path.stroke()
+            return
+        }
         (expanded ? NSColor(white: 0.32, alpha: 1) : NSColor.black).setFill()
         NSBezierPath(roundedRect: bounds, xRadius: 5, yRadius: 5).fill()
         let capacity = max(1, Int((bounds.height - 2 * TemporaryStashDefaults.textPadding) / TemporaryStashDefaults.lineHeight))

@@ -21,10 +21,9 @@ final class AppConfig {
     func isAppEnabled(bundleID: String) -> Bool { enabled.contains(bundleID) }
 }
 final class TemporaryStashTabCoordinator {
-    var orders: [TemporaryStashTabOrder] = []
+    var assignments: [TemporaryStashSlotAssignment] = []
     var suppressedIDs: Set<String> = []
-    func snapshotOrder() -> [TemporaryStashTabOrder] { orders }
-    func restoreOrder(_ orders: [TemporaryStashTabOrder]) { self.orders = orders }
+    func restoreSlots(_ assignments: [TemporaryStashSlotAssignment], pendingIDs: Set<String> = []) { self.assignments = assignments }
     func suppressRestoredHover(for session: Session) { suppressedIDs.insert(session.temporaryStashID) }
 }
 final class RecoveryManager {
@@ -41,12 +40,12 @@ final class RecoveryManager {
     init(_ records: [TemporaryStashRecoveryRecord], defaults: UserDefaults = UserDefaults()) {
         temporaryRecoveryStore = TemporaryStashRecoveryStore(defaults: defaults, bootSessionID: "test-boot")
         temporaryRecovery = TemporaryStashRecoverySnapshot()
-        temporaryRecovery.update(windows: records, liveOrders: [])
-        pendingTemporaryRecovery = records
+        temporaryRecovery.update(windows: records)
+        pendingTemporaryRecovery = temporaryRecovery.windows
         for record in records {
             temporaryOrdinals.reserve(bundleID: record.bundleID, windowID: record.id, ordinal: record.ordinal)
         }
-        temporaryTabCoordinator.restoreOrder(temporaryRecovery.orders)
+        temporaryTabCoordinator.restoreSlots(temporaryRecovery.assignments)
     }
     func attachSessionLifecycle(to session: Session) {
         session.onTemporaryShortcutSessionEnded = { [weak self] session, exclude, remove in
@@ -54,6 +53,15 @@ final class RecoveryManager {
         }
     }
     func reconcileIndicators() { persistTemporaryRecovery() }
+    func monitorApp(pid: pid_t, bundleID: String) {}
+    var focusedTarget: (appElement: Element, windowElement: Element, pid: pid_t, bundleID: String)?
+    func currentFocusedStandardWindow() -> (appElement: Element, windowElement: Element, pid: pid_t, bundleID: String)? { focusedTarget }
+    func clearTemporarilyExcludedWindow(for window: Element, pid: pid_t) {}
+    func stash(_ window: Element, pid: pid_t = 123, bundleID: String = "same.app") -> Bool {
+        focusedTarget = (testApplicationElement(pid), window, pid, bundleID)
+        return handleTemporaryShortcut()
+    }
+    func terminated(pid: pid_t) { retainTemporaryRecoveryAfterTermination(pid: pid) }
     func refreshSideBarHotkeyRuntime() {}
     func windowKey(for window: Element, pid: Int32) -> String? { "\(pid):\(window.systemWindowID ?? 42)" }
     func refreshTemporaryDockExclusion(bundleID: String) {
@@ -65,6 +73,7 @@ final class RecoveryManager {
         restoreTemporaryShortcuts(attemptsRemaining: attemptsRemaining)
     }
     func persist() { persistTemporaryRecovery() }
+    func resolveCloses(now: Date) { resolveClosedTemporaryRecovery(now: now); persistTemporaryRecovery() }
     func stop() {
         stopTemporaryRecovery()
         sessions.forEach { $0.restoreAndDestroy() }

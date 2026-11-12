@@ -12,6 +12,8 @@ final class Element: NSObject {
     var frameUnavailable = false
     var systemWindowID: UInt32?
     var windows: [Element]?
+    var mainWindow: Element?
+    var focusedWindow: Element?
     var standard = true
     var writes = 0
     var events: [String] = []
@@ -25,6 +27,20 @@ enum AccessibilityRuntimeGuard {
         if attribute as String == "AXWindows" {
             value = element.windows as CFTypeRef?
             return element.windows == nil ? .cannotComplete : .success
+        }
+        if attribute as String == "AXMainWindow" || attribute as String == "AXFocusedWindow" {
+            value = (attribute as String == "AXMainWindow" ? element.mainWindow : element.focusedWindow) as CFTypeRef?
+            return value == nil ? .noValue : .success
+        }
+        if attribute as String == "AXPosition" {
+            var point = element.frame.origin
+            value = AXValueCreate(.cgPoint, &point)
+            return element.frameUnavailable ? .cannotComplete : .success
+        }
+        if attribute as String == "AXSize" {
+            var size = element.frame.size
+            value = AXValueCreate(.cgSize, &size)
+            return element.frameUnavailable ? .cannotComplete : .success
         }
         axEvents.append("read")
         value = element.enhancedUI.map { $0 ? kCFBooleanTrue : kCFBooleanFalse }
@@ -76,7 +92,14 @@ final class NSRunningApplication {
     }
     func activate(options: ActivateOptions) { NSWorkspace.shared.frontmostApplication = self }
 }
-final class NSWorkspace { static let shared = NSWorkspace(); var frontmostApplication: NSRunningApplication? }
+final class NSWorkspace {
+    static let shared = NSWorkspace()
+    var frontmostApplication: NSRunningApplication?
+    var runningApplications: [NSRunningApplication] {
+        NSRunningApplication.bundles.keys.sorted().compactMap { NSRunningApplication(processIdentifier: $0) }
+            .filter { !$0.isTerminated }
+    }
+}
 @discardableResult
 func axSetPositionAttribute(on element: Element, position: CGPoint, context: String) -> AXResult {
     element.writes += 1
@@ -121,6 +144,8 @@ final class Session {
     var snappedScreen: NSScreen?
     var snappedScreenFrame: CGRect?
     var snappedDisplayBounds: CGRect?
+    var temporaryStashSlot = 0
+    var temporaryStashSlotCapacity: Int { TemporaryStashGeometry.slotCapacity(visibleFrame: getScreenForWindow().visibleFrame) }
     var temporaryOriginalFrame: CGRect?
     var temporaryLastExpandedFrame: CGRect?
     var lockedWidth: CGFloat = 0
@@ -213,6 +238,7 @@ final class Session {
     func rememberFocusReturnTargetBeforeReveal() {}
     func stopPinnedRaisePulse() {}
     func teardownMirrorCapture() {}
+    func syncMirrorGeometryWithSourceWindow() {}
     func startMouseTrackingTimer() { tracking = true }
     func updatePinControlWindow() {}
     func showIndicator(animated: Bool) {}
@@ -223,6 +249,7 @@ final class Session {
     func transitionToFloatingFromManagedState() { cancelTemporaryShortcutStash() }
     func destroy() { destroyed = true; animationGenerationToken += 1 }
     func closed() { handleDestroyed() }
+    func reseat(in screens: [NSScreen]) -> Bool { reseatTemporaryShortcutGeometry(in: screens) }
     func CGWindowListCopyWindowInfo(_ options: CGWindowListOption, _ relative: CGWindowID) -> Any? { cgWindows }
     func sensedOnScreen() -> Bool { isWindowOnScreen() }
     func writePosition(position: CGPoint, context: String) -> AXError {

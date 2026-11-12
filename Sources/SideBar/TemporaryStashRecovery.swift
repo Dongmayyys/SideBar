@@ -11,55 +11,121 @@ struct TemporaryStashRecoveryRecord: Codable, Equatable {
     let originalFrame: CGRect
     let ordinal: Int
 
+    // Missing fields in V1 archives retain the old same-boot exact-identity path.
+    var awaitingRelaunch: Bool = false
+    var closedAt: Date? = nil
+    var slot: Int = 0
+    var windowFrame: CGRect? = nil
+    var matchingFrame: CGRect { windowFrame ?? originalFrame }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, bundleID, pid, windowID, edge, screenID, originalFrame, ordinal, awaitingRelaunch, closedAt, slot, windowFrame
+    }
+
+    private enum LegacyKeys: String, CodingKey { case waitForProcessExit }
+
+    init(id: String, bundleID: String, pid: Int32, windowID: UInt32, edge: Int, screenID: UInt32,
+         originalFrame: CGRect, ordinal: Int, awaitingRelaunch: Bool = false, slot: Int = 0, windowFrame: CGRect? = nil) {
+        self.id = id
+        self.bundleID = bundleID
+        self.pid = pid
+        self.windowID = windowID
+        self.edge = edge
+        self.screenID = screenID
+        self.originalFrame = originalFrame
+        self.ordinal = ordinal
+        self.awaitingRelaunch = awaitingRelaunch
+        self.slot = slot
+        self.windowFrame = windowFrame
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(String.self, forKey: .id)
+        bundleID = try values.decode(String.self, forKey: .bundleID)
+        pid = try values.decode(Int32.self, forKey: .pid)
+        windowID = try values.decode(UInt32.self, forKey: .windowID)
+        edge = try values.decode(Int.self, forKey: .edge)
+        screenID = try values.decode(UInt32.self, forKey: .screenID)
+        originalFrame = try values.decode(CGRect.self, forKey: .originalFrame)
+        ordinal = try values.decode(Int.self, forKey: .ordinal)
+        awaitingRelaunch = try values.decodeIfPresent(Bool.self, forKey: .awaitingRelaunch) ?? false
+        closedAt = try values.decodeIfPresent(Date.self, forKey: .closedAt)
+        let legacy = try decoder.container(keyedBy: LegacyKeys.self)
+        if closedAt == nil, try legacy.decodeIfPresent(Bool.self, forKey: .waitForProcessExit) == true {
+            closedAt = .distantPast
+        }
+        slot = try values.decodeIfPresent(Int.self, forKey: .slot) ?? 0
+        windowFrame = try values.decodeIfPresent(CGRect.self, forKey: .windowFrame)
+    }
+
+    func waitingForRelaunch() -> Self {
+        var record = self
+        record.awaitingRelaunch = true
+        record.closedAt = nil
+        return record
+    }
+
     func matches(pid: Int32, bundleID: String, windowID: UInt32) -> Bool {
         self.pid == pid && self.bundleID == bundleID && self.windowID == windowID
     }
 
     var isValid: Bool {
         !id.isEmpty && !bundleID.isEmpty && pid > 0 && windowID > 0 && ordinal > 0 && ordinal < Int.max
+            && slot >= 0 && slot < Int.max
             && (edge == 1 || edge == 2)
             && [originalFrame.minX, originalFrame.minY, originalFrame.width, originalFrame.height].allSatisfy(\.isFinite)
             && originalFrame.width > 0 && originalFrame.height > 0
+            && [matchingFrame.minX, matchingFrame.minY, matchingFrame.width, matchingFrame.height].allSatisfy(\.isFinite)
+            && matchingFrame.width > 0 && matchingFrame.height > 0
     }
-}
-
-struct TemporaryStashTabOrder: Codable, Equatable {
-    let screenID: UInt32
-    let edge: Int
-    var ids: [String]
 }
 
 struct TemporaryStashRecoverySnapshot: Codable, Equatable {
     var windows: [TemporaryStashRecoveryRecord] = []
-    var orders: [TemporaryStashTabOrder] = []
+    var assignments: [TemporaryStashSlotAssignment] { windows.map(\.slotAssignment) }
 
-    /// Pending records keep their slots while AX is busy. Reordering live tabs replaces
-    /// only live slots, so late restoration cannot discard either order or membership.
-    mutating func update(windows: [TemporaryStashRecoveryRecord], liveOrders: [TemporaryStashTabOrder]) {
-        self.windows = windows
-        orders = orders.compactMap { order in
-            let ids = order.ids.filter { id in
-                windows.contains { $0.id == id && $0.screenID == order.screenID && $0.edge == order.edge }
-            }
-            return ids.isEmpty ? nil : TemporaryStashTabOrder(screenID: order.screenID, edge: order.edge, ids: ids)
+    private enum CodingKeys: String, CodingKey { case windows, orders }
+    private struct LegacyOrder: Decodable {
+        let screenID: UInt32
+        let edge: Int
+        let ids: [String]
+    }
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        var records = try values.decode([TemporaryStashRecoveryRecord].self, forKey: .windows)
+        let orders = try values.decodeIfPresent([LegacyOrder].self, forKey: .orders) ?? []
+        for index in records.indices where records[index].slot == 0 {
+            let record = records[index]
+            if let order = orders.first(where: { $0.screenID == record.screenID && $0.edge == record.edge }),
+               let rank = order.ids.firstIndex(of: record.id) { records[index].slot = rank + 1 }
         }
-        for window in windows {
-            if let index = orders.firstIndex(where: { $0.screenID == window.screenID && $0.edge == window.edge }) {
-                if !orders[index].ids.contains(window.id) { orders[index].ids.append(window.id) }
-            } else {
-                orders.append(TemporaryStashTabOrder(screenID: window.screenID, edge: window.edge, ids: [window.id]))
-            }
-        }
-        for liveOrder in liveOrders {
-            guard let index = orders.firstIndex(where: { $0.screenID == liveOrder.screenID && $0.edge == liveOrder.edge }) else { continue }
-            let liveIDs = liveOrder.ids.filter { orders[index].ids.contains($0) }
-            var iterator = liveIDs.makeIterator()
-            orders[index].ids = orders[index].ids.map { liveIDs.contains($0) ? iterator.next()! : $0 }
+        update(windows: records)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(windows, forKey: .windows)
+    }
+
+    mutating func update(windows: [TemporaryStashRecoveryRecord]) {
+        let resolved = TemporaryStashSlots.resolve(existing: assignments, requested: windows.map(\.slotAssignment))
+        self.windows = windows.map { record in
+            var record = record
+            record.slot = resolved.first { $0.id == record.id }?.slot ?? record.slot
+            return record
         }
     }
 
-    mutating func remove(id: String) {
-        update(windows: windows.filter { $0.id != id }, liveOrders: [])
+    mutating func remove(id: String) { windows.removeAll { $0.id == id } }
+}
+
+extension TemporaryStashRecoveryRecord {
+    var slotAssignment: TemporaryStashSlotAssignment {
+        TemporaryStashSlotAssignment(id: id, screenID: screenID, edge: edge, slot: slot)
     }
 }
 
@@ -80,14 +146,14 @@ final class TemporaryStashRecoveryStore {
     }
 
     func load() -> TemporaryStashRecoverySnapshot {
-        guard !bootSessionID.isEmpty,
-              let data = defaults.data(forKey: Self.defaultsKey),
-              let archive = try? JSONDecoder().decode(Archive.self, from: data),
-              archive.bootSessionID == bootSessionID else { return TemporaryStashRecoverySnapshot() }
+        guard let data = defaults.data(forKey: Self.defaultsKey),
+              let archive = try? JSONDecoder().decode(Archive.self, from: data) else { return TemporaryStashRecoverySnapshot() }
         var snapshot = archive.snapshot
         var ids: Set<String> = []
+        let sameBoot = !bootSessionID.isEmpty && archive.bootSessionID == bootSessionID
         let valid = snapshot.windows.filter { $0.isValid && ids.insert($0.id).inserted }
-        snapshot.update(windows: valid, liveOrders: [])
+            .map { sameBoot ? $0 : $0.waitingForRelaunch() }
+        snapshot.update(windows: valid)
         return snapshot
     }
 
@@ -104,5 +170,48 @@ final class TemporaryStashRecoveryStore {
         var bytes = [CChar](repeating: 0, count: length)
         guard sysctlbyname("kern.bootsessionuuid", &bytes, &length, nil, 0) == 0 else { return "" }
         return String(cString: bytes)
+    }
+}
+
+/// Conservative one-to-one matching: size is mandatory; a nearby position may
+/// disambiguate equal-size windows, but enumeration order never breaks a tie.
+enum TemporaryStashRecoveryMatcher {
+    static func uniqueMatches(records: [TemporaryStashRecoveryRecord], frames: [CGRect]) -> [String: Int] {
+        var candidates: [[Int]] = records.map { record in
+            let sizeMatches = frames.indices.filter {
+                abs(frames[$0].width - record.matchingFrame.width) <= 8
+                    && abs(frames[$0].height - record.matchingFrame.height) <= 8
+            }
+            let nearby = sizeMatches.filter { positionMatches(record.matchingFrame, frames[$0]) }
+            return sizeMatches.count > 1 && nearby.count == 1 ? nearby : sizeMatches
+        }
+        // Apply the same positional rule from the window side. Never let two
+        // records claim one window just because it is the only size candidate.
+        for index in frames.indices {
+            let owners = records.indices.filter { candidates[$0].contains(index) }
+            let nearby = owners.filter { positionMatches(records[$0].matchingFrame, frames[index]) }
+            if owners.count > 1 && nearby.count == 1 {
+                for owner in owners where owner != nearby[0] { candidates[owner].removeAll { $0 == index } }
+            }
+        }
+        var result: [String: Int] = [:]
+        for index in records.indices {
+            guard candidates[index].count == 1, let window = candidates[index].first,
+                  candidates.filter({ $0.contains(window) }).count == 1 else { continue }
+            result[records[index].id] = window
+        }
+        return result
+    }
+
+    static func replacement(in records: [TemporaryStashRecoveryRecord], frame: CGRect) -> TemporaryStashRecoveryRecord? {
+        records.min { sizeDistance($0.matchingFrame, frame) < sizeDistance($1.matchingFrame, frame) }
+    }
+
+    private static func sizeDistance(_ lhs: CGRect, _ rhs: CGRect) -> CGFloat {
+        abs(lhs.width - rhs.width) + abs(lhs.height - rhs.height)
+    }
+
+    private static func positionMatches(_ lhs: CGRect, _ rhs: CGRect) -> Bool {
+        abs(lhs.minX - rhs.minX) <= 24 && abs(lhs.minY - rhs.minY) <= 24
     }
 }

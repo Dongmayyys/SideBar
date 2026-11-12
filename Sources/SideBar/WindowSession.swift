@@ -255,6 +255,10 @@ class WindowSession {
         // 用锁定**瞬间**的 frame 值快照做几何匹配。绝对不能读 `snappedScreen.frame`：
         // 那是 live getter，macOS 在纯分辨率切换时会复用同一实例并原地更新 frame，
         // 读出来是"新"值，反而误判为未变化（这正是老版本导致快照条错位、窗口卡死的根因）。
+        if isTemporaryShortcutManaged, let saved = snappedScreen {
+            guard let screen = activeScreens.first(where: { $0.displayID == saved.displayID }) else { return true }
+            return snappedScreenFrame != screen.frame || snappedDisplayBounds != cgBounds(for: screen)
+        }
         guard let lockedFrame = snappedScreenFrame else { return false }
         let stillExists = activeScreens.contains { screen in
             let f = screen.frame
@@ -277,6 +281,7 @@ class WindowSession {
     /// - Returns: 成功迁移则返回 `true`；找不到"对得上"的新屏幕则返回 `false`，
     ///   由调用方走 `recoverFromScreenParametersChange()` 兜底路径。
     func reseatSnappedGeometryIfPossible(in activeScreens: [NSScreen]) -> Bool {
+        if isTemporaryShortcutManaged { return reseatTemporaryShortcutGeometry(in: activeScreens) }
         guard let oldDisplayBounds = snappedDisplayBounds else { return false }
         guard !activeScreens.isEmpty else { return false }
 
@@ -358,6 +363,55 @@ class WindowSession {
         state = .snapped(edge: currentEdge, hiddenOrX: geometry.hidden.x)
 
         print("🖥️ \(bundleID) 分辨率变化：已就地重贴到新几何 (\(oldDisplayBounds) → \(match.cg))")
+        return true
+    }
+
+    /// Keep the edge while the physical display exists, even if a new neighbor
+    /// blocks it. Only losing that display selects a new right-first edge.
+    private func reseatTemporaryShortcutGeometry(in activeScreens: [NSScreen]) -> Bool {
+        guard isTemporaryShortcutManaged, !isFloatingForCoordination,
+              let saved = snappedScreen, let frame = getRawWindowFrame() else { return false }
+        let sameScreen = activeScreens.first { $0.displayID == saved.displayID }
+        guard let screen = sameScreen ?? activeScreens.first else { return false }
+        let bounds = cgBounds(for: screen)
+        let edge: Int
+        if sameScreen != nil { edge = currentEdge }
+        else {
+            guard let preferred = TemporaryStashGeometry.preferredEdge(screen: bounds, screens: activeScreens.map { cgBounds(for: $0) }) else { return false }
+            edge = preferred
+        }
+        let oldFrame = snappedScreenFrame
+        let oldBounds = snappedDisplayBounds
+        let oldEdge = currentEdge
+        var succeeded = false
+        defer {
+            if !succeeded {
+                snappedScreen = saved
+                snappedScreenFrame = oldFrame
+                snappedDisplayBounds = oldBounds
+                currentEdge = oldEdge
+            }
+        }
+        snappedScreen = screen
+        snappedScreenFrame = screen.frame
+        snappedDisplayBounds = bounds
+        currentEdge = edge
+        let adjusted = clampFrameYToBounds(frame, bounds: bounds)
+        guard let geometry = edgeGeometry(for: adjusted) else { return false }
+        invalidatePendingFocusRelease()
+        windowAnimator.stop()
+        animationGenerationToken &+= 1
+        isAnimating = false
+        let expanded = CGRect(origin: geometry.expanded, size: frame.size)
+        let wasExpanded = isExpandedForCoordination
+        guard setWindowPositionWithoutSystemAnimation(position: wasExpanded ? geometry.expanded : geometry.visualHidden,
+                  context: "WindowSession.reseatTemporaryShortcutGeometry.position") == .success else { return false }
+        succeeded = true
+        temporaryLastExpandedFrame = expanded
+        if !wasExpanded { state = .snapped(edge: edge, hiddenOrX: geometry.hidden.x) }
+        setWindowAlpha(wasExpanded ? 1 : 0, isHidden: !wasExpanded, frameHint: expanded)
+        if isMirrorPinActive { syncMirrorGeometryWithSourceWindow() }
+        updatePinControlWindow()
         return true
     }
 
@@ -553,6 +607,8 @@ class WindowSession {
     private static let mouseCacheQuantum: CGFloat = 3
 
     private var isTemporaryShortcutManaged = false
+    var temporaryStashSlot: Int = 0
+    var temporaryStashSlotCapacity: Int { TemporaryStashGeometry.slotCapacity(visibleFrame: getScreenForWindow().visibleFrame) }
     private var temporaryOriginalFrame: CGRect?
     private var temporaryLastExpandedFrame: CGRect?
     let temporaryStashID: String
@@ -3925,10 +3981,9 @@ class WindowSession {
         let screen = savedScreen ?? detectScreen()
         let bounds = cgBounds(for: screen)
         guard let edge = TemporaryStashGeometry.recoveryEdge(savedEdge: savedScreen == nil ? nil : record?.edge,
-                    window: frame, screen: bounds, visibleWidth: screen.visibleFrame.width,
-                    screens: NSScreen.screens.map { cgBounds(for: $0) }) else { return false }
+                    screen: bounds, screens: NSScreen.screens.map { cgBounds(for: $0) }) else { return false }
         temporaryOriginalFrame = record?.originalFrame ?? frame
-        temporaryStashWindowID = record?.windowID ?? WindowAlphaManager.shared.findWindowID(for: windowElement, pid: pid)
+        temporaryStashWindowID = WindowAlphaManager.shared.findWindowID(for: windowElement, pid: pid)
         lockedWidth = frame.width
         initialFrameCaptured = true
         snappedScreen = screen
@@ -3943,7 +3998,7 @@ class WindowSession {
                       context: "WindowSession.startTemporaryShortcutStash.restoreY") == .success else { return false }
         }
         guard collapseWindow(immediate: true, triggerEffects: false) else { return false }
-        // Startup restoration must not activate an app or schedule a focus handoff.
+        // Automatic restoration must not activate an app or schedule a focus handoff.
         if record == nil { scheduleFocusRelease(after: 0.5) }
         return true
     }
@@ -3955,9 +4010,12 @@ class WindowSession {
             temporaryStashWindowID = WindowAlphaManager.shared.findWindowID(for: windowElement, pid: pid)
         }
         guard let windowID = temporaryStashWindowID else { return nil }
+        // Match the ordinary pre-stash position with the latest expanded size,
+        // never the collapsed window's offscreen coordinates.
         return TemporaryStashRecoveryRecord(id: temporaryStashID, bundleID: bundleID, pid: pid,
                     windowID: windowID, edge: currentEdge, screenID: getScreenForWindow().displayID,
-                    originalFrame: original, ordinal: temporaryStashOrdinal)
+                    originalFrame: original, ordinal: temporaryStashOrdinal, slot: temporaryStashSlot,
+                    windowFrame: CGRect(origin: original.origin, size: temporaryLastExpandedFrame?.size ?? original.size))
     }
 
     func cancelTemporaryShortcutStash(keepingFrame: CGRect? = nil) {

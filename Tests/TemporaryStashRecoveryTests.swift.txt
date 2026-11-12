@@ -8,9 +8,9 @@ func expect(_ condition: Bool, _ name: String) {
 let primary = CGRect(x: 0, y: 0, width: 1000, height: 1000)
 let original = CGRect(x: 130, y: 200, width: 400, height: 300)
 func record(_ id: String = "saved", pid: Int32 = 123, bundle: String = "same.app", windowID: UInt32 = 42,
-            edge: Int = 2, screenID: UInt32 = 1, ordinal: Int = 2) -> TemporaryStashRecoveryRecord {
+            edge: Int = 2, screenID: UInt32 = 1, ordinal: Int = 2, frame: CGRect = original, slot: Int = 1) -> TemporaryStashRecoveryRecord {
     TemporaryStashRecoveryRecord(id: id, bundleID: bundle, pid: pid, windowID: windowID,
-                                 edge: edge, screenID: screenID, originalFrame: original, ordinal: ordinal)
+                                 edge: edge, screenID: screenID, originalFrame: original, ordinal: ordinal, slot: slot, windowFrame: frame)
 }
 func resetBackend() {
     NSScreen.screens = [NSScreen(frame: primary)]
@@ -31,8 +31,7 @@ expect(!saved.matches(pid: 124, bundleID: "same.app", windowID: 42), "different 
 expect(!saved.matches(pid: 123, bundleID: "other.app", windowID: 42), "different bundle rejected")
 expect(!saved.matches(pid: 123, bundleID: "same.app", windowID: 43), "different system window rejected")
 var snapshot = TemporaryStashRecoverySnapshot()
-snapshot.update(windows: [record("one", ordinal: 1), saved], liveOrders: [])
-snapshot.orders = [TemporaryStashTabOrder(screenID: 1, edge: 2, ids: [saved.id, "one"])]
+snapshot.update(windows: [record("one", ordinal: 1), saved])
 let data = try! JSONEncoder().encode(snapshot)
 expect(try! JSONDecoder().decode(TemporaryStashRecoverySnapshot.self, from: data) == snapshot,
        "record and per-display edge order encode/decode without losing original frame or ordinal")
@@ -42,26 +41,52 @@ store.save(snapshot)
 expect(store.load() == snapshot, "archive roundtrip through isolated in-memory defaults")
 store.save(snapshot)
 expect(defaults.writes == 1, "unchanged polling snapshot does not rewrite defaults")
-expect(TemporaryStashRecoveryStore(defaults: defaults, bootSessionID: "boot-b").load().windows.isEmpty,
-       "computer reboot discards old identities even if pid and window ID are reused")
-expect(TemporaryStashRecoveryStore(defaults: defaults, bootSessionID: "").load().windows.isEmpty,
-       "unreadable boot identity never guesses")
+let rebooted = TemporaryStashRecoveryStore(defaults: defaults, bootSessionID: "boot-b").load()
+expect(rebooted.windows == snapshot.windows.map { $0.waitingForRelaunch() } && rebooted.assignments == snapshot.assignments,
+       "computer reboot retains geometry, ordinals and slots but invalidates exact identities")
+expect(TemporaryStashRecoveryStore(defaults: defaults, bootSessionID: "").load().windows.allSatisfy(\.awaitingRelaunch),
+       "unreadable boot identity retains intent in waiting state")
+var legacy = try! JSONSerialization.jsonObject(with: JSONEncoder().encode(snapshot)) as! [String: Any]
+legacy["windows"] = (legacy["windows"] as! [[String: Any]]).map { entry in
+    var entry = entry
+    entry.removeValue(forKey: "awaitingRelaunch")
+    entry.removeValue(forKey: "windowFrame")
+    entry.removeValue(forKey: "slot")
+    return entry
+}
+legacy["orders"] = [["screenID": 1, "edge": 2, "ids": [saved.id, "one"]]]
+let legacySnapshot = try! JSONDecoder().decode(TemporaryStashRecoverySnapshot.self, from: JSONSerialization.data(withJSONObject: legacy))
+expect(legacySnapshot.windows.allSatisfy { !$0.awaitingRelaunch && $0.matchingFrame == original },
+       "pre-change archives decode with exact identity and original-frame matching fallback")
+expect(legacySnapshot.windows.first { $0.id == saved.id }?.slot == 1 && legacySnapshot.windows.first { $0.id == "one" }?.slot == 2,
+       "legacy order migrates to explicit one-based slots")
+expect((try! JSONSerialization.jsonObject(with: JSONEncoder().encode(legacySnapshot)) as! [String: Any])["orders"] == nil,
+       "new archives store per-record slots, not legacy order lists")
+var legacyClose = try! JSONSerialization.jsonObject(with: JSONEncoder().encode(saved)) as! [String: Any]
+legacyClose["waitForProcessExit"] = true
+legacyClose["awaitingRelaunch"] = true
+let migratedClose = try! JSONDecoder().decode(TemporaryStashRecoveryRecord.self, from: JSONSerialization.data(withJSONObject: legacyClose))
+expect(migratedClose.closedAt != nil, "previous indefinite window-close records migrate into delayed process classification")
 defaults.values[TemporaryStashRecoveryStore.defaultsKey] = Data("broken".utf8)
 expect(store.load().windows.isEmpty, "corrupt archive safely loads empty")
 expect(!TemporaryStashRecoveryStore.currentBootSessionID().isEmpty, "macOS supplies stable boot session UUID")
 
 var slots = TemporaryStashRecoverySnapshot()
-let a = record("a", ordinal: 1), b = record("b", ordinal: 2), c = record("c", ordinal: 3)
-slots.update(windows: [a, b, c], liveOrders: [])
-slots.update(windows: [a, b, c], liveOrders: [TemporaryStashTabOrder(screenID: 1, edge: 2, ids: ["c", "a"])])
-expect(slots.orders[0].ids == ["c", "b", "a"], "sorting live tabs retains pending AX window's slot")
+let a = record("a", ordinal: 1, slot: 1), b = record("b", ordinal: 2, slot: 2), c = record("c", ordinal: 3, slot: 3)
+slots.update(windows: [a, b, c])
 slots.remove(id: "b")
-expect(slots.windows.map(\.id) == ["a", "c"] && slots.orders[0].ids == ["c", "a"],
-       "cancel or close removes record and only its order slot")
-let moved = record("a", edge: 1, screenID: 2, ordinal: 1)
-slots.update(windows: [moved, c], liveOrders: [])
-expect(slots.orders.contains { $0.screenID == 2 && $0.edge == 1 && $0.ids == ["a"] }
-       && slots.orders.first { $0.screenID == 1 }?.ids == ["c"], "edge and screen changes migrate order membership")
+expect(slots.windows.map(\.slot) == [1, 3], "cancel or close frees only its own slot")
+slots.update(windows: slots.windows + [record("new", slot: 0)])
+expect(slots.windows.first { $0.id == "new" }?.slot == 2, "new record fills highest free slot")
+let moved = record("a", edge: 1, screenID: 2, ordinal: 1, slot: 3)
+let resident = record("resident", edge: 1, screenID: 2, slot: 3)
+slots.update(windows: slots.windows + [resident])
+slots.update(windows: [moved, resident, c])
+expect(slots.windows.first { $0.id == "resident" }?.slot == 3 && slots.windows.first { $0.id == "a" }?.slot == 1,
+       "screen migration preserves resident slot and uses topmost free slot on collision")
+let unoccupiedMove = record("a", edge: 1, screenID: 3, ordinal: 1, slot: 6)
+slots.update(windows: [unoccupiedMove, resident, c])
+expect(slots.windows.first { $0.id == "a" }?.slot == 6, "screen migration keeps preferred slot when unoccupied")
 
 var ordinals = TemporaryStashOrdinals()
 ordinals.reserve(bundleID: "same.app", windowID: "late", ordinal: 8)
@@ -78,7 +103,7 @@ expect(manager.sessions.count == 1 && manager.pendingTemporaryRecovery.isEmpty, 
 let restored = manager.sessions[0]
 expect(restored.isSnappedForCoordination && restored.alpha == 0 && !restored.isTemporarilyPinned,
        "restored window is collapsed, invisible and unpinned")
-expect(restored.currentEdge == 2 && restored.snappedScreen?.displayID == 1, "saved edge beats nearest edge on saved display")
+expect(restored.currentEdge == 2 && restored.snappedScreen?.displayID == 1, "available saved edge is preserved on saved display")
 expect(restored.temporaryOriginalFrame == original && restored.temporaryStashOrdinal == 2,
        "restoration injects earliest original frame and unchanged ordinal")
 expect(!restored.focusReleasePending && NSWorkspace.shared.frontmostApplication == nil,
@@ -104,7 +129,25 @@ let reopen = RecoveryManager(shutdown.temporaryRecoveryStore.load().windows)
 reopen.run()
 expect(reopen.sessions.count == 1 && !reopen.sessions[0].isTemporarilyPinned, "manual exit and reopen resets pin state")
 reopen.sessions[0].closed()
-expect(reopen.temporaryRecoveryStore.load().windows.isEmpty, "window close immediately deletes persisted recovery")
+let closedAt = reopen.pendingTemporaryRecovery.first!.closedAt!
+expect(reopen.temporaryRecoveryStore.load().windows.first?.closedAt != nil, "window destruction temporarily reserves slot pending process check")
+reopen.sessions.removeAll()
+let unrelated = Element(); unrelated.systemWindowID = 61
+applicationElements[123]!.windows = [unrelated]
+reopen.resolveCloses(now: closedAt.addingTimeInterval(1.9))
+expect(reopen.pendingTemporaryRecovery.count == 1, "close check does not expire before approximately two seconds")
+reopen.resolveCloses(now: closedAt.addingTimeInterval(2.1))
+expect(reopen.pendingTemporaryRecovery.isEmpty && reopen.temporaryRecoveryStore.load().windows.isEmpty,
+       "closed window with live process deletes record and releases slot after two seconds")
+reopen.run()
+expect(reopen.sessions.isEmpty, "ordinary window close cannot rematch another live window")
+
+resetBackend()
+applicationElements[123]!.windows![0].systemWindowID = 999
+let renumbered = RecoveryManager([saved])
+renumbered.run()
+expect(renumbered.sessions.first?.temporaryStashWindowID == 999 && renumbered.pendingTemporaryRecovery.isEmpty,
+       "confirmed missing window ID falls back to main-window matching even when the PID is unchanged")
 
 resetBackend()
 let newStash = RecoveryManager([])
@@ -122,13 +165,12 @@ expect(newStash.temporaryRecoveryStore.load().windows.first?.edge == 2, "live ed
 fresh.cancelTemporaryShortcutStash(keepingFrame: CGRect(x: 350, y: 400, width: 400, height: 300))
 expect(newStash.temporaryRecoveryStore.load().windows.isEmpty, "drag-away cancellation deletes recovery too")
 
-for mismatch in ["absent", "pid", "bundle", "window", "unknownID", "nonstandard", "configured", "terminated"] {
+for mismatch in ["absent", "pid", "bundle", "unknownID", "nonstandard", "configured", "terminated"] {
     resetBackend()
     switch mismatch {
     case "absent": applicationElements[123]!.windows = []
     case "pid": NSRunningApplication.bundles = [999: "same.app"]
     case "bundle": NSRunningApplication.bundles[123] = "other.app"
-    case "window": applicationElements[123]!.windows![0].systemWindowID = 999
     case "unknownID": applicationElements[123]!.windows![0].systemWindowID = nil
     case "nonstandard": applicationElements[123]!.windows![0].standard = false
     case "configured": AppConfig.shared.enabled.insert("same.app")
@@ -137,8 +179,8 @@ for mismatch in ["absent", "pid", "bundle", "window", "unknownID", "nonstandard"
     }
     let candidate = RecoveryManager([saved])
     candidate.run()
-    expect(candidate.sessions.isEmpty && candidate.pendingTemporaryRecovery.isEmpty
-           && candidate.temporaryRecoveryStore.load().windows.isEmpty, "invalid startup candidate discarded: \(mismatch)")
+    expect(candidate.sessions.isEmpty && candidate.pendingTemporaryRecovery.count == 1
+           && candidate.temporaryRecoveryStore.load().windows.count == 1, "unavailable startup candidate retained: \(mismatch)")
 }
 resetBackend()
 applicationElements[123]!.windows = nil
@@ -154,12 +196,12 @@ delayed.run()
 expect(delayed.sessions.count == 1 && delayed.pendingTemporaryRecovery.isEmpty, "later AX success restores pending window")
 resetBackend()
 applicationElements[123]!.windows![0].frameUnavailable = true
-// An unreadable frame is a transient condition; final exhaustion must remove its record.
+// A busy AX window retains its exact record even after the launch retry burst.
 let failedAX = RecoveryManager([saved])
 failedAX.run(attemptsRemaining: 1)
 failedAX.run()
-expect(failedAX.pendingTemporaryRecovery.isEmpty && failedAX.temporaryRecoveryStore.load().windows.isEmpty,
-       "retry exhaustion discards record rather than restoring a guessed window")
+expect(failedAX.pendingTemporaryRecovery == [saved] && failedAX.temporaryRecoveryRetry == nil,
+       "retry exhaustion retains exact record without unbounded scheduling")
 resetBackend()
 applicationElements[123]!.windows = nil
 let interrupted = RecoveryManager([saved])
@@ -184,8 +226,8 @@ expect(externalManager.sessions[0].windowElement.frame.origin == original.origin
 resetBackend()
 let unplugged = RecoveryManager([record(screenID: 999)])
 unplugged.run()
-expect(unplugged.sessions.first?.currentEdge == 1 && unplugged.sessions.first?.snappedScreen?.displayID == 1,
-       "unplugged display falls back to current screen and existing nearest-edge rule")
+expect(unplugged.sessions.first?.currentEdge == 2 && unplugged.sessions.first?.snappedScreen?.displayID == 1,
+       "unplugged display falls back to current screen and right-first rule")
 resetBackend()
 NSScreen.screens.append(NSScreen(frame: primary.offsetBy(dx: 1000, dy: 0), displayID: 2))
 let blockedRight = RecoveryManager([saved])
@@ -195,8 +237,260 @@ expect(blockedRight.temporaryRecoveryStore.load().windows.first?.edge == 1, "fal
 NSScreen.screens.append(NSScreen(frame: primary.offsetBy(dx: -1000, dy: 0), displayID: 3))
 let bothBlocked = RecoveryManager([saved])
 bothBlocked.run()
-expect(bothBlocked.sessions.isEmpty && bothBlocked.temporaryRecoveryStore.load().windows.isEmpty,
-       "two blocked sides abandon this window and delete its record")
+expect(bothBlocked.sessions.isEmpty && bothBlocked.temporaryRecoveryStore.load().windows.count == 1,
+       "two blocked sides retain intent for a later display change")
+
+// Process exit, including AX destruction delivered before didTerminate.
+resetBackend()
+let quitting = RecoveryManager([saved])
+quitting.run()
+quitting.sessions[0].closed()
+expect(quitting.pendingTemporaryRecovery.first?.closedAt != nil, "AX close reserves its slot during two-second process check")
+NSRunningApplication.terminated.insert(123)
+quitting.terminated(pid: 123)
+quitting.sessions.removeAll()
+quitting.persist()
+expect(quitting.pendingTemporaryRecovery.first?.awaitingRelaunch == true
+       && quitting.temporaryRecoveryStore.load().windows.first?.id == saved.id,
+       "application quit turns recovery into indefinite waiting instead of deleting it")
+expect(quitting.temporaryRecovery.windows.first?.slot == saved.slot, "exited application's slot remains reserved")
+quitting.run()
+expect(quitting.temporaryRecoveryRetry == nil && quitting.pendingTemporaryRecovery.count == 1,
+       "waiting outlives retry burst without scheduling an infinite negative countdown")
+
+resetBackend()
+let interleaved = RecoveryManager([record("before", bundle: "other.app", ordinal: 1), saved,
+                                  record("after", bundle: "third.app", ordinal: 1)])
+interleaved.run()
+let originalOrder = interleaved.temporaryRecovery.assignments.sorted { $0.id < $1.id }
+NSRunningApplication.terminated.insert(123)
+interleaved.sessions[0].restoreAndDestroy()
+interleaved.sessions.removeAll()
+interleaved.resolveCloses(now: Date().addingTimeInterval(2.1))
+expect(interleaved.pendingTemporaryRecovery.first { $0.id == saved.id }?.awaitingRelaunch == true,
+       "poll-based process cleanup preserves recovery even without a termination notification")
+NSRunningApplication.bundles[456] = "same.app"
+let reopenedApp = Element(), reopenedWindow = Element()
+reopenedWindow.systemWindowID = 314
+reopenedApp.windows = [reopenedWindow]
+applicationElements[456] = reopenedApp
+interleaved.run()
+expect(interleaved.sessions.first?.temporaryStashID == saved.id && interleaved.temporaryRecovery.assignments.sorted { $0.id < $1.id } == originalOrder,
+       "application relaunch preserves its interleaved slot among other waiting bundles")
+
+// A new PID and CGWindowID must use main, then focused, then first standard window.
+for preference in ["main", "focus", "first"] {
+    resetBackend()
+    NSRunningApplication.bundles = [456: "same.app"]
+    let app = Element()
+    let first = Element(); first.systemWindowID = 81
+    let main = Element(); main.systemWindowID = 82; main.frame.size = CGSize(width: 620, height: 510)
+    let focus = Element(); focus.systemWindowID = 83
+    app.windows = [first, focus, main]
+    app.mainWindow = preference == "main" ? main : nil
+    app.focusedWindow = preference == "first" ? nil : focus
+    applicationElements = [456: app]
+    let relaunched = RecoveryManager([saved])
+    relaunched.run()
+    let expected = preference == "main" ? main : (preference == "focus" ? focus : first)
+    expect(relaunched.sessions.first?.windowElement === expected, "single-window relaunch chooses \(preference) window, independent of size")
+    let live = relaunched.sessions[0]
+    expect(live.pid == 456 && live.temporaryStashWindowID == expected.systemWindowID
+           && live.temporaryStashID == saved.id && live.temporaryStashOrdinal == saved.ordinal
+           && live.currentEdge == saved.edge && live.temporaryOriginalFrame == saved.originalFrame
+           && relaunched.temporaryRecovery.windows.first?.slot == saved.slot,
+           "relaunch updates physical identity but retains original position, ID, edge, ordinal and slot: \(preference)")
+    expect(!live.focusReleasePending && NSWorkspace.shared.frontmostApplication == nil, "relaunch does not activate or hand off focus: \(preference)")
+    relaunched.stop()
+    let restart = RecoveryManager(relaunched.temporaryRecoveryStore.load().windows)
+    restart.run()
+    expect(restart.sessions.count == 1 && restart.sessions[0].temporaryStashWindowID == expected.systemWindowID,
+           "next SideBar restart uses the newly persisted PID and window ID: \(preference)")
+    restart.sessions[0].cancelTemporaryShortcutStash()
+    expect(expected.frame.origin == original.origin && restart.temporaryRecoveryStore.load().windows.isEmpty,
+           "cancel after relaunch returns to original position and deletes intent: \(preference)")
+}
+
+resetBackend()
+let small = record("small", ordinal: 1)
+let large = record("large", windowID: 43, ordinal: 4, frame: CGRect(x: 600, y: 100, width: 600, height: 450))
+NSRunningApplication.bundles = [456: "same.app"]
+let app = Element()
+let largeWindow = Element(); largeWindow.systemWindowID = 91; largeWindow.frame = large.matchingFrame
+let smallWindow = Element(); smallWindow.systemWindowID = 92; smallWindow.frame = original.offsetBy(dx: 200, dy: 100)
+smallWindow.frame.size = CGSize(width: 408, height: 292)
+app.windows = [largeWindow, smallWindow]
+applicationElements = [456: app]
+let multi = RecoveryManager([small, large])
+multi.run()
+expect(multi.sessions.count == 2 && multi.pendingTemporaryRecovery.isEmpty
+       && multi.sessions.first { $0.temporaryStashID == small.id }?.windowElement === smallWindow
+       && multi.sessions.first { $0.temporaryStashID == large.id }?.windowElement === largeWindow,
+       "multiple windows uniquely match by size within inclusive 8pt tolerance, not AX order")
+expect(multi.sessions.first { $0.temporaryStashID == large.id }?.temporaryStashOrdinal == 4,
+       "multi-window relaunch preserves noncontiguous ordinals")
+
+let equalA = record("equal-a", ordinal: 1).waitingForRelaunch()
+let equalB = record("equal-b", windowID: 43, ordinal: 2).waitingForRelaunch()
+expect(TemporaryStashRecoveryMatcher.uniqueMatches(records: [equalA, equalB], frames: [original, original]).isEmpty,
+       "identical sizes and positions are ambiguous in both directions")
+expect(TemporaryStashRecoveryMatcher.uniqueMatches(records: [equalA, equalB], frames: [original]).isEmpty,
+       "two records cannot claim one window even when both have only one candidate")
+expect(TemporaryStashRecoveryMatcher.uniqueMatches(records: [small], frames: [original.insetBy(dx: -4.5, dy: 0)]).isEmpty,
+       "9pt size mismatch remains waiting")
+let positioned = record("positioned", windowID: 43, ordinal: 2, frame: original.offsetBy(dx: 500, dy: 250))
+let positionedMatches = TemporaryStashRecoveryMatcher.uniqueMatches(records: [small, positioned], frames: [positioned.matchingFrame, original])
+expect(positionedMatches[small.id] == 1 && positionedMatches[positioned.id] == 0,
+       "unique nearby positions disambiguate equal-size windows")
+
+resetBackend()
+applicationElements[123]!.windows = [Element(), Element()]
+for (index, window) in applicationElements[123]!.windows!.enumerated() { window.systemWindowID = UInt32(200 + index) }
+let ambiguous = RecoveryManager([equalA, equalB])
+ambiguous.run()
+expect(ambiguous.sessions.isEmpty && ambiguous.pendingTemporaryRecovery.count == 2,
+       "ambiguous relaunch leaves both records and windows untouched")
+let manual = applicationElements[123]!.windows![0]
+expect(ambiguous.stash(manual), "manual shortcut can override an ambiguous waiting record")
+expect(ambiguous.sessions.count == 1 && ambiguous.pendingTemporaryRecovery.count == 1
+       && ambiguous.sessions[0].temporaryStashID == equalA.id
+       && ambiguous.sessions[0].temporaryStashOrdinal == 1
+       && ambiguous.temporaryRecovery.windows.count == 2,
+       "manual stash replaces exactly one record, reuses its ordinal and never duplicates a label")
+ambiguous.run()
+expect(ambiguous.sessions.count == 2 && Set(ambiguous.sessions.map { ObjectIdentifier($0.windowElement) }).count == 2,
+       "remaining recovery cannot steal the manually stashed window")
+
+resetBackend()
+let cancelApp = applicationElements[123]!
+let canceledWindow = cancelApp.windows![0]
+let remainingWindow = Element(); remainingWindow.systemWindowID = 88
+cancelApp.windows!.append(remainingWindow)
+cancelApp.mainWindow = canceledWindow
+let cancelDuringRecovery = RecoveryManager([equalA, equalB])
+expect(cancelDuringRecovery.stash(canceledWindow), "prepare cancellation while another record is still waiting")
+cancelDuringRecovery.sessions[0].cancelTemporaryShortcutStash()
+cancelDuringRecovery.sessions.removeAll()
+cancelDuringRecovery.run()
+expect(cancelDuringRecovery.sessions.count == 1 && cancelDuringRecovery.sessions[0].windowElement === remainingWindow,
+       "remaining waiting intent never reclaims a window the user explicitly canceled")
+
+resetBackend()
+let manualClosest = RecoveryManager([small.waitingForRelaunch(), large.waitingForRelaunch()])
+let manualLarge = applicationElements[123]!.windows![0]
+manualLarge.frame.size = CGSize(width: 590, height: 460)
+expect(manualClosest.stash(manualLarge)
+       && manualClosest.sessions[0].temporaryStashID == large.id
+       && manualClosest.sessions[0].temporaryStashOrdinal == large.ordinal
+       && manualClosest.pendingTemporaryRecovery.map(\.id) == [small.id],
+       "manual multi-window stash replaces closest-size record, including beyond automatic tolerance")
+resetBackend()
+let manualSingle = RecoveryManager([saved.waitingForRelaunch()])
+let manualWindow = applicationElements[123]!.windows![0]
+manualWindow.frame.size = CGSize(width: 900, height: 800)
+expect(manualSingle.stash(manualWindow) && manualSingle.pendingTemporaryRecovery.isEmpty
+       && manualSingle.sessions[0].temporaryStashID == saved.id, "manual single-window stash replaces waiting record regardless of size")
+manualSingle.sessions[0].cancelTemporaryShortcutStash()
+expect(manualSingle.temporaryRecoveryStore.load().windows.isEmpty, "canceling manual replacement removes recovery permanently")
+resetBackend()
+let failedManual = RecoveryManager([saved.waitingForRelaunch()])
+applicationElements[123]!.windows![0].frameUnavailable = true
+expect(!failedManual.stash(applicationElements[123]!.windows![0]) && failedManual.pendingTemporaryRecovery.count == 1,
+       "failed manual stash does not consume waiting intent")
+
+resetBackend()
+let exactApp = applicationElements[123]!
+let exact = exactApp.windows![0]
+let misleadingMain = Element(); misleadingMain.systemWindowID = 55
+exactApp.mainWindow = misleadingMain
+exactApp.windows!.insert(misleadingMain, at: 0)
+let exactPriority = RecoveryManager([saved])
+exactPriority.run()
+expect(exactPriority.sessions.first?.windowElement === exact, "same-boot exact identity beats main-window and geometry heuristics")
+resetBackend()
+let protectedApp = applicationElements[123]!
+let protectedWindow = protectedApp.windows![0]
+protectedWindow.frameUnavailable = true
+let other = Element(); other.systemWindowID = 99
+protectedApp.windows!.append(other)
+protectedApp.mainWindow = other
+let exactBusy = RecoveryManager([saved])
+exactBusy.run()
+expect(exactBusy.sessions.isEmpty && exactBusy.pendingTemporaryRecovery.first?.awaitingRelaunch == false,
+       "existing exact window with busy AX never falls back to a different main window")
+resetBackend()
+AppConfig.shared.enabled.insert("same.app")
+let configuredWaiting = RecoveryManager([saved.waitingForRelaunch()])
+configuredWaiting.run()
+expect(configuredWaiting.sessions.isEmpty && configuredWaiting.pendingTemporaryRecovery.count == 1,
+       "configured applications never participate in relaunch matching")
+
+resetBackend()
+let crossBoot = RecoveryManager(rebooted.windows)
+crossBoot.run()
+expect(crossBoot.sessions.isEmpty && crossBoot.pendingTemporaryRecovery.count == 2,
+       "cross-boot reused exact IDs cannot bypass ambiguous multi-window matching")
+let bootSingle = RecoveryManager([saved.waitingForRelaunch()])
+bootSingle.run()
+expect(bootSingle.sessions.count == 1 && bootSingle.sessions[0].temporaryStashOrdinal == saved.ordinal,
+       "cross-boot single-window intent restores already running application")
+
+resetBackend()
+let closeWithoutNotification = RecoveryManager([record(slot: 6)])
+closeWithoutNotification.run()
+closeWithoutNotification.sessions[0].closed()
+closeWithoutNotification.sessions.removeAll()
+let timestamp = closeWithoutNotification.pendingTemporaryRecovery[0].closedAt!
+let restartWhileClosing = RecoveryManager(closeWithoutNotification.temporaryRecoveryStore.load().windows)
+restartWhileClosing.run()
+expect(restartWhileClosing.sessions.isEmpty && restartWhileClosing.pendingTemporaryRecovery[0].slot == 6,
+       "SideBar restart inside close-check period preserves reserved slot without guessing another window")
+NSRunningApplication.terminated.insert(123)
+closeWithoutNotification.resolveCloses(now: timestamp.addingTimeInterval(2.1))
+expect(closeWithoutNotification.pendingTemporaryRecovery[0].awaitingRelaunch
+       && closeWithoutNotification.pendingTemporaryRecovery[0].closedAt == nil
+       && closeWithoutNotification.pendingTemporaryRecovery[0].slot == 6,
+       "two-second check detects process exit without workspace notification and reserves slot indefinitely")
+
+resetBackend()
+let allocation = RecoveryManager([record("one", bundle: "first.app", slot: 1).waitingForRelaunch(),
+                                  record("three", bundle: "third.app", slot: 3).waitingForRelaunch()])
+expect(allocation.stash(applicationElements[123]!.windows![0]) && allocation.sessions[0].temporaryStashSlot == 2,
+       "manual entry allocates topmost empty slot between waiting records")
+expect(allocation.temporaryRecoveryStore.load().windows.map(\.slot).sorted() == [1, 2, 3],
+       "new slot and waiting reservations persist together")
+allocation.sessions[0].cancelTemporaryShortcutStash()
+expect(allocation.temporaryRecoveryStore.load().windows.map(\.slot).sorted() == [1, 3],
+       "canceling new stash does not move waiting slots")
+resetBackend()
+let replacementSlot = RecoveryManager([record(slot: 5).waitingForRelaunch()])
+expect(replacementSlot.stash(applicationElements[123]!.windows![0]) && replacementSlot.sessions[0].temporaryStashSlot == 5,
+       "manual replacement inherits waiting record's fixed slot")
+
+resetBackend()
+let destination = NSScreen(frame: CGRect(x: 1200, y: 0, width: 1000, height: 1000), displayID: 9)
+NSScreen.screens.append(destination)
+let residentWindow = Element(); residentWindow.systemWindowID = 43
+applicationElements[123]!.windows!.append(residentWindow)
+let migration = RecoveryManager([record("moving", edge: 1, slot: 3),
+                                 record("resident", windowID: 43, screenID: 9, ordinal: 3, slot: 3)])
+migration.run()
+NSScreen.screens = [destination]
+let movingSession = migration.sessions.first { $0.temporaryStashID == "moving" }!
+expect(movingSession.reseat(in: NSScreen.screens), "original screen disappearance reattaches temporary stash")
+migration.persist()
+let migrated = migration.temporaryRecoveryStore.load().windows.first { $0.id == "moving" }!
+expect(migrated.screenID == 9 && migrated.edge == 2 && migrated.slot == 1
+       && migration.sessions.first { $0.temporaryStashID == "resident" }?.temporaryStashSlot == 3,
+       "display fallback persists new right edge and free slot without moving existing destination resident")
+
+resetBackend()
+NSScreen.screens[0].usableFrame = CGRect(x: 0, y: 0, width: 1000, height: 300)
+let shorterDisplay = RecoveryManager([record(slot: 6)])
+shorterDisplay.run()
+expect(shorterDisplay.sessions.first?.temporaryStashSlot == 6
+       && shorterDisplay.temporaryRecoveryStore.load().windows.first?.slot == 6,
+       "restart on a temporarily shorter display preserves original slot instead of filling an earlier empty slot")
 
 print("RESULT checks=\(total) failures=\(failures)")
 exit(failures == 0 ? 0 : 1)

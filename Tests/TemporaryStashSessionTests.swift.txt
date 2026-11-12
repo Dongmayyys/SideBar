@@ -15,8 +15,8 @@ for right in [false, true] {
     var excluded: Bool?
     s.onTemporaryShortcutSessionEnded = { _, exclude, _ in excluded = exclude }
     expect(s.startTemporaryShortcutStash() && s.isSnappedForCoordination && s.alpha == 0,
-           "production start hides window edge=\(right ? 2 : 1)")
-    expect(s.temporaryOriginalFrame == original && s.currentEdge == (right ? 2 : 1), "start stores original and nearest edge")
+           "production start hides left/right positioned window at right edge")
+    expect(s.temporaryOriginalFrame == original && s.currentEdge == 2, "start stores original and always chooses right")
     s.revealForTemporaryStashTab()
     expect(s.isExpandedForCoordination && s.alpha == 1 && s.windowElement.frame.minY == original.minY && s.tracking,
            "production reveal preserves vertical position and starts tracking")
@@ -251,14 +251,6 @@ for edge in [1, 2] {
     fast.runPositionHelper(completion: {})
     expect(fast.windowAnimator.interpolations == 1, "configured position helper still interpolates edge=\(edge)")
 }
-resetScreens()
-NSScreen.screens[0].usableFrame = CGRect(x: 0, y: 0, width: 900, height: 1000)
-let visiblyWide = Session()
-visiblyWide.windowElement.frame = CGRect(x: 0, y: 100, width: 860, height: 300)
-expect(visiblyWide.startTemporaryShortcutStash() && visiblyWide.currentEdge == 2,
-       "production stash passes visible width into wide-window preference")
-resetScreens()
-
 // Production notification endpoint ignores geometry/hover locks and never releases focus.
 let dismissed = Session()
 _ = dismissed.startTemporaryShortcutStash()
@@ -370,6 +362,37 @@ expect(Session.shouldIgnoreTemporaryAppActivation(activatedPID: shortcutDismisse
 shortcutDismissed.focusReleasePending = true
 expect(shortcutDismissed.hideForTemporaryStashTab() && !shortcutDismissed.focusReleasePending,
        "synchronous shortcut collapse invalidates old delayed focus release without scheduling another")
+
+// Screen changes retain the current edge unless the original physical display disappears.
+resetScreens()
+let screenOriginal = CGRect(x: 120, y: 220, width: 400, height: 300)
+let leftRecord = TemporaryStashRecoveryRecord(id: "left", bundleID: "same.app", pid: 123, windowID: 42,
+    edge: 1, screenID: 1, originalFrame: screenOriginal, ordinal: 4, slot: 5)
+let screenStash = Session()
+expect(screenStash.startTemporaryShortcutStash(restoring: leftRecord), "saved left edge is honored while available")
+screenStash.temporaryStashSlot = 5
+NSScreen.screens.append(NSScreen(frame: CGRect(x: -1000, y: 0, width: 1000, height: 1000), displayID: 2))
+expect(!screenStash.snappedScreenIsStale(in: NSScreen.screens) && screenStash.currentEdge == 1,
+       "attaching adjacent display does not reroute an existing stash")
+expect(screenStash.reseat(in: NSScreen.screens) && screenStash.currentEdge == 1,
+       "same physical display never selects a new edge, even when blocked")
+NSScreen.screens.removeLast()
+expect(!screenStash.snappedScreenIsStale(in: NSScreen.screens) && screenStash.currentEdge == 1,
+       "unplugging a neighbor does not move an existing edge")
+let oldSlot = screenStash.temporaryStashSlot
+NSScreen.screens = [NSScreen(frame: CGRect(x: 0, y: 0, width: 1200, height: 1000), displayID: 9)]
+expect(screenStash.snappedScreenIsStale(in: NSScreen.screens)
+       && screenStash.reseat(in: NSScreen.screens)
+       && screenStash.currentEdge == 2 && screenStash.snappedScreen?.displayID == 9
+       && screenStash.temporaryStashSlot == oldSlot,
+       "losing original display selects right on new display and retains preferred slot")
+expect(screenStash.temporaryOriginalFrame == screenOriginal && screenStash.alpha == 0 && !screenStash.focusReleasePending,
+       "screen fallback preserves original cancel position without focus release")
+resetScreens()
+NSScreen.screens.append(NSScreen(frame: CGRect(x: 1000, y: 0, width: 1000, height: 1000), displayID: 2))
+let rightBlocked = Session()
+expect(rightBlocked.startTemporaryShortcutStash() && rightBlocked.currentEdge == 1,
+       "new production stash uses left only when right is blocked")
 
 print("RESULT checks=\(total) failures=\(failures)")
 exit(failures == 0 ? 0 : 1)

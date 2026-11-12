@@ -16,15 +16,13 @@ expect(TemporaryStashShortcutAction.resolve(isConfiguredApp: true, isManaged: tr
 let leftScreen = CGRect(x: -1000, y: 0, width: 1000, height: 1000)
 let belowScreen = CGRect(x: 0, y: 1000, width: 1000, height: 800)
 let rightScreen = CGRect(x: 1000, y: 0, width: 1000, height: 1000)
-let leftWindow = CGRect(x: 10, y: 100, width: 300, height: 300)
 let layout = [mainScreen, leftScreen, belowScreen]
-expect(TemporaryStashGeometry.nearestEdge(window: leftWindow, screen: mainScreen, visibleWidth: mainScreen.width, screens: [mainScreen]) == 1, "nearest left edge")
-expect(TemporaryStashGeometry.nearestEdge(window: leftWindow.offsetBy(dx: 680, dy: 0), screen: mainScreen, visibleWidth: mainScreen.width, screens: [mainScreen]) == 2, "nearest right edge")
-expect(TemporaryStashGeometry.nearestEdge(window: leftWindow, screen: mainScreen, visibleWidth: mainScreen.width, screens: layout) == 2, "three-screen main screen excludes left seam")
-expect(TemporaryStashGeometry.nearestEdge(window: leftWindow.offsetBy(dx: -400, dy: 0), screen: leftScreen, visibleWidth: leftScreen.width, screens: layout) == 1, "three-screen left screen uses outer left edge")
-expect(TemporaryStashGeometry.nearestEdge(window: leftWindow.offsetBy(dx: 0, dy: 1000), screen: belowScreen, visibleWidth: belowScreen.width, screens: layout) == 1, "lower screen left remains available")
-expect(TemporaryStashGeometry.nearestEdge(window: leftWindow.offsetBy(dx: 680, dy: 1000), screen: belowScreen, visibleWidth: belowScreen.width, screens: layout) == 2, "lower screen right remains available")
-expect(TemporaryStashGeometry.nearestEdge(window: leftWindow, screen: mainScreen, visibleWidth: mainScreen.width, screens: layout + [rightScreen]) == nil, "both seams blocked ignores shortcut")
+expect(TemporaryStashGeometry.preferredEdge(screen: mainScreen, screens: [mainScreen]) == 2, "new stash always prefers right")
+expect(TemporaryStashGeometry.preferredEdge(screen: mainScreen, screens: layout) == 2, "left neighbor does not change new right stash")
+expect(TemporaryStashGeometry.preferredEdge(screen: leftScreen, screens: layout) == 1, "blocked right falls back left")
+expect(TemporaryStashGeometry.preferredEdge(screen: mainScreen, screens: layout + [rightScreen]) == nil, "both sides blocked rejects stash")
+expect(TemporaryStashGeometry.recoveryEdge(savedEdge: 1, screen: mainScreen, screens: [mainScreen]) == 1, "available saved left edge beats right preference")
+expect(TemporaryStashGeometry.recoveryEdge(savedEdge: 1, screen: mainScreen, screens: layout) == 2, "blocked saved edge falls back to right preference")
 let sliver = CGRect(x: -1000, y: 999, width: 1000, height: 600)
 expect(TemporaryStashGeometry.hasAdjacentScreen(edge: 1, screen: mainScreen, screens: [mainScreen, sliver]), "one point vertical overlap blocks whole side")
 expect(!TemporaryStashGeometry.hasAdjacentScreen(edge: 1, screen: mainScreen, screens: [mainScreen, sliver.offsetBy(dx: 0, dy: 1)]), "corner-only contact does not block side")
@@ -37,52 +35,26 @@ expect(TemporaryStashGeometry.restorePosition(original: original, expanded: expa
 expect(TemporaryStashGeometry.restorePosition(original: original.offsetBy(dx: 850, dy: 0), expanded: expanded, screens: [mainScreen]).x == -50, "partially visible original position remains valid")
 
 let usable = CGRect(x: 60, y: 50, width: 900, height: 900)
-let isolated = TemporaryStashGeometry.labelFrames(count: 1, edge: 1, visibleFrame: usable)
-expect(isolated[0].midY == usable.midY && isolated[0].minX == usable.minX, "single label centers inside visibleFrame")
-expect(isolated[0].width == 18 && isolated[0].height == 120, "fixed label dimensions")
-let column = TemporaryStashGeometry.labelFrames(count: 3, edge: 2, visibleFrame: usable)
-expect(near((column[0].maxY + column[2].minY) / 2, usable.midY), "whole column centers vertically")
-expect(zip(column, column.dropFirst()).allSatisfy { near($0.minY - $1.maxY, 4) }, "top-to-bottom order with four point gaps")
-expect(column.allSatisfy { usable.contains($0) && $0.maxX == usable.maxX }, "right column remains inside usable region")
-expect(TemporaryStashGeometry.labelFrames(count: 0, edge: 1, visibleFrame: mainScreen).isEmpty, "empty edge has no labels")
-let shifted = TemporaryStashGeometry.labelFrames(count: 3, edge: 1, visibleFrame: usable.offsetBy(dx: -1000, dy: -1000))
-expect(zip(column, shifted).allSatisfy { near($0.minY - 1000, $1.minY) && $1.minX == -940 }, "negative multi-screen coordinates keep centered layout")
-let range = column.reduce(column[0]) { $0.union($1) }
-let clampedTop = TemporaryStashGeometry.draggedFrame(initial: column[2], deltaY: 10000, column: range)
-let clampedBottom = TemporaryStashGeometry.draggedFrame(initial: column[0], deltaY: -10000, column: range)
-expect(clampedTop == column[0] && clampedBottom == column[2], "drag stays within column, preserving x and dimensions")
-expect(TemporaryStashGeometry.insertionIndex(centerY: column[0].midY + 1, columnFrames: column) == 0, "drag inserts at top slot")
-expect(TemporaryStashGeometry.insertionIndex(centerY: column[1].midY - 1, columnFrames: column) == 1, "drag inserts in middle")
-expect(TemporaryStashGeometry.insertionIndex(centerY: column[2].midY - 1, columnFrames: column) == 2, "drag inserts at bottom")
-expect(TemporaryStashGeometry.insertionIndex(centerY: 500, columnFrames: []) == 0, "empty column insertion is zero")
-let halfway = (column[0].midY + column[1].midY) / 2
-expect(TemporaryStashGeometry.insertionIndex(centerY: halfway + 1, columnFrames: column) == 0, "drop above slot midpoint keeps previous index")
-expect(TemporaryStashGeometry.insertionIndex(centerY: halfway - 1, columnFrames: column) == 1, "drop below slot midpoint inserts at next index")
-
+expect(TemporaryStashGeometry.slotCapacity(visibleFrame: usable) == 7, "capacity fits complete labels and 4pt gaps")
+expect(TemporaryStashGeometry.slotFrame(slot: 1, edge: 2, visibleFrame: usable)?.maxY == usable.maxY, "slot one starts at visible top")
+expect(TemporaryStashGeometry.slotFrame(slot: 0, edge: 2, visibleFrame: usable) == nil
+       && TemporaryStashGeometry.slotFrame(slot: 8, edge: 2, visibleFrame: usable) == nil, "slots cannot extend outside visible region")
 for edge in [1, 2] {
-    for count in 1...7 {
-        let frames = TemporaryStashGeometry.labelFrames(count: count, edge: edge, visibleFrame: usable)
-        expect(frames.allSatisfy { usable.contains($0) } && near((frames[0].maxY + frames[count - 1].minY) / 2, usable.midY),
-               "centered full column within visible region edge=\(edge) count=\(count)")
-    }
+    let frames = (1...7).compactMap { TemporaryStashGeometry.slotFrame(slot: $0, edge: edge, visibleFrame: usable) }
+    expect(frames.allSatisfy { usable.contains($0) } && zip(frames, frames.dropFirst()).allSatisfy { near($0.minY - $1.maxY, 4) },
+           "fixed slots fit visible region with 4pt gaps edge=\(edge)")
 }
-
-for width: CGFloat in [960, 1000, 1200] {
-    expect(TemporaryStashGeometry.nearestEdge(window: CGRect(x: 0, y: 100, width: width, height: 300), screen: mainScreen,
-                                            visibleWidth: 1000, screens: [mainScreen]) == 2, "wide window prefers right width=\(width)")
-}
-expect(TemporaryStashGeometry.nearestEdge(window: CGRect(x: 0, y: 100, width: 860, height: 300), screen: mainScreen,
-                                        visibleWidth: 900, screens: [mainScreen]) == 2, "wide threshold uses visible width, not full screen width")
-for x: CGFloat in [340, 350, 360] {
-    expect(TemporaryStashGeometry.nearestEdge(window: CGRect(x: x, y: 100, width: 300, height: 300), screen: mainScreen,
-                                            visibleWidth: 1000, screens: [mainScreen]) == 2, "distance tie within inclusive twenty points x=\(x)")
-}
-expect(TemporaryStashGeometry.nearestEdge(window: CGRect(x: 339, y: 100, width: 300, height: 300), screen: mainScreen,
-                                        visibleWidth: 1000, screens: [mainScreen]) == 1, "distance difference over twenty uses nearest edge")
-expect(TemporaryStashGeometry.nearestEdge(window: mainScreen, screen: mainScreen, visibleWidth: 1000,
-                                        screens: [mainScreen, rightScreen]) == 1, "wide window falls back left when right blocked")
-expect(TemporaryStashGeometry.nearestEdge(window: mainScreen, screen: mainScreen, visibleWidth: 1000,
-                                        screens: [mainScreen, rightScreen, leftScreen]) == nil, "wide rule cannot override two blocked sides")
+expect(TemporaryStashSlots.allocate(occupied: [1, 3]) == 2, "allocate highest empty slot first")
+expect(TemporaryStashSlots.allocate(occupied: [1, 2, 3]) == 4, "append after last occupied slot")
+expect(TemporaryStashSlots.allocate(occupied: [1, 2], capacity: 2) == nil, "full column does not add an out-of-bounds slot")
+let initialSlots = [TemporaryStashSlotAssignment(id: "s1", screenID: 1, edge: 2, slot: 1),
+                    TemporaryStashSlotAssignment(id: "s3", screenID: 1, edge: 2, slot: 3)]
+let swap = TemporaryStashSlots.move(id: "s1", to: 3, assignments: initialSlots)
+expect(swap.map(\.slot) == [3, 1], "occupied slot swaps both assignments")
+expect(TemporaryStashSlots.move(id: "s1", to: 2, assignments: initialSlots).map(\.slot) == [2, 3], "empty slot move leaves other assignments unchanged")
+expect(TemporaryStashGeometry.slot(at: CGPoint(x: 500, y: 500), edge: 2, visibleFrame: usable, count: 4) == nil, "outside slot area has no drop target")
+let slotOne = TemporaryStashGeometry.slotFrame(slot: 1, edge: 2, visibleFrame: usable)!
+expect(TemporaryStashGeometry.slot(at: CGPoint(x: slotOne.midX, y: slotOne.minY - 2), edge: 2, visibleFrame: usable, count: 4) == nil, "4pt gap is not a slot drop target")
 
 var visibility = TemporaryStashVisibility()
 expect(visibility.isVisible(isOnScreen: true, now: 0), "on-screen label visible immediately")
@@ -346,11 +318,9 @@ retryCoordinator.tearDownAll()
 expect(!Timer.all.contains { $0.valid }, "teardown cancels activation retry timer")
 NSWorkspace.shared.frontmostApplication = Application(processIdentifier: 123)
 
-// Order survives polling, window y changes, Space hiding and drag/drop.
+// Fixed-slot UI entry points: empty movement, swaps, placeholders, outside drops.
 let dragCoordinator = TemporaryStashTabCoordinator()
-let d1 = WindowSession("d1")
-let d2 = WindowSession("d2")
-let d3 = WindowSession("d3")
+let d1 = WindowSession("d1"), d2 = WindowSession("d2"), d3 = WindowSession("d3")
 let rightLabel = WindowSession("right", edge: 2)
 var dragSessions = [d1, d2, d3, rightLabel]
 NSEvent.mouseLocation = CGPoint(x: 500, y: 400)
@@ -358,47 +328,36 @@ dragCoordinator.reconcile(sessions: dragSessions)
 func leftOrder() -> [String] {
     TemporaryStashTabWindow.live.filter { $0.value.minX == 0 }.sorted { $0.value.midY > $1.value.midY }.map(\.key)
 }
-expect(leftOrder() == ["d1", "d2", "d3"], "new labels append at bottom in stash order")
 let initialFrames = TemporaryStashTabWindow.live
 dragCoordinator.reconcile(sessions: [d3, rightLabel, d2, d1])
-expect(TemporaryStashTabWindow.live == initialFrames, "input enumeration cannot reshuffle existing order")
-let down = tabPoint("d3")
-NSEvent.mouseLocation = down
-TemporaryStashTabWindow.emit("d3", .down(down))
-d2.isExpandedForCoordination = true
-rightLabel.isExpandedForCoordination = true
+expect(TemporaryStashTabWindow.live == initialFrames, "AX enumeration cannot change fixed slots")
+let from = tabPoint("d3"), to = tabPoint("d1")
+TemporaryStashTabWindow.emit("d3", .down(from))
+expect(TemporaryStashTabWindow.placeholders.count == 4, "press shows all used slots and one additional empty slot")
 transitions.removeAll()
-let outsideTop = CGPoint(x: 900, y: down.y + 10000)
-NSEvent.mouseLocation = outsideTop
-TemporaryStashTabWindow.emit("d3", .dragged(outsideTop))
-Clock.now += 1
+TemporaryStashTabWindow.emit("d3", .dragged(to))
+expect(transitions.isEmpty && dragSessions.allSatisfy(\.hoverLock), "slot drag blocks hover reveal and collapse")
+TemporaryStashTabWindow.emit("d3", .up(to))
+expect(d1.temporaryStashSlot == 3 && d3.temporaryStashSlot == 1 && d2.temporaryStashSlot == 2,
+       "occupied drop swaps two labels instead of inserting")
+expect(TemporaryStashTabWindow.placeholders.isEmpty, "release hides all empty placeholders")
+let d1From = tabPoint("d1")
+let fourth = TemporaryStashGeometry.slotFrame(slot: 4, edge: 1, visibleFrame: mainScreen)!
+TemporaryStashTabWindow.emit("d1", .down(d1From))
+TemporaryStashTabWindow.emit("d1", .up(CGPoint(x: fourth.midX, y: fourth.midY)))
+expect(d1.temporaryStashSlot == 4 && d3.temporaryStashSlot == 1, "drop into empty new slot moves only dragged label")
+let beforeOutside = TemporaryStashTabWindow.live
+TemporaryStashTabWindow.emit("d1", .down(tabPoint("d1")))
+TemporaryStashTabWindow.emit("d1", .up(CGPoint(x: 500, y: 2000)))
+expect(TemporaryStashTabWindow.live == beforeOutside && d1.temporaryStashSlot == 4, "drop outside slot area leaves all slots unchanged")
+dragSessions.removeAll { $0 === d2 }
 dragCoordinator.reconcile(sessions: dragSessions)
-expect(TemporaryStashTabWindow.live["d3"] == initialFrames["d1"], "drag follows y clamped at column top and ignores mouse x")
-expect(TemporaryStashTabWindow.live["d1"] == initialFrames["d1"] && TemporaryStashTabWindow.live["d2"] == initialFrames["d2"], "other labels remain stationary during drag")
-expect(transitions.isEmpty && dragSessions.allSatisfy(\.hoverLock), "drag blocks all hover reveals and all collapse timers")
-TemporaryStashTabWindow.emit("d3", .up(outsideTop))
-expect(leftOrder() == ["d3", "d1", "d2"], "drop inserts bottom label at top")
-expect(d2.isExpandedForCoordination && rightLabel.isExpandedForCoordination && dragSessions.allSatisfy { !$0.hoverLock }, "drop restores normal hover locks without collapsing expanded windows")
-let middleDrop = tabPoint("d1")
-let secondDown = tabPoint("d2")
-TemporaryStashTabWindow.emit("d2", .down(secondDown))
-TemporaryStashTabWindow.emit("d2", .dragged(CGPoint(x: 0, y: middleDrop.y + 5)))
-TemporaryStashTabWindow.emit("d2", .up(CGPoint(x: 0, y: middleDrop.y + 5)))
-expect(leftOrder() == ["d3", "d2", "d1"], "drop supports middle insertion")
-transitions.removeAll()
-let click = tabPoint("d2")
-TemporaryStashTabWindow.emit("d2", .down(click))
-TemporaryStashTabWindow.emit("d2", .up(click))
-expect(leftOrder() == ["d3", "d2", "d1"] && transitions.isEmpty, "single click has no extra action or reorder")
+expect(TemporaryStashTabWindow.live["d1"] == beforeOutside["d1"] && TemporaryStashTabWindow.live["d3"] == beforeOutside["d3"],
+       "cancel frees its slot without moving or recentering other labels")
 let d4 = WindowSession("d4")
 dragSessions.append(d4)
 dragCoordinator.reconcile(sessions: dragSessions)
-expect(leftOrder() == ["d3", "d2", "d1", "d4"], "new stash appends after manually reordered members")
-dragSessions.removeAll { $0 === d2 }
-dragCoordinator.reconcile(sessions: dragSessions)
-expect(leftOrder() == ["d3", "d1", "d4"], "remove preserves relative order")
-let recentered = TemporaryStashTabWindow.live
-expect(near((recentered["d3"]!.maxY + recentered["d4"]!.minY) / 2, mainScreen.midY), "remove recenters entire column")
+expect(d4.temporaryStashSlot == 2, "new label occupies topmost empty slot")
 let d3Panel = TemporaryStashTabWindow.instances["d3"]
 d3.eligible = false
 dragCoordinator.reconcile(sessions: dragSessions)
@@ -406,7 +365,7 @@ Clock.now += 0.31
 dragCoordinator.reconcile(sessions: dragSessions)
 d3.eligible = true
 dragCoordinator.reconcile(sessions: dragSessions)
-expect(leftOrder() == ["d3", "d1", "d4"] && TemporaryStashTabWindow.instances["d3"] === d3Panel, "hidden Space member retains list slot and panel")
+expect(d3.temporaryStashSlot == 1 && TemporaryStashTabWindow.instances["d3"] === d3Panel, "Space visibility preserves slot and panel")
 
 // Tracking event starts the configured delay immediately, rather than waiting for the next poll.
 AppConfig.shared.hoverDelayMS = 0
@@ -474,7 +433,7 @@ for edge in [1, 2] {
     TemporaryStashTabWindow.emit("first", .down(from))
     TemporaryStashTabWindow.emit("first", .up(to))
     let titles = TemporaryStashTabWindow.live.sorted { $0.value.midY > $1.value.midY }.map(\.key)
-    expect(titles == ["second", "third", "first"], "top label can drop at bottom edge=\(edge)")
+    expect(titles == ["third", "second", "first"], "top label can drop at bottom edge=\(edge)")
     TemporaryStashTabWindow.emit("third", .down(tabPoint("third")))
     third.eligible = false
     stableCoordinator.reconcile(sessions: members)
@@ -494,22 +453,19 @@ for edge in [1, 2] {
     expect(afterResize == titles, "display ID preserves manual order after screen geometry change edge=\(edge)")
     stableCoordinator.tearDownAll()
 }
-expect(TemporaryStashGeometry.nearestEdge(window: CGRect(x: 0, y: 100, width: 959, height: 300), screen: mainScreen,
-                                        visibleWidth: 1000, screens: [mainScreen]) == 1, "width just below forty-point threshold uses nearest edge")
-
 let screenCoordinator = TemporaryStashTabCoordinator()
 let primary = WindowSession("primary")
 let secondary = WindowSession("secondary")
 secondary.screenID = 2
 secondary.visibleFrame = leftScreen
 primary.isExpandedForCoordination = true
-NSEvent.mouseLocation = CGPoint(x: -990, y: 500)
+NSEvent.mouseLocation = CGPoint(x: -990, y: 940)
 AppConfig.shared.hoverDelayMS = 0
 screenCoordinator.reconcile(sessions: [primary, secondary])
 expect(primary.isExpandedForCoordination && secondary.isExpandedForCoordination,
        "same edge on distinct screens has independent reveal coordination")
-expect(TemporaryStashTabWindow.live["primary"]?.midY == 500 && TemporaryStashTabWindow.live["secondary"]?.midY == 500,
-       "each screen centers its own independent column")
+expect(TemporaryStashTabWindow.live["primary"]?.midY == 940 && TemporaryStashTabWindow.live["secondary"]?.midY == 940,
+       "each display uses its own visible top slot")
 AppConfig.shared.hoverDelayMS = AppConfig.defaultHoverDelayMS
 screenCoordinator.tearDownAll()
 
@@ -604,57 +560,65 @@ expect(fixed.isExpandedForCoordination && untouched.isExpandedForCoordination,
        "switch to stashed app still preserves pinned and configured windows")
 switchCoordinator.tearDownAll()
 
-// Saved stable IDs restore order independently of session creation/AX retry order.
+// Persisted slots survive missing windows, late restoration and changed displays.
 let restoredCoordinator = TemporaryStashTabCoordinator()
-let savedA = WindowSession("saved-a", edge: 2)
-let savedB = WindowSession("saved-b", edge: 2)
-let savedC = WindowSession("saved-c", edge: 2)
-let savedOrder = TemporaryStashTabOrder(screenID: 1, edge: 2, ids: ["saved-c", "saved-a", "saved-b"])
-restoredCoordinator.restoreOrder([savedOrder])
+let savedA = WindowSession("saved-a", edge: 2), savedC = WindowSession("saved-c", edge: 2)
+let savedSlots = [TemporaryStashSlotAssignment(id: "saved-a", screenID: 1, edge: 2, slot: 2),
+                  TemporaryStashSlotAssignment(id: "saved-c", screenID: 1, edge: 2, slot: 5)]
+restoredCoordinator.restoreSlots(savedSlots, pendingIDs: ["saved-c"])
 NSEvent.mouseLocation = CGPoint(x: 500, y: 400)
-restoredCoordinator.reconcile(sessions: [savedB, savedA])
-expect(restoredCoordinator.snapshotOrder().first?.ids == ["saved-a", "saved-b"], "saved order overrides AX creation order")
-restoredCoordinator.reconcile(sessions: [savedB, savedA, savedC])
-expect(restoredCoordinator.snapshotOrder().first?.ids == savedOrder.ids, "late AX window inserts at saved slot instead of appending")
-let freshTab = WindowSession("fresh-tab", edge: 2)
-restoredCoordinator.reconcile(sessions: [freshTab, savedB, savedA, savedC])
-expect(restoredCoordinator.snapshotOrder().first?.ids == savedOrder.ids + ["fresh-tab"], "new stash appends after restored order")
-var orderNotifications = 0
-restoredCoordinator.onOrderChanged = { orderNotifications += 1 }
-let savedDown = tabPoint("saved-b")
-let savedTop = tabPoint("saved-c")
-TemporaryStashTabWindow.emit("saved-b", .down(savedDown))
-TemporaryStashTabWindow.emit("saved-b", .dragged(savedTop))
-TemporaryStashTabWindow.emit("saved-b", .up(savedTop))
-expect(restoredCoordinator.snapshotOrder().first?.ids == ["saved-b", "saved-c", "saved-a", "fresh-tab"]
-       && orderNotifications == 1, "drag after restore publishes updated persistent order on mouse-up")
-savedC.screenID = 2
-restoredCoordinator.reconcile(sessions: [savedA, savedB, savedC, freshTab])
-expect(restoredCoordinator.snapshotOrder().contains { $0.screenID == 2 && $0.ids == ["saved-c"] },
-       "changing display moves stable order membership to that display")
-savedB.isManagedByTemporaryShortcut = false
-restoredCoordinator.reconcile(sessions: [savedA, savedB, savedC, freshTab])
-expect(restoredCoordinator.snapshotOrder().allSatisfy { !$0.ids.contains("saved-b") }, "cancel/close removes stable ID from saved tab order")
+restoredCoordinator.reconcile(sessions: [savedA])
+let savedAFrame = TemporaryStashTabWindow.live["saved-a"]
+expect(savedA.temporaryStashSlot == 2 && TemporaryStashTabWindow.live["saved-c"] == nil,
+       "waiting record hides label while retaining noncontiguous slot")
+restoredCoordinator.restoreSlots(savedSlots)
+restoredCoordinator.suppressRestoredHover(for: savedC)
+restoredCoordinator.reconcile(sessions: [savedC, savedA])
+expect(savedC.temporaryStashSlot == 5 && TemporaryStashTabWindow.live["saved-a"] == savedAFrame,
+       "late restore returns to exact slot without moving existing labels")
+var slotNotifications = 0
+restoredCoordinator.onSlotsChanged = { _ in slotNotifications += 1 }
+let targetSlot = tabPoint("saved-a")
+TemporaryStashTabWindow.emit("saved-c", .down(tabPoint("saved-c")))
+TemporaryStashTabWindow.emit("saved-c", .up(targetSlot))
+expect(savedA.temporaryStashSlot == 5 && savedC.temporaryStashSlot == 2 && slotNotifications == 1,
+       "drag publishes swapped persistent slot assignments")
+let stableTallFrame = TemporaryStashTabWindow.live["saved-a"]
+savedA.visibleFrame = CGRect(x: 0, y: 0, width: 1000, height: 300)
+restoredCoordinator.reconcile(sessions: [savedC, savedA])
+expect(TemporaryStashTabWindow.live["saved-a"] == nil && savedA.temporaryStashSlot == 5,
+       "screen height shrink hides an unrenderable slot rather than moving it or leaving an out-of-bounds panel")
+savedA.visibleFrame = mainScreen
+restoredCoordinator.reconcile(sessions: [savedC, savedA])
+expect(TemporaryStashTabWindow.live["saved-a"] == stableTallFrame, "restoring available height restores exact slot position")
 restoredCoordinator.tearDownAll()
 
-let fallbackCoordinator = TemporaryStashTabCoordinator()
-fallbackCoordinator.restoreOrder([TemporaryStashTabOrder(screenID: 9, edge: 1, ids: ["f-c", "f-a", "f-b"])])
-let fallbackA = WindowSession("f-a", edge: 2), fallbackB = WindowSession("f-b", edge: 2), fallbackC = WindowSession("f-c", edge: 2)
-fallbackCoordinator.suppressRestoredHover(for: fallbackA)
-fallbackCoordinator.suppressRestoredHover(for: fallbackB)
-fallbackCoordinator.reconcile(sessions: [fallbackB, fallbackA])
-expect(fallbackCoordinator.snapshotOrder().first?.ids == ["f-a", "f-b"], "fallback to another screen/edge retains source-column order")
-fallbackCoordinator.restoreOrder([TemporaryStashTabOrder(screenID: 9, edge: 1, ids: ["f-c"]),
-                                   TemporaryStashTabOrder(screenID: 1, edge: 2, ids: ["f-a", "f-b"])])
-fallbackCoordinator.suppressRestoredHover(for: fallbackC)
-fallbackCoordinator.reconcile(sessions: [fallbackB, fallbackA, fallbackC])
-expect(fallbackCoordinator.snapshotOrder().first?.ids == ["f-c", "f-a", "f-b"], "late retry preserves original relative order after fallback migration")
-fallbackCoordinator.tearDownAll()
+// A waiting record is reserved even though its label is hidden; dragging can
+// swap its reservation atomically, never overwrite it with a duplicate slot.
+let waitingCoordinator = TemporaryStashTabCoordinator()
+let visibleSwap = WindowSession("visible-swap", edge: 2)
+let waitingSwap = WindowSession("waiting-swap", edge: 2)
+var swapAssignments = [TemporaryStashSlotAssignment(id: "visible-swap", screenID: 1, edge: 2, slot: 2),
+                       TemporaryStashSlotAssignment(id: "waiting-swap", screenID: 1, edge: 2, slot: 5)]
+waitingCoordinator.restoreSlots(swapAssignments, pendingIDs: ["waiting-swap"])
+waitingCoordinator.onSlotsChanged = { swapAssignments = $0 }
+NSEvent.mouseLocation = CGPoint(x: 500, y: 400)
+waitingCoordinator.reconcile(sessions: [visibleSwap])
+let waitingFrame = TemporaryStashGeometry.slotFrame(slot: 5, edge: 2, visibleFrame: mainScreen)!
+TemporaryStashTabWindow.emit("visible-swap", .down(tabPoint("visible-swap")))
+TemporaryStashTabWindow.emit("visible-swap", .up(CGPoint(x: waitingFrame.midX, y: waitingFrame.midY)))
+expect(swapAssignments.first { $0.id == "waiting-swap" }?.slot == 2 && visibleSwap.temporaryStashSlot == 5,
+       "dragging into a waiting reservation swaps both slots atomically")
+waitingCoordinator.restoreSlots(swapAssignments)
+waitingCoordinator.reconcile(sessions: [waitingSwap, visibleSwap])
+expect(waitingSwap.temporaryStashSlot == 2 && visibleSwap.temporaryStashSlot == 5,
+       "waiting software returns to its updated reservation after a user drag")
+waitingCoordinator.tearDownAll()
 
 let hoverRestore = TemporaryStashTabCoordinator()
 let underPointer = WindowSession("under-pointer")
 AppConfig.shared.hoverDelayMS = 0
-let restoredFrame = TemporaryStashGeometry.labelFrames(count: 1, edge: 1, visibleFrame: mainScreen)[0]
+let restoredFrame = TemporaryStashGeometry.slotFrame(slot: 1, edge: 1, visibleFrame: mainScreen)!
 NSEvent.mouseLocation = CGPoint(x: restoredFrame.midX, y: restoredFrame.midY)
 hoverRestore.suppressRestoredHover(for: underPointer)
 hoverRestore.reconcile(sessions: [underPointer])

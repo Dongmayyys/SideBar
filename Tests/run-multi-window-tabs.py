@@ -39,7 +39,7 @@ if result.returncode:
 
 session_source = (source / 'WindowSession.swift').read_text()
 methods = []
-for name in ['startTemporaryShortcutStash', 'cancelTemporaryShortcutStash', 'restoreTemporaryShortcutWindow',
+for name in ['snappedScreenIsStale', 'reseatTemporaryShortcutGeometry', 'startTemporaryShortcutStash', 'cancelTemporaryShortcutStash', 'restoreTemporaryShortcutWindow',
              'finishTemporaryShortcutSession', 'hideForTemporaryStashTab', 'revealForTemporaryStashTab', 'focusForTemporaryStashTab',
              'restoreAndDestroy', 'handleDestroyed', 'handleMouseUp', 'isDetachedFromManagedEdge',
              'canRevealForTemporaryAppActivation', 'beginTargetedActivationWindow',
@@ -79,11 +79,18 @@ if result.returncode:
 manager_source = (source / 'AXWindowManager.swift').read_text()
 manager_methods = []
 for name in ['persistTemporaryRecovery', 'stopTemporaryRecovery', 'discardPendingTemporaryRecovery',
-             'restoreTemporaryShortcuts', 'findTemporaryRecoveryWindow', 'handleTemporaryShortcutSessionEnded']:
+             'restoreTemporaryShortcuts', 'temporaryRecoveryWindows', 'isTemporaryRecoveryCandidate',
+             'restoreTemporaryShortcut', 'primaryTemporaryRecoveryCandidate', 'temporaryRecoveryFrame',
+             'pendingTemporaryReplacement', 'markTemporaryRecoveryWaiting', 'resolveClosedTemporaryRecovery', 'claimTemporarySlot', 'handleTemporarySlotsChanged',
+             'retainTemporaryRecoveryAfterTermination', 'handleTemporaryShortcut', 'handleTemporaryShortcutSessionEnded']:
     matches = list(re.finditer(r'    private func ' + name + r'\(.*?\n    }', manager_source, re.S))
     if len(matches) != 1:
         sys.exit(f'Expected exactly one production manager method: {name}')
     manager_methods.append(matches[0].group().replace('WindowSession', 'Session').replace('AXUIElementCreateApplication', 'testApplicationElement'))
+# The cancelled topology-reroute direction must not return through screen notifications.
+assert not re.search(r'reroute|topologyAware|appendRelocated', manager_source + session_source, re.I)
+assert 'nearestEdge' not in (source / 'TemporaryStashLogic.swift').read_text()
+assert 'insertionIndex' not in coordinator and 'recoveryRanks' not in coordinator
 recovery_harness = (repo / 'Tests/TemporaryStashRecoveryHarness.swift.txt').read_text()
 recovery_harness = recovery_harness.replace('__MANAGER_METHODS__', '\n\n'.join(manager_methods))
 recovery_fixture = session_base + '\n' + recovery_harness

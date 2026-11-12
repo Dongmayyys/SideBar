@@ -7,11 +7,14 @@ func expect(_ condition: Bool, _ name: String) {
 }
 
 func resetVisibilityBackend() {
+    AccessibilityRuntimeGuard.shared.trusted = true
     NSRunningApplication.knownAppsOnly = false
     NSRunningApplication.hidden = []
     NSRunningApplication.terminated = []
     NSRunningApplication.hideSucceeds = true
     NSRunningApplication.unhideSucceeds = true
+    NSRunningApplication.unhideIsImmediate = true
+    NSRunningApplication.pendingUnhides = []
     NSRunningApplication.hideIsImmediate = true
     NSRunningApplication.pendingHides = []
     NSRunningApplication.bundles = [123: "same.app", 456: "other.app"]
@@ -21,6 +24,9 @@ func resetVisibilityBackend() {
     Session.targetedActivationByPID.removeAll()
     Session.programmaticPIDs.removeAll()
     Session.temporaryFocusReturnActivationUntilByPID.removeAll()
+    testHiddenDefaults.removeObject(forKey: TemporaryStashHiddenAppStore.defaultsKey)
+    NSRunningApplication.launches = [:]
+    TemporaryStashWindowSpaces.displays = nil
     TemporaryStashWindowSpaces.available = true
     TemporaryStashWindowSpaces.active = [1]
     TemporaryStashWindowSpaces.memberships = [:]
@@ -79,8 +85,11 @@ delayedHide.reconcile(sessions: [delayedSession])
 appVisibilityEvents.removeAll()
 delayedSession.revealForTemporaryStashTab()
 expect(appVisibilityEvents.first == "unhide:123" && NSRunningApplication.pendingHides.isEmpty
-       && delayedSession.isExpandedForCoordination,
-       "immediate reveal cancels an asynchronous hide even before isHidden becomes true")
+       && delayedSession.isSnappedForCoordination,
+       "pending hide cancellation keeps reveal intent until the acknowledgement window settles")
+Thread.sleep(forTimeInterval: 0.85)
+delayedHide.reconcile(sessions: [delayedSession])
+expect(delayedSession.isExpandedForCoordination, "confirmed cancellation resumes requested reveal without another hover")
 
 resetVisibilityBackend()
 NSRunningApplication.hideIsImmediate = false
@@ -159,6 +168,9 @@ let spaceAware = TemporaryStashAppVisibility()
 let spaceSessions = collapsedSessions(visibility: spaceAware, count: 2)
 TemporaryStashWindowSpaces.memberships[spaceSessions[0].windowElement.systemWindowID!] = [1]
 TemporaryStashWindowSpaces.memberships[spaceSessions[1].windowElement.systemWindowID!] = [2]
+for session in spaceSessions {
+    session.temporaryStashPresence = TemporaryStashAppVisibility.capturePresence(window: session.windowElement, pid: session.pid, screenID: 1)
+}
 spaceAware.reconcile(sessions: spaceSessions)
 cgWindows = []
 expect(spaceSessions[0].temporaryStashTabDescriptor()?.isOnScreen == true
@@ -170,8 +182,9 @@ expect(spaceSessions[0].temporaryStashTabDescriptor()?.isOnScreen == false
        && spaceSessions[1].temporaryStashTabDescriptor()?.isOnScreen == true
        && NSRunningApplication.hidden.contains(123), "desktop change updates hidden labels without unhiding app")
 TemporaryStashWindowSpaces.active = [1, 2]
-expect(spaceSessions.allSatisfy { $0.temporaryStashTabDescriptor()?.isOnScreen == true },
-       "different displays can each have their own active Space")
+expect(spaceSessions[0].temporaryStashTabDescriptor()?.isOnScreen == true
+       && spaceSessions[1].temporaryStashTabDescriptor()?.isOnScreen == false,
+       "active Space on another display cannot leak a label onto this display")
 spaceSessions[0].fullscreen = true
 expect(spaceSessions[0].temporaryStashTabDescriptor()?.isOnScreen == false,
        "hidden-app override still respects fullscreen-Space suppression")
@@ -184,24 +197,21 @@ let visibleID = fallbackSessions[0].windowElement.systemWindowID!
 cgWindows = [[kCGWindowNumber as String: visibleID]]
 fallback.reconcile(sessions: fallbackSessions)
 cgWindows = []
-expect(fallbackSessions[0].temporaryStashTabDescriptor()?.isOnScreen == true
-       && fallbackSessions[1].temporaryStashTabDescriptor()?.isOnScreen == false,
-       "without Space APIs, hiding preserves each window's last on-screen status")
+expect(!NSRunningApplication.hidden.contains(123),
+       "unknown initial Space ownership defers app hide rather than losing its entry point")
 fallback.spaceDidChange()
-expect(!NSRunningApplication.hidden.contains(123)
-       && fallbackSessions.allSatisfy { $0.temporaryStashTabDescriptor()?.isOnScreen == false },
-       "fallback desktop change unhides alpha-zero windows to resample rather than leak old-Space labels")
 fallback.reconcile(sessions: fallbackSessions)
-expect(!NSRunningApplication.hidden.contains(123), "fallback gives CG time to publish a fresh Space sample before rehiding")
-Thread.sleep(forTimeInterval: 0.25)
+expect(!NSRunningApplication.hidden.contains(123), "Space API failure never grants hide ownership")
+TemporaryStashWindowSpaces.available = true
+Thread.sleep(forTimeInterval: 1.05)
 fallback.reconcile(sessions: fallbackSessions)
 expect(NSRunningApplication.hidden.contains(123)
-       && fallbackSessions.allSatisfy { $0.temporaryStashTabDescriptor()?.isOnScreen == false },
-       "fallback can rehide after sampling actual absence in new Space")
-cgWindows = [[kCGWindowNumber as String: visibleID]]
+       && fallbackSessions.allSatisfy { $0.temporaryStashTabDescriptor()?.isOnScreen == true },
+       "initial unknown membership is retried and can later safely hide")
+TemporaryStashWindowSpaces.available = false
 fallback.spaceDidChange()
-expect(fallbackSessions[0].temporaryStashTabDescriptor()?.isOnScreen == true,
-       "fallback labels recover on returning to original Space")
+expect(fallbackSessions.allSatisfy { $0.temporaryStashTabDescriptor()?.isOnScreen == true },
+       "generation change and unavailable active API preserve last trusted hidden label visibility")
 
 for action in ["cancel", "cleanup", "accessibility"] {
     resetVisibilityBackend()
@@ -290,6 +300,7 @@ failuresVisibility.reconcile(sessions: [failureSession])
 expect(!appVisibilityEvents.contains("hide:\(failureSession.pid)"),
        "hide request records ownership even when hide() returns false")
 failuresVisibility.restoreAll(reason: "cleanup")
+failuresVisibility.restore(pid: 123, reason: "test-new-eligibility")
 NSRunningApplication.hideSucceeds = true
 failuresVisibility.reconcile(sessions: [failureSession])
 NSRunningApplication.unhideSucceeds = false
@@ -298,7 +309,9 @@ failureSession.revealForTemporaryStashTab()
 expect(failureSession.isSnappedForCoordination && failureSession.alpha == 0 && appVisibilityEvents == ["unhide:123"],
        "failed unhide keeps window collapsed without position/alpha writes and retains ownership for retry")
 NSRunningApplication.unhideSucceeds = true
+Thread.sleep(forTimeInterval: 0.25)
 failureSession.revealForTemporaryStashTab()
+failuresVisibility.reconcile(sessions: [failureSession])
 expect(failureSession.isExpandedForCoordination && !NSRunningApplication.hidden.contains(123), "later reveal retries failed unhide successfully")
 
 resetVisibilityBackend()
@@ -311,6 +324,207 @@ expect(restarted.sessions.count == 1 && NSRunningApplication.hidden.contains(123
        "startup recovery hides app once all recovered standard windows are collapsed")
 restarted.stop()
 expect(!NSRunningApplication.hidden.contains(123), "manager cleanup restores hidden app after recovery")
+
+let managedDisplays: [[String: Any]] = [
+    ["Display Identifier": "display-1", "Current Space": ["ManagedSpaceID": NSNumber(value: 1)]],
+    ["Display Identifier": "display-2", "Current Space": ["ManagedSpaceID": NSNumber(value: 2)]]
+]
+expect(TemporaryStashWindowSpaces.activeSpaces(in: managedDisplays, screenUUIDs: []) == ["display-1": 1, "display-2": 2],
+       "production Space parser keeps display UUID and current Space mapping")
+let partialDisplays = [managedDisplays[0], ["Display Identifier": "display-2"]]
+expect(TemporaryStashWindowSpaces.activeSpaces(in: partialDisplays, screenUUIDs: []) == ["display-1": 1],
+       "missing fields on one display leave that display unknown without downgrading another")
+expect(TemporaryStashWindowSpaces.activeSpaces(in: [], screenUUIDs: []) == nil
+       && TemporaryStashWindowSpaces.activeSpaces(in: [["Display Identifier": "display-1", "Current Space": [:]]], screenUUIDs: []) == nil,
+       "empty and malformed managed display samples are unknown, never an empty trusted active set")
+expect(TemporaryStashWindowSpaces.activeSpaces(in: [["Display Identifier": "Main", "Current Space": ["ManagedSpaceID": NSNumber(value: 4)]]],
+    screenUUIDs: ["display-1", "display-2"]) == ["display-1": 4, "display-2": 4],
+       "shared desktop group maps to physical displays when separate Spaces are disabled")
+
+// Deterministic asynchronous backend: request results and OS state are independent.
+resetVisibilityBackend()
+var moment = Date()
+let durable = TemporaryStashHiddenAppStore(defaults: testHiddenDefaults, bootSessionID: "test-boot")
+let asynchronous = TemporaryStashAppVisibility(store: durable, now: { moment })
+let asyncSessions = collapsedSessions(visibility: asynchronous, count: 2)
+NSRunningApplication.hideSucceeds = false
+asynchronous.reconcile(sessions: asyncSessions)
+expect(durable.load().first?.phase == "hideRequested", "hide intent is durable before OS confirmation even on false return")
+asynchronous.applicationWasUnhidden(pid: 123)
+NSRunningApplication.hidden.insert(123)
+asynchronous.applicationWasHidden(pid: 123)
+asynchronous.applicationWasHidden(pid: 123)
+expect(durable.load().first?.phase == "hiddenOwned", "old unhide during pending hide and duplicate hide notifications preserve confirmed ownership")
+cgWindows = []
+TemporaryStashWindowSpaces.active = nil
+asynchronous.spaceDidChange()
+expect(asyncSessions.allSatisfy { $0.temporaryStashTabDescriptor()?.isOnScreen == true },
+       "valid initial Space and later nil active map preserve labels despite CG absence and changed generation")
+TemporaryStashWindowSpaces.active = [2]
+expect(asyncSessions.allSatisfy { $0.temporaryStashTabDescriptor()?.isOnScreen == false },
+       "only a trusted mismatching active Space hides cached labels")
+TemporaryStashWindowSpaces.active = nil
+expect(asyncSessions.allSatisfy { $0.temporaryStashTabDescriptor()?.isOnScreen == false },
+       "unknown after trusted off-space retains the last trusted negative, not unconditional true")
+TemporaryStashWindowSpaces.active = [1]
+expect(asyncSessions.allSatisfy { $0.temporaryStashTabDescriptor()?.isOnScreen == true }, "API recovery re-evaluates cached Space without unhide")
+NSRunningApplication.unhideIsImmediate = false
+appVisibilityEvents.removeAll()
+asyncSessions[0].revealForTemporaryStashTab()
+expect(asyncSessions[0].isSnappedForCoordination && !appVisibilityEvents.contains("size")
+       && durable.load().first?.phase == "revealRequested", "unhide true but delayed preserves durable reveal intent and forbids geometry writes")
+NSRunningApplication.hidden.remove(123)
+asynchronous.applicationWasUnhidden(pid: 123)
+expect(asyncSessions[0].isExpandedForCoordination && asyncSessions[1].isSnappedForCoordination
+       && durable.load().isEmpty, "confirmed reveal resumes precisely the selected sibling and clears ownership")
+
+resetVisibilityBackend()
+var failureMoment = Date()
+let timeoutStore = TemporaryStashHiddenAppStore(defaults: testHiddenDefaults, bootSessionID: "test-boot")
+let timeoutVisibility = TemporaryStashAppVisibility(store: timeoutStore, now: { failureMoment })
+let neverHidden = collapsedSessions(visibility: timeoutVisibility)
+NSRunningApplication.hideSucceeds = false
+appVisibilityEvents.removeAll()
+timeoutVisibility.reconcile(sessions: neverHidden)
+for _ in 0..<5 {
+    failureMoment = failureMoment.addingTimeInterval(0.71)
+    timeoutVisibility.reconcile(sessions: neverHidden)
+}
+expect(appVisibilityEvents.filter { $0 == "hide:123" }.count == 3 && timeoutStore.load().isEmpty,
+       "permanently ineffective hide has three bounded attempts then releases unconfirmed ownership")
+NSRunningApplication.hidden.insert(123)
+appVisibilityEvents.removeAll()
+timeoutVisibility.restoreAll(reason: "cleanup", timeout: 0)
+expect(NSRunningApplication.hidden.contains(123) && appVisibilityEvents.isEmpty, "a later user hide is never rescued as a timed-out SideBar request")
+
+resetVisibilityBackend()
+var raceMoment = Date()
+let raceStore = TemporaryStashHiddenAppStore(defaults: testHiddenDefaults, bootSessionID: "test-boot")
+let raceVisibility = TemporaryStashAppVisibility(store: raceStore, now: { raceMoment })
+let raceSessions = collapsedSessions(visibility: raceVisibility)
+NSRunningApplication.hideIsImmediate = false
+raceVisibility.reconcile(sessions: raceSessions)
+raceSessions[0].revealForTemporaryStashTab()
+NSRunningApplication.hidden.insert(123) // Older hide completes AFTER unhide.
+raceVisibility.applicationWasHidden(pid: 123)
+expect(raceStore.load().first?.phase == "revealRequested" && raceSessions[0].isSnappedForCoordination,
+       "late hide acknowledgement cannot reverse a pending reveal or permit early geometry")
+raceMoment = raceMoment.addingTimeInterval(0.3)
+raceVisibility.reconcile(sessions: raceSessions)
+raceMoment = raceMoment.addingTimeInterval(0.6)
+raceVisibility.reconcile(sessions: raceSessions)
+expect(raceSessions[0].isExpandedForCoordination && !NSRunningApplication.hidden.contains(123),
+       "reverse hide/unhide completion converges to revealed state after bounded settling")
+
+resetVisibilityBackend()
+var falseMoment = Date()
+let falseUnhideStore = TemporaryStashHiddenAppStore(defaults: testHiddenDefaults, bootSessionID: "test-boot")
+let falseUnhide = TemporaryStashAppVisibility(store: falseUnhideStore, now: { falseMoment })
+let falseSessions = collapsedSessions(visibility: falseUnhide)
+falseUnhide.reconcile(sessions: falseSessions)
+NSRunningApplication.unhideSucceeds = false
+falseSessions[0].revealForTemporaryStashTab()
+NSRunningApplication.hidden.remove(123) // Request returned false, but OS shows later.
+falseUnhide.applicationWasUnhidden(pid: 123)
+expect(falseSessions[0].isExpandedForCoordination && falseUnhideStore.load().isEmpty,
+       "unhide false followed by actual visibility is confirmed, not treated as failure")
+
+for operation in ["cancel", "cleanup"] {
+    resetVisibilityBackend()
+    NSRunningApplication.hideIsImmediate = false
+    NSRunningApplication.unhideSucceeds = false
+    let pendingStore = TemporaryStashHiddenAppStore(defaults: testHiddenDefaults, bootSessionID: "test-boot")
+    let pending = TemporaryStashAppVisibility(store: pendingStore)
+    let session = collapsedSessions(visibility: pending)[0]
+    pending.reconcile(sessions: [session])
+    NSRunningApplication.hidden.insert(123)
+    let start = Date()
+    if operation == "cancel" { session.cancelTemporaryShortcutStash() }
+    else { session.restoreAndDestroy(); pending.restoreAll(reason: "cleanup", timeout: 0.15) }
+    expect(Date().timeIntervalSince(start) < 1.3 && pendingStore.load().first?.phase == "revealRequested",
+           "\(operation) during pending hide is bounded and retains unconfirmed rescue intent")
+    expect(!session.clearedRecovery, "\(operation) does not delete geometry rescue before unhide confirmation")
+}
+
+resetVisibilityBackend()
+let topology = TemporaryStashAppVisibility()
+let topologySessions = collapsedSessions(visibility: topology)
+topology.reconcile(sessions: topologySessions)
+TemporaryStashWindowSpaces.displays = ["display-2": 2]
+topology.spaceDidChange(topologyChanged: true)
+expect(!NSRunningApplication.hidden.contains(123), "topology invalidation restores owned app before Space rebinding")
+// Mirrors AXWindowManager's invalidation after reseating geometry on the new screen.
+topologySessions[0].temporaryStashPresence = TemporaryStashAppVisibility.capturePresence(
+    window: topologySessions[0].windowElement, pid: 123, screenID: 2)
+expect(topologySessions[0].temporaryStashPresence?.displayUUID == "display-2", "topology resample binds the new display UUID rather than a merged active set")
+
+resetVisibilityBackend()
+let identityStore = TemporaryStashHiddenAppStore(defaults: testHiddenDefaults, bootSessionID: "test-boot")
+let identityVisibility = TemporaryStashAppVisibility(store: identityStore)
+let originalProcess = collapsedSessions(visibility: identityVisibility)
+identityVisibility.reconcile(sessions: originalProcess)
+NSRunningApplication.launches[123] = Date(timeIntervalSince1970: 200)
+appVisibilityEvents.removeAll()
+identityVisibility.restore(pid: 123, reason: "cleanup")
+expect(appVisibilityEvents.isEmpty && identityStore.load().isEmpty,
+       "PID reuse is rejected before any unhide request and stale ownership is released")
+
+let ownedRecord = TemporaryStashHiddenAppRecord(pid: 123, bundleID: "same.app", launchDate: Date(timeIntervalSince1970: 100),
+    windowIDs: [12300], sessionIDs: ["window"], phase: "hiddenOwned")
+identityStore.upsert(ownedRecord)
+expect(identityStore.load() == [ownedRecord], "crash ownership archive round-trips process identity, windows, sessions and phase")
+let rebootedStore = TemporaryStashHiddenAppStore(defaults: testHiddenDefaults, bootSessionID: "another-boot")
+expect(rebootedStore.load().isEmpty, "previous boot ownership never authorizes rescue")
+expect(!ownedRecord.matches(pid: 123, bundleID: "other.app", launchDate: ownedRecord.launchDate, windowIDs: [12300])
+       && !ownedRecord.matches(pid: 123, bundleID: "same.app", launchDate: Date(timeIntervalSince1970: 200), windowIDs: [12300])
+       && !ownedRecord.matches(pid: 123, bundleID: "same.app", launchDate: ownedRecord.launchDate, windowIDs: []),
+       "rescue requires bundle, launch identity and an associated matching window")
+expect(ownedRecord.matches(pid: 123, bundleID: "same.app", launchDate: ownedRecord.launchDate, windowIDs: [12300, 999]),
+       "validated same-process surviving associated window authorizes app recovery")
+
+// Exercise the actual startup rescue method, not only the archive predicate.
+resetVisibilityBackend()
+let startupStore = TemporaryStashHiddenAppStore(defaults: testHiddenDefaults, bootSessionID: "test-boot")
+let startupProbe = RescueProbe(store: startupStore)
+let startupWindows = collapsedSessions(visibility: TemporaryStashAppVisibility())
+NSRunningApplication.hidden.insert(123)
+startupStore.upsert(ownedRecord)
+startupProbe.recoverOwnedApplications(reason: "test-crash-owned")
+expect(!NSRunningApplication.hidden.contains(123) && startupStore.load().isEmpty,
+       "startup verifies associated AX window and process before restoring persisted SideBar hide")
+NSRunningApplication.hidden.insert(123)
+appVisibilityEvents.removeAll()
+startupProbe.recoverOwnedApplications(reason: "test-user-hidden-no-ownership")
+expect(NSRunningApplication.hidden.contains(123) && appVisibilityEvents.isEmpty,
+       "startup never unhides a user-hidden app without ownership even with stashed windows")
+startupStore.upsert(ownedRecord)
+NSRunningApplication.launches[123] = Date(timeIntervalSince1970: 200)
+appVisibilityEvents.removeAll()
+startupProbe.recoverOwnedApplications(reason: "test-pid-reuse")
+expect(appVisibilityEvents.isEmpty && NSRunningApplication.hidden.contains(123),
+       "startup rejects same PID and window ID when launch identity has changed")
+NSRunningApplication.launches = [:]
+NSRunningApplication.bundles[123] = "different.app"
+startupProbe.recoverOwnedApplications(reason: "test-bundle-mismatch")
+expect(appVisibilityEvents.isEmpty && !startupProbe.candidates(pid: 123, bundle: "same.app").contains(123),
+       "both app ownership rescue and geometry rescue candidates reject wrong bundle at reused PID")
+NSRunningApplication.bundles[123] = "same.app"
+let savedWindows = applicationElements[123]!.windows
+applicationElements[123]!.windows = []
+startupProbe.recoverOwnedApplications(reason: "test-missing-window")
+expect(appVisibilityEvents.isEmpty && !startupStore.load().isEmpty, "no matching AX window means no unhide and no ownership deletion")
+applicationElements[123]!.windows = savedWindows
+NSRunningApplication.unhideSucceeds = false
+startupProbe.recoverOwnedApplications(reason: "test-unhide-not-confirmed")
+expect(NSRunningApplication.hidden.contains(123) && startupStore.load().first?.phase == "revealRequested",
+       "startup unhide failure retains durable pending transaction instead of deleting on request return")
+NSRunningApplication.unhideSucceeds = true
+startupProbe.recoverOwnedApplications(reason: "test-rescue-retry")
+expect(!NSRunningApplication.hidden.contains(123) && startupStore.load().isEmpty,
+       "retry of pending startup transaction clears only after visible confirmation")
+NSRunningApplication.launches[123] = Date(timeIntervalSince1970: 200)
+expect(!startupProbe.candidates(pid: 123, bundle: "same.app", launch: ownedRecord.launchDate).contains(123),
+       "new geometry rescue records reject PID reuse even within the same bundle")
 
 print("RESULT app-visibility checks=\(total) failures=\(failures)")
 exit(failures == 0 ? 0 : 1)

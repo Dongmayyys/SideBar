@@ -1,4 +1,12 @@
 import Foundation
+final class TestHiddenDefaults {
+    static let standard = TestHiddenDefaults()
+    private var values: [String: Data] = [:]
+    func data(forKey key: String) -> Data? { values[key] }
+    func set(_ value: Data, forKey key: String) { values[key] = value }
+    func removeObject(forKey key: String) { values[key] = nil }
+    func synchronize() {}
+}
 
 enum Clock { static var now: Double = 0 }
 struct Date: Comparable, Codable {
@@ -87,6 +95,11 @@ final class WindowSession {
                                            isOnScreen: eligible, title: temporaryStashID)
     }
     func temporaryActivationDiagnostics(activatedPID: pid_t) -> String { temporaryStashID }
+    func cancelTemporaryActivationReveal() {}
+    var focusOutside = false
+    func temporaryActivationFocusIsOutside(_ managed: [WindowSession]) -> Bool {
+        focusOutside || !isManagedByTemporaryShortcut || !managed.contains { $0.pid == pid && !$0.isExpandedForCoordination } || programmaticActivation || targetedActivation || Date() < activationSuppressionUntil
+    }
     func canRevealForTemporaryAppActivation(activatedPID: pid_t, requiresFrontmost: Bool = true) -> Bool {
         isManagedByTemporaryShortcut && !isExpandedForCoordination && activationFocused
             && !programmaticActivation && !targetedActivation && Date() >= activationSuppressionUntil

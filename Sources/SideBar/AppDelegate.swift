@@ -11,6 +11,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         let shortVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
         let buildVersion = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
+        StashDebugLog.write("startup version=\(shortVersion) build=\(buildVersion) revision=\(Bundle.main.infoDictionary?["SideBarBuildRevision"] ?? "?") pid=\(ProcessInfo.processInfo.processIdentifier) process-start=\(NSRunningApplication.current.launchDate?.description ?? "unknown")")
         print("---------------------------------------")
         print("🚀 SideBar \(shortVersion) (build \(buildVersion)) 已启动")
         print("---------------------------------------")
@@ -240,6 +241,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
     
     private func rescueHiddenWindows(reason: String) {
+        WindowRescueManager.shared.recoverOwnedApplications(reason: reason)
         guard AppConfig.shared.hasPendingWindowRescueRecords() else { return }
 
         let hiddenCount = AppConfig.shared.hiddenWindowRecords.count

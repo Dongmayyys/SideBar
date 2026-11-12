@@ -37,6 +37,8 @@ else
   if [ "$built" -ne 1 ]; then cat "$log" >&2; exit 1; fi
 fi
 cp Info.plist "$app/Contents/Info.plist"
+# Stamp only the built copy; preserve the user's source Info.plist.
+/usr/libexec/PlistBuddy -c "Add :SideBarBuildRevision string $(git rev-parse --short HEAD)-workspace" "$app/Contents/Info.plist"
 cp Sources/*.png Sources/*.icns Sources/*.svg "$app/Contents/Resources/"
 cp Sources/SettingsTabIcons/*.svg "$app/Contents/Resources/"
 cp -R Sources/Recommends "$app/Contents/Resources/"

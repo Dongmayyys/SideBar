@@ -217,6 +217,33 @@ expect(!active2.isExpandedForCoordination && active1.isExpandedForCoordination,
        "pending activation is discarded when focus changes")
 activationCoordinator.tearDownAll()
 
+// Initially unreadable AX must preserve PID intent rather than require a candidate.
+let warmingCoordinator = TemporaryStashTabCoordinator()
+let warming = WindowSession("warming")
+NSWorkspace.shared.frontmostApplication = Application(processIdentifier: 123)
+warming.activationFocused = false
+warmingCoordinator.handleAppActivation(activatedPID: 123, activationPolicy: .regular, sessions: [warming])
+expect(warmingCoordinator.pendingActivationPID == 123 && !warming.isExpandedForCoordination,
+       "initially unknown focused/main window records bounded PID activation intent")
+Clock.now += 0.12
+warming.activationFocused = true
+Timer.fireDue()
+expect(warming.isExpandedForCoordination, "AX focus becoming ready before deadline reveals without another activation notification")
+warming.isExpandedForCoordination = false
+warming.activationFocused = false
+warmingCoordinator.handleAppActivation(activatedPID: 123, activationPolicy: .regular, sessions: [warming])
+Clock.now += 1.01
+Timer.fireDue()
+expect(warmingCoordinator.pendingActivationPID == nil, "unreadable focus activation expires at bounded deadline")
+warming.activationFocused = true
+warmingCoordinator.reconcile(sessions: [warming])
+expect(!warming.isExpandedForCoordination, "AX arriving after deadline cannot revive expired intent")
+warming.focusOutside = true
+warmingCoordinator.handleAppActivation(activatedPID: 123, activationPolicy: .regular, sessions: [warming])
+expect(warmingCoordinator.pendingActivationPID == nil && !warming.isExpandedForCoordination,
+       "definite focus in an ordinary uncollected window cancels intent, never picks stale main")
+warmingCoordinator.tearDownAll()
+
 // Workspace can publish didActivate before updating frontmostApplication.
 let retryCoordinator = TemporaryStashTabCoordinator()
 let retryWindow = WindowSession("retry")
@@ -244,7 +271,7 @@ transitions.removeAll()
 retryCoordinator.handleAppActivation(activatedPID: 123, activationPolicy: .regular, sessions: [retryWindow])
 for _ in 0..<14 { Clock.now += 0.04; Timer.fireDue() }
 expect(transitions.isEmpty && Timer.all.contains { $0.valid }, "foreground wait stays pending within 0.6 seconds")
-Clock.now += 0.05
+Clock.now += 0.45
 Timer.fireDue()
 expect(transitions.isEmpty && !Timer.all.contains { $0.valid }, "foreground wait expires and clears pending request")
 NSWorkspace.shared.frontmostApplication = Application(processIdentifier: 123)
@@ -264,7 +291,7 @@ retryCoordinator.reconcile(sessions: [retryWindow])
 expect(!retryWindow.isExpandedForCoordination, "superseded activation cannot reveal after old app becomes foreground")
 
 let invalidateActivation: [(String, (WindowSession) -> Void)] = [
-    ("focus", { $0.activationFocused = false }),
+    ("focus", { $0.activationFocused = false; $0.focusOutside = true }),
     ("targeted", { $0.targetedActivation = true }),
     ("programmatic", { $0.programmaticActivation = true }),
     ("suppression", { $0.activationSuppressionUntil = Date().addingTimeInterval(10) }),
@@ -279,6 +306,7 @@ for (gate, invalidate) in invalidateActivation {
     Timer.fireDue()
     expect(!Timer.all.contains { $0.valid }, "short retry rechecks \(gate) even while waiting for foreground")
     retryWindow.activationFocused = true
+    retryWindow.focusOutside = false
     retryWindow.targetedActivation = false
     retryWindow.programmaticActivation = false
     retryWindow.activationSuppressionUntil = .distantPast
@@ -289,7 +317,7 @@ for (gate, invalidate) in invalidateActivation {
     expect(!retryWindow.isExpandedForCoordination, "restoring \(gate) cannot revive discarded activation")
 }
 
-// Once foreground is confirmed, retain the existing AX-busy retry behavior beyond the wait deadline.
+// AX-busy retry is bounded by the same 1-second PID intent deadline.
 retryWindow.canReveal = false
 retryCoordinator.handleAppActivation(activatedPID: 123, activationPolicy: .regular, sessions: [retryWindow])
 Clock.now += 0.65

@@ -1,5 +1,14 @@
 import Foundation
+final class TestHiddenDefaults {
+    static let standard = TestHiddenDefaults()
+    private var values: [String: Data] = [:]
+    func data(forKey key: String) -> Data? { values[key] }
+    func set(_ value: Data, forKey key: String) { values[key] = value }
+    func removeObject(forKey key: String) { values[key] = nil }
+    func synchronize() {}
+}
 import ApplicationServices
+let testHiddenDefaults = TestHiddenDefaults()
 
 enum StashDebugLog { static func write(_ message: String) {} }
 
@@ -33,14 +42,27 @@ enum WindowCapabilityProfiler {
     }
 }
 enum TemporaryStashWindowSpaces {
+__SPACE_PARSER__
     static var active: Set<UInt64>? = [1]
     static var memberships: [CGWindowID: Set<UInt64>] = [:]
     static var available = true
-    static func activeSpaceIDs() -> Set<UInt64>? { available ? active : nil }
+    static func spaceQueryCategory(for windowID: CGWindowID) -> String { available ? "valid" : "nil" }
+    static var displays: [String: UInt64]?
+    static func displayUUID(for screenID: UInt32) -> String? { "display-\(screenID)" }
+    static func activeSpacesByDisplay() -> [String: UInt64]? {
+        guard available else { return nil }
+        if let displays { return displays }
+        return active?.sorted().first.map { ["display-1": $0] }
+    }
     static func spaceIDs(for windowID: CGWindowID) -> Set<UInt64>? { available ? (memberships[windowID] ?? [1]) : nil }
 }
 var appVisibilityEvents: [String] = []
+final class RuntimeTrust {
+    var trusted = true
+    func evaluateTrustState(source: String) -> Bool { trusted }
+}
 enum AccessibilityRuntimeGuard {
+    static let shared = RuntimeTrust()
     static func copyAttributeValue(of element: Element, attribute: CFString, value: inout CFTypeRef?, context: String) -> AXError {
         if attribute as String == "AXWindows" {
             value = element.windows as CFTypeRef?
@@ -84,6 +106,7 @@ final class WindowAlphaManager {
     func findWindowID(for element: Element, pid: pid_t) -> CGWindowID? { element.systemWindowID ?? windowID }
 }
 var cgWindows: [[String: Any]] = []
+func testCGWindowListCopyWindowInfo(_ options: CGWindowListOption, _ relative: CGWindowID) -> Any? { cgWindows }
 final class Effect { func stopExpandEffect(closeWindow: Bool, immediate: Bool = false) {} }
 final class Panel { func orderOut(_ sender: Any?) {} }
 struct NSScreen {
@@ -108,8 +131,12 @@ final class NSRunningApplication {
     static var hidden: Set<Int32> = []
     static var hideSucceeds = true
     static var unhideSucceeds = true
+    static var unhideIsImmediate = true
+    static var pendingUnhides: Set<Int32> = []
     static var hideIsImmediate = true
     static var pendingHides: Set<Int32> = []
+    static var launches: [Int32: Date] = [:]
+    var launchDate: Date? { Self.launches[processIdentifier] ?? Date(timeIntervalSince1970: 100) }
     var isHidden: Bool { Self.hidden.contains(processIdentifier) }
     var bundleIdentifier: String? { Self.bundles[processIdentifier] ?? "same.app" }
     var isTerminated: Bool { Self.terminated.contains(processIdentifier) }
@@ -132,8 +159,10 @@ final class NSRunningApplication {
     func unhide() -> Bool {
         appVisibilityEvents.append("unhide:\(processIdentifier)")
         if Self.unhideSucceeds {
-            Self.hidden.remove(processIdentifier)
-            Self.pendingHides.remove(processIdentifier)
+            if Self.unhideIsImmediate {
+                Self.hidden.remove(processIdentifier)
+                Self.pendingHides.remove(processIdentifier)
+            } else { Self.pendingUnhides.insert(processIdentifier) }
         }
         return Self.unhideSucceeds
     }
@@ -206,6 +235,8 @@ final class Session {
     var temporaryStashSlotCapacity: Int { TemporaryStashGeometry.slotCapacity(visibleFrame: getScreenForWindow().visibleFrame) }
     var temporaryOriginalFrame: CGRect?
     var temporaryOriginalSize: CGSize?
+    var temporaryStashPresence: TemporaryStashAppVisibility.Presence?
+    var lastTemporaryDescriptorDiagnostic = ""
     weak var temporaryAppVisibility: TemporaryStashAppVisibility?
     var temporaryLastExpandedFrame: CGRect?
     var lockedWidth: CGFloat = 0

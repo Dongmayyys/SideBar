@@ -611,6 +611,8 @@ class WindowSession {
     var temporaryStashSlotCapacity: Int { TemporaryStashGeometry.slotCapacity(visibleFrame: getScreenForWindow().visibleFrame) }
     private var temporaryOriginalFrame: CGRect?
     private var temporaryOriginalSize: CGSize?
+    var temporaryStashPresence: TemporaryStashAppVisibility.Presence?
+    private var lastTemporaryDescriptorDiagnostic = ""
     weak var temporaryAppVisibility: TemporaryStashAppVisibility?
     private var temporaryLastExpandedFrame: CGRect?
     let temporaryStashID: String
@@ -3066,7 +3068,8 @@ class WindowSession {
             visibleFrame: PersistedRect(visibleFrame),
             safeRestorePosition: PersistedPoint(safeRestorePosition(for: visibleFrame)),
             displayFrame: PersistedRect(getDisplayBounds()),
-            updatedAt: Date().timeIntervalSince1970
+            updatedAt: Date().timeIntervalSince1970,
+            processLaunchDate: NSRunningApplication(processIdentifier: pid)?.launchDate
         )
         AppConfig.shared.upsertWindowRescueRecord(record)
     }
@@ -3992,6 +3995,7 @@ class WindowSession {
         snappedScreenFrame = screen.frame
         snappedDisplayBounds = bounds
         currentEdge = edge
+        temporaryStashPresence = TemporaryStashAppVisibility.capturePresence(window: windowElement, pid: pid, screenID: screen.displayID)
         guard let expanded = prepareTemporaryShortcutFrame() else { return false }
         temporaryLastExpandedFrame = expanded
         guard collapseWindow(immediate: true, triggerEffects: false) else { return false }
@@ -4038,6 +4042,7 @@ class WindowSession {
         teardownMirrorCapture()
         effectWindow.stopExpandEffect(closeWindow: true, immediate: true)
         let current = getRawWindowFrame() ?? temporaryLastExpandedFrame ?? temporaryOriginalFrame
+        var restoredGeometry = false
         if let current {
             let expanded = temporaryLastExpandedFrame
                 ?? CGRect(origin: edgeGeometry(for: current)?.expanded ?? current.origin, size: current.size)
@@ -4054,11 +4059,15 @@ class WindowSession {
                                                  size: temporaryOriginalSize,
                                                  context: "WindowSession.restoreTemporaryShortcutWindow.retry")
             }
-            if result == .success { clearTrackedWindowRecoveryState(frameHint: current) }
+            restoredGeometry = result == .success
             // 保持隐藏直到恢复位置写完，避免取消时在屏幕边缘露出一帧。
             setWindowAlpha(1, isHidden: false, frameHint: current, preserveRecoveryRecord: true)
         }
         _ = temporaryAppVisibility?.restore(pid: pid, reason: excludeWindow ? "cancel" : "session-cleanup")
+        if excludeWindow { temporaryAppVisibility?.waitForRestore(pid: pid, timeout: 0.9) }
+        if restoredGeometry, let current, temporaryAppVisibility?.restorationIsConfirmed(pid: pid) != false {
+            clearTrackedWindowRecoveryState(frameHint: current)
+        }
         state = .floating
         indicatorWindow.orderOut(nil)
         pinControlWindow.orderOut(nil)
@@ -4076,11 +4085,17 @@ class WindowSession {
         if isExpandedForCoordination && !isAnimating, let frame = getRawWindowFrame() {
             temporaryLastExpandedFrame = frame
         }
+        let fullscreen = isInFullscreenSpace(screen: screen)
+        let cached = temporaryAppVisibility?.isOnScreen(sessionID: temporaryStashID, pid: pid)
+        let raw = cached ?? isWindowOnScreen()
+        let diagnostic = "raw=\(raw) source=\(cached == nil ? "CG" : "cached-space") fullscreen=\(fullscreen) visible=\(!fullscreen && raw) screen=\(screen.displayID)"
+        if diagnostic != lastTemporaryDescriptorDiagnostic {
+            StashDebugLog.write("descriptor session=\(temporaryStashID) pid=\(pid) \(diagnostic)")
+            lastTemporaryDescriptorDiagnostic = diagnostic
+        }
         return TemporaryStashTabDescriptor(session: self, edge: currentEdge, screenID: screen.displayID,
-                                           visibleFrame: screen.visibleFrame,
-                                           isOnScreen: !isInFullscreenSpace(screen: screen)
-                                                && (temporaryAppVisibility?.isOnScreen(sessionID: temporaryStashID, pid: pid) ?? isWindowOnScreen()),
-                                           title: TemporaryStashOrdinals.title(appName: appDisplayName, ordinal: temporaryStashOrdinal))
+            visibleFrame: screen.visibleFrame, isOnScreen: !fullscreen && raw,
+            title: TemporaryStashOrdinals.title(appName: appDisplayName, ordinal: temporaryStashOrdinal))
     }
 
     /// 逐项列出 ⌘Tab/Dock 激活展开的各个门槛，供诊断日志使用。
@@ -4108,6 +4123,18 @@ class WindowSession {
         return isMainWindowOfApp()
     }
 
+    func cancelTemporaryActivationReveal() {
+        temporaryAppVisibility?.cancelPendingReveal(pid: pid, sessionID: temporaryStashID)
+    }
+
+    func temporaryActivationFocusIsOutside(_ managed: [WindowSession]) -> Bool {
+        if Date() < activationSuppressionUntil || !managed.contains(where: { $0.pid == pid && $0.isSnappedForCoordination }) { return true }
+        guard let focused = focusedWindowOfApp(),
+              !managed.contains(where: { $0.pid == pid && CFEqual($0.windowElement, focused) }) else { return false }
+        return WindowCapabilityProfiler.profile(of: focused, bundleID: bundleID,
+            context: "WindowSession.activation-other-focus").isStandardWindow
+    }
+
     static func shouldIgnoreTemporaryAppActivation(activatedPID: pid_t) -> Bool {
         cleanupRegistry()
         return targetedActivationByPID[activatedPID] != nil
@@ -4130,14 +4157,19 @@ class WindowSession {
         if isTemporarilyPinned { return true }
         if !isExpandedForCoordination { return !isAnimating }
         invalidatePendingFocusRelease()
+        temporaryStashPresence = TemporaryStashAppVisibility.capturePresence(window: windowElement, pid: pid,
+            screenID: getScreenForWindow().displayID)
         return collapseWindow(immediate: true, triggerEffects: false)
     }
 
     func revealForTemporaryStashTab(isAppActivated: Bool = false) {
         guard isTemporaryShortcutManaged, !isAnimating, isSnappedForCoordination,
-              temporaryAppVisibility?.prepareToReveal(pid: pid) != false,
+              temporaryAppVisibility?.prepareToReveal(pid: pid, sessionID: temporaryStashID, onReady: { [weak self] in
+                  self?.revealForTemporaryStashTab(isAppActivated: isAppActivated)
+              }) != false,
               let frame = prepareTemporaryShortcutFrame() else {
-            StashDebugLog.write("reveal skipped \(bundleID) id=\(temporaryStashID.prefix(8)) appActivated=\(isAppActivated) \(debugStateSummary)")
+            // App request/confirmation transitions are logged by the visibility
+            // manager; polling a pending reveal must not flood the log.
             return
         }
         StashDebugLog.write("reveal \(bundleID) id=\(temporaryStashID.prefix(8)) appActivated=\(isAppActivated)")

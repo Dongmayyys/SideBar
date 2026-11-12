@@ -94,7 +94,7 @@ final class NSWorkspace { static let shared = NSWorkspace(); var frontmostApplic
 @discardableResult func axSetBoolAttribute(on element: AXUIElement, attribute: CFString, value: Bool, context: String) -> Bool { true }
 struct Pins { let safeRect: CGRect }
 final class TemporaryStashAppVisibility {
-    func prepareToReveal(pid: pid_t) -> Bool { true }
+    func prepareToReveal(pid: pid_t, sessionID: String, onReady: @escaping () -> Void) -> Bool { true }
 }
 
 __SNAP_STATE__

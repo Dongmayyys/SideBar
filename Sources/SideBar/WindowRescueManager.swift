@@ -5,6 +5,45 @@ final class WindowRescueManager {
     static let shared = WindowRescueManager()
 
     private init() {}
+    private let hiddenAppStore = TemporaryStashHiddenAppStore()
+
+    /// Validate both process identity and an associated AX window before any
+    /// unhide. An unconfirmed transaction remains durable for the next attempt.
+    func recoverOwnedApplications(reason: String) {
+        let records = hiddenAppStore.load()
+        StashDebugLog.write("rescue apps begin reason=\(reason) records=\(records.count)")
+        guard AccessibilityRuntimeGuard.shared.evaluateTrustState(source: "app-rescue-\(reason)") else { return }
+        for record in records {
+            guard let app = NSRunningApplication(processIdentifier: record.pid), !app.isTerminated,
+                  let windows = standardWindows(in: AXUIElementCreateApplication(record.pid)) else { continue }
+            let ids = Set(windows.compactMap { WindowAlphaManager.shared.findWindowID(for: $0, pid: record.pid) })
+            guard record.matches(pid: app.processIdentifier, bundleID: app.bundleIdentifier,
+                                 launchDate: app.launchDate, windowIDs: ids) else {
+                StashDebugLog.write("rescue app rejected pid=\(record.pid) reason=identity-or-window-mismatch")
+                continue
+            }
+            let pendingHide = record.phase == "hideRequested"
+            var transaction = record
+            transaction.phase = "revealRequested"
+            hiddenAppStore.upsert(transaction)
+            let start = Date()
+            let settle = start.addingTimeInterval(pendingHide ? 0.8 : 0)
+            let deadline = start.addingTimeInterval(1.2)
+            repeat {
+                let before = app.isHidden
+                let accepted = app.unhide()
+                StashDebugLog.write("rescue unhide pid=\(record.pid) identity=\(record.launchDate) ownership=\(record.phase) accepted=\(accepted) before=\(before) after=\(app.isHidden)")
+                if !app.isHidden && Date() >= settle { break }
+                RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+            } while Date() < deadline
+            if !app.isHidden && Date() >= settle {
+                hiddenAppStore.remove(pid: record.pid)
+                StashDebugLog.write("rescue app confirmed pid=\(record.pid) delete=visible-and-identity-matched")
+            } else {
+                StashDebugLog.write("rescue app pending pid=\(record.pid) reason=confirmation-timeout ownership-retained=true")
+            }
+        }
+    }
 
     func revealPendingWindowsWithoutAccessibility(reason: String) {
         let structuredWindowIDs = AppConfig.shared.windowRescueRecords.map(\.windowID)
@@ -50,15 +89,13 @@ final class WindowRescueManager {
     }
 
     private func recoverStructuredRecord(_ record: WindowRescueRecord) -> Bool {
-        WindowAlphaManager.shared.setAlpha(for: record.windowID, alpha: 1.0)
-
         for pid in candidatePIDs(for: record) {
-            if let app = NSRunningApplication(processIdentifier: pid), app.isHidden {
-                app.unhide()
-            }
-
             let appElement = AXUIElementCreateApplication(pid)
-            guard let match = matchWindow(in: appElement, pid: pid, record: record) else { continue }
+            guard let match = matchWindow(in: appElement, pid: pid, record: record),
+                  let app = NSRunningApplication(processIdentifier: pid), !app.isHidden else {
+                StashDebugLog.write("rescue geometry pending pid=\(pid) window=\(record.windowID) reason=window-unmatched-or-app-hidden ownership-required=true")
+                continue
+            }
 
             let targetFrame = normalizedRestoreFrame(for: record, currentFrame: match.frame)
             let relatedWindowIDs = WindowAlphaManager.shared.findRelatedWindowIDs(
@@ -83,13 +120,15 @@ final class WindowRescueManager {
                 context: "WindowRescueManager.recoverStructuredRecord.position"
             )
 
-            guard positionResult == .success || sizeResult == .success else { continue }
+            StashDebugLog.write("rescue geometry pid=\(pid) window=\(match.windowID) position=\(positionResult.rawValue) size=\(sizeResult.rawValue) hidden=\(app.isHidden)")
+            guard positionResult == .success && sizeResult == .success && !app.isHidden else { continue }
 
             AppConfig.shared.removeWindowRescueRecord(pid: record.pid, windowID: record.windowID)
             AppConfig.shared.removeHiddenWindowRecord(pid: record.pid, windowID: record.windowID)
             if pid != record.pid {
                 AppConfig.shared.removeHiddenWindowRecord(pid: pid, windowID: match.windowID)
             }
+            StashDebugLog.write("rescue window confirmed pid=\(pid) window=\(match.windowID) delete=geometry-and-visible")
             return true
         }
 
@@ -97,16 +136,12 @@ final class WindowRescueManager {
     }
 
     private func recoverLegacyRecord(pid: pid_t, windowID: UInt32) -> Bool {
-        WindowAlphaManager.shared.setAlpha(for: windowID, alpha: 1.0)
-
         guard let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated else {
             return false
         }
 
-        if app.isHidden {
-            app.unhide()
-        }
-
+        // A legacy geometry record grants no application hide ownership.
+        guard !app.isHidden else { return false }
         let appElement = AXUIElementCreateApplication(pid)
         guard let match = exactWindowMatch(in: appElement, pid: pid, windowID: windowID),
               let inferred = inferLegacyRestoreFrame(from: match.frame) else {
@@ -124,10 +159,12 @@ final class WindowRescueManager {
             context: "WindowRescueManager.recoverLegacyRecord.position"
         )
 
-        guard positionResult == .success || sizeResult == .success else {
+        guard positionResult == .success && sizeResult == .success && !app.isHidden else {
             return false
         }
 
+        WindowAlphaManager.shared.setAlpha(for: windowID, alpha: 1.0)
+        StashDebugLog.write("rescue legacy confirmed pid=\(pid) window=\(windowID) delete=geometry-and-visible")
         AppConfig.shared.removeHiddenWindowRecord(pid: pid, windowID: windowID)
         return true
     }
@@ -135,12 +172,15 @@ final class WindowRescueManager {
     private func candidatePIDs(for record: WindowRescueRecord) -> [pid_t] {
         var result: [pid_t] = []
 
-        if let app = NSRunningApplication(processIdentifier: record.pid), !app.isTerminated {
+        if let app = NSRunningApplication(processIdentifier: record.pid), !app.isTerminated,
+           app.bundleIdentifier == record.bundleID,
+           record.processLaunchDate == nil || record.processLaunchDate == app.launchDate {
             result.append(record.pid)
         }
 
         let bundleMatches = NSWorkspace.shared.runningApplications.compactMap { app -> pid_t? in
-            guard app.bundleIdentifier == record.bundleID, !app.isTerminated else { return nil }
+            guard app.bundleIdentifier == record.bundleID, !app.isTerminated,
+                  record.processLaunchDate == nil || record.processLaunchDate == app.launchDate else { return nil }
             return app.processIdentifier
         }
 
@@ -157,7 +197,7 @@ final class WindowRescueManager {
         var fallback: WindowMatch?
         for window in windows {
             guard let frame = frame(of: window) else { continue }
-            let windowID = WindowAlphaManager.shared.findWindowID(for: window, pid: pid) ?? record.windowID
+            guard let windowID = WindowAlphaManager.shared.findWindowID(for: window, pid: pid) else { continue }
 
             if windowID == record.windowID {
                 return WindowMatch(element: window, windowID: windowID, frame: frame)

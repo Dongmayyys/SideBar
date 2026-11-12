@@ -57,6 +57,7 @@ final class TemporaryStashTabCoordinator {
 
     private var panels: [ObjectIdentifier: TemporaryStashTabWindow] = [:]
     private var visibility: [ObjectIdentifier: TemporaryStashVisibility] = [:]
+    private var descriptorVisibility: [ObjectIdentifier: Bool] = [:]
     private var layoutFrames: [ObjectIdentifier: CGRect] = [:]
     private var drag: Drag?
     private var sessions: [WindowSession] = []
@@ -66,10 +67,13 @@ final class TemporaryStashTabCoordinator {
     private var hoverTimer: Timer?
     private var hoverSuppressedUntilExit: Set<ObjectIdentifier> = []
     private weak var pendingAppActivation: WindowSession?
-    var pendingActivationPID: pid_t? { pendingAppActivation?.pid }
-    // 只限制等待 Workspace 前台更新的时间；前台到位后的 AX 忙沿用原有重试。
+    private(set) var pendingActivationPID: pid_t?
+    private var activationWasFrontmost = false
+    var visiblePanelCount: Int { layoutFrames.count }
+    // PID intent survives initially unreadable AX focus, but always has a deadline.
     private var appActivationDeadline: Date?
     private var appActivationRetryTimer: Timer?
+    private var lastActivationDiagnostic = ""
     private var recentExpandedIDs: [String] = []
 
     func rememberExpansion(of session: WindowSession) {
@@ -127,13 +131,9 @@ final class TemporaryStashTabCoordinator {
             StashDebugLog.write("activation pid=\(activatedPID)")
             candidates.forEach { StashDebugLog.write("  candidate \($0.temporaryActivationDiagnostics(activatedPID: activatedPID))") }
         }
-        // 激活通知先于 frontmostApplication 更新时，仍记录满足其他门槛的目标。
-        pendingAppActivation = sessions.first {
-            $0.canRevealForTemporaryAppActivation(activatedPID: activatedPID, requiresFrontmost: false)
-        }
-        if !candidates.isEmpty { StashDebugLog.write("  pending=\(pendingAppActivation.map { "\($0.temporaryStashID.prefix(8))" } ?? "none")") }
-        guard pendingAppActivation != nil else { return }
-        appActivationDeadline = Date().addingTimeInterval(0.6)
+        guard !candidates.isEmpty else { return }
+        pendingActivationPID = activatedPID
+        appActivationDeadline = Date().addingTimeInterval(1)
         resetHover()
         reconcile(sessions: sessions)
     }
@@ -154,17 +154,22 @@ final class TemporaryStashTabCoordinator {
         let liveIDs = Set(self.sessions.map(\.temporaryStashID))
         recentExpandedIDs.removeAll { !liveIDs.contains($0) }
         let now = Date()
-        if let pending = pendingAppActivation {
-            let isFrontmost = NSWorkspace.shared.frontmostApplication?.processIdentifier == pending.pid
-            let waitExpired = appActivationDeadline.map { now >= $0 } ?? true
-            if !self.sessions.contains(where: { $0 === pending })
-                || !pending.canRevealForTemporaryAppActivation(activatedPID: pending.pid, requiresFrontmost: false)
-                || (!isFrontmost && waitExpired) {
-                StashDebugLog.write("  pending dropped \(pending.temporaryActivationDiagnostics(activatedPID: pending.pid))")
+        if let pid = pendingActivationPID {
+            let candidates = self.sessions.filter { $0.pid == pid }
+            let isFrontmost = NSWorkspace.shared.frontmostApplication?.processIdentifier == pid
+            let expired = appActivationDeadline.map { now >= $0 } ?? true
+            if expired || candidates.isEmpty || (activationWasFrontmost && !isFrontmost)
+                || candidates.first?.temporaryActivationFocusIsOutside(self.sessions) == true
+                || WindowSession.shouldIgnoreTemporaryAppActivation(activatedPID: pid) {
+                StashDebugLog.write("activation dropped pid=\(pid) expired=\(expired) frontmost=\(isFrontmost) reason=deadline-or-focus-or-superseded")
                 resetAppActivation()
-            } else if isFrontmost {
-                // 此后前台若转走就放弃，不再把它视作 Workspace 更新延迟。
-                appActivationDeadline = nil
+            } else {
+                activationWasFrontmost = activationWasFrontmost || isFrontmost
+                let selected = candidates.first {
+                    $0.canRevealForTemporaryAppActivation(activatedPID: pid, requiresFrontmost: false)
+                }
+                if pendingAppActivation !== selected { pendingAppActivation?.cancelTemporaryActivationReveal() }
+                pendingAppActivation = selected
             }
         }
         // 面板在按住期间离屏/关闭时可能丢失 mouseUp，由轮询补齐松手收尾。
@@ -175,8 +180,10 @@ final class TemporaryStashTabCoordinator {
         let managedIDs = Set(self.sessions.map(ObjectIdentifier.init))
         // 只有离开管理才销毁；切换 Space、全屏遮挡或 AX 暂时读不到都保留面板和顺序。
         for id in Array(panels.keys) where !managedIDs.contains(id) {
+            StashDebugLog.write("panel close id=\(id) reason=session-ended")
             panels.removeValue(forKey: id)?.close()
             visibility[id] = nil
+            descriptorVisibility[id] = nil
         }
         // Waiting records reserve slots without creating panels or hit targets.
         let stableIDs = Set(self.sessions.map(\.temporaryStashID))
@@ -197,8 +204,13 @@ final class TemporaryStashTabCoordinator {
 
         let visible = descriptors.filter { descriptor in
             let id = ObjectIdentifier(descriptor.session)
-            return visibility[id, default: TemporaryStashVisibility()].isVisible(
+            let visible = visibility[id, default: TemporaryStashVisibility()].isVisible(
                 isOnScreen: descriptor.isOnScreen, now: now.timeIntervalSinceReferenceDate)
+            if descriptorVisibility[id] != visible {
+                StashDebugLog.write("descriptor debounce session=\(descriptor.session.temporaryStashID) raw=\(descriptor.isOnScreen) final=\(visible)")
+                descriptorVisibility[id] = visible
+            }
+            return visible
         }
         let previousFrames = layoutFrames
         layoutFrames.removeAll()
@@ -208,7 +220,12 @@ final class TemporaryStashTabCoordinator {
                                                                visibleFrame: descriptor.visibleFrame) else { continue }
             layoutFrames[ObjectIdentifier(descriptor.session)] = frame
         }
-        for (id, panel) in panels where layoutFrames[id] == nil { panel.orderOut(nil) }
+        for (id, panel) in panels where layoutFrames[id] == nil {
+            let descriptor = descriptors.first { ObjectIdentifier($0.session) == id }
+            let reason = descriptor == nil ? "descriptor-missing-or-no-screen" : (descriptor?.isOnScreen == false ? "off-space-or-fullscreen" : "no-slot")
+            if previousFrames[id] != nil { StashDebugLog.write("panel orderOut id=\(id) session=\(descriptor?.session.temporaryStashID ?? "unknown") reason=\(reason)") }
+            panel.orderOut(nil)
+        }
         // 成员或屏幕几何变化时取消本次拖动，避免用过期的列范围插入。
         if let current = drag,
            previousFrames != layoutFrames || current.assignments != assignments
@@ -251,11 +268,16 @@ final class TemporaryStashTabCoordinator {
             if pending.canRevealForTemporaryAppActivation(activatedPID: pending.pid) {
                 let target = visible.first(where: { $0.session === pending })
                 let activated = target.map { activate($0, among: visible, isAppActivated: true) } ?? false
-                StashDebugLog.write("  pending activate visible=\(target != nil) result=\(activated)")
+                let diagnostic = "pid=\(pending.pid) session=\(pending.temporaryStashID) visible=\(target != nil) result=\(activated)"
+                if lastActivationDiagnostic != diagnostic {
+                    StashDebugLog.write("activation pending \(diagnostic)")
+                    lastActivationDiagnostic = diagnostic
+                }
                 if activated { resetAppActivation() }
             }
             return
         }
+        if pendingActivationPID != nil { return }
         guard let hovered, !hoverSuppressedUntilExit.contains(ObjectIdentifier(hovered.session)) else { return }
         let remaining = Double(AppConfig.shared.hoverDelayMS) / 1000 - now.timeIntervalSince(hoverBeganAt)
         if remaining <= 0 {
@@ -342,14 +364,18 @@ final class TemporaryStashTabCoordinator {
     }
 
     private func resetAppActivation() {
+        pendingAppActivation?.cancelTemporaryActivationReveal()
         appActivationRetryTimer?.invalidate()
         appActivationRetryTimer = nil
         pendingAppActivation = nil
+        pendingActivationPID = nil
+        lastActivationDiagnostic = ""
+        activationWasFrontmost = false
         appActivationDeadline = nil
     }
 
     private func scheduleAppActivationRetry() {
-        guard pendingAppActivation != nil else {
+        guard pendingActivationPID != nil else {
             resetAppActivation()
             return
         }
@@ -365,6 +391,7 @@ final class TemporaryStashTabCoordinator {
 
     private func activate(_ target: TemporaryStashTabDescriptor, among descriptors: [TemporaryStashTabDescriptor], isAppActivated: Bool = false, waitForInteraction: Bool = false) -> Bool {
         let siblings = descriptors.filter { EdgeKey($0) == EdgeKey(target) && $0.session !== target.session }
+        for sibling in siblings { sibling.session.cancelTemporaryActivationReveal() }
         for sibling in siblings where sibling.session.isExpandedForCoordination {
             if !sibling.session.hideForTemporaryStashTab() { return false }
         }
@@ -378,6 +405,7 @@ final class TemporaryStashTabCoordinator {
     }
 
     func tearDownAll() {
+        if !panels.isEmpty { StashDebugLog.write("panel close-all count=\(panels.count) reason=teardown") }
         panels.values.forEach { $0.close() }
         panels.removeAll()
         assignments.removeAll()
@@ -385,6 +413,7 @@ final class TemporaryStashTabCoordinator {
         slotPanels.values.forEach { $0.close() }
         slotPanels.removeAll()
         visibility.removeAll()
+        descriptorVisibility.removeAll()
         layoutFrames.removeAll()
         hoverSuppressedUntilExit.removeAll()
         sessions.removeAll()

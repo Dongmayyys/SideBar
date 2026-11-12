@@ -17,6 +17,8 @@ class AXWindowManager {
     private var bundleLastExpandedSessions: [String: ObjectIdentifier] = [:]
     private var bundleLastSnappedSessions: [String: ObjectIdentifier] = [:]
     private var hasCleanedUp = false
+    private var lastReconcileAt = Date.distantPast
+    private var lastHeartbeatAt = Date.distantPast
     // 保留每个软件最后的普通焦点窗口；刚收纳该窗口时可回退到此前的主界面。
     private var mainInterfaceHistory: [(app: NSRunningApplication, window: AXUIElement)] = []
 
@@ -223,7 +225,7 @@ class AXWindowManager {
     /// 找不到对应新屏时才退化为"复位到主屏可见区域 + 状态机降级为 floating"的安全兜底。
     /// 同时让融合条按新的屏幕几何重新组装，避免快照条出现在"幽灵屏幕"的坐标上。
     @objc private func handleScreenParametersChanged() {
-        temporaryAppVisibility.spaceDidChange()
+        temporaryAppVisibility.spaceDidChange(topologyChanged: true)
         let activeScreens = NSScreen.screens
         var reseated = 0
         var recovered = 0
@@ -239,6 +241,7 @@ class AXWindowManager {
                 recovered += 1
             }
         }
+        for session in sessions { session.temporaryStashPresence = nil }
         if reseated + recovered > 0 {
             print("🖥️ 检测到屏幕配置变化: reseat=\(reseated), recover=\(recovered)")
         }
@@ -655,10 +658,25 @@ class AXWindowManager {
     }
 
     private func reconcileIndicators() {
+        guard !hasCleanedUp else { return }
+        let start = Date()
+        let gap = start.timeIntervalSince(lastReconcileAt)
         fusionCoordinator.reconcile(sessions: sessions.filter { !$0.isManagedByTemporaryShortcut })
+        let fusionEnd = Date()
         persistTemporaryRecovery()
+        let persistenceEnd = Date()
         temporaryAppVisibility.reconcile(sessions: sessions, activatingPID: temporaryTabCoordinator.pendingActivationPID)
+        let appEnd = Date()
         temporaryTabCoordinator.reconcile(sessions: sessions)
+        let end = Date()
+        lastReconcileAt = end
+        if end.timeIntervalSince(start) > 0.1 {
+            StashDebugLog.write("reconcile slow totalMS=\(end.timeIntervalSince(start) * 1000) fusionMS=\(fusionEnd.timeIntervalSince(start) * 1000) persistenceMS=\(persistenceEnd.timeIntervalSince(fusionEnd) * 1000) appMS=\(appEnd.timeIntervalSince(persistenceEnd) * 1000) panelsMS=\(end.timeIntervalSince(appEnd) * 1000)")
+        }
+        if end.timeIntervalSince(lastHeartbeatAt) >= 10 {
+            StashDebugLog.write("heartbeat sessions=\(sessions.count) \(temporaryAppVisibility.diagnosticSummary) visible-panels=\(temporaryTabCoordinator.visiblePanelCount) last-reconcile=\(end) gapMS=\(gap * 1000)")
+            lastHeartbeatAt = end
+        }
     }
 
     private func persistTemporaryRecovery() {

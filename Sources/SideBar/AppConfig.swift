@@ -57,6 +57,7 @@ struct WindowRescueRecord: Codable, Equatable {
     var safeRestorePosition: PersistedPoint
     var displayFrame: PersistedRect
     var updatedAt: TimeInterval
+    var processLaunchDate: Date? = nil
 }
 
 enum DockAvoidanceMode: String, CaseIterable {

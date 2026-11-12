@@ -1,0 +1,15 @@
+// Compile production app-rescue and candidate-PID methods with in-memory AX/apps.
+final class RescueProbe {
+    struct WindowRescueRecord {
+        let pid: pid_t
+        let bundleID: String
+        var processLaunchDate: Date?
+    }
+    private let hiddenAppStore: TemporaryStashHiddenAppStore
+    init(store: TemporaryStashHiddenAppStore) { hiddenAppStore = store }
+    private func standardWindows(in app: Element) -> [Element]? { app.windows?.filter(\.standard) }
+    func candidates(pid: pid_t, bundle: String, launch: Date? = nil) -> [pid_t] {
+        candidatePIDs(for: WindowRescueRecord(pid: pid, bundleID: bundle, processLaunchDate: launch))
+    }
+__RESCUE_METHODS__
+}

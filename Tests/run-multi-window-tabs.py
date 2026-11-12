@@ -19,7 +19,7 @@ for name in ['recordMainInterfaceActivation', 'handleMainInterfaceShortcut', 'ha
     main_methods.append(matches[0].group())
 fixture = (repo / 'Tests/TemporaryStashHarness.swift.txt').read_text()
 fixture = fixture.replace('__MAIN_INTERFACE_METHODS__', '\n\n'.join(main_methods))
-fixture += '\n' + (source / 'TemporaryStashRecovery.swift').read_text()
+fixture += '\n' + (source / 'TemporaryStashRecovery.swift').read_text().replace('Foundation.UserDefaults', 'TestHiddenDefaults')
 fixture += '\n' + (source / 'TemporaryStashLogic.swift').read_text() + '\n' + coordinator
 fixture += '\n' + (repo / 'Tests/TemporaryStashTests.swift.txt').read_text()
 output = repo / 'build/tests/multi-window-tabs'
@@ -43,24 +43,27 @@ for name in ['snappedScreenIsStale', 'reseatTemporaryShortcutGeometry', 'startTe
              'finishTemporaryShortcutSession', 'hideForTemporaryStashTab', 'revealForTemporaryStashTab', 'focusForTemporaryStashTab',
              'restoreAndDestroy', 'handleDestroyed', 'handleMouseUp', 'suspendForAccessibilityLoss', 'isDetachedFromManagedEdge',
              'relinquishToDockMinimizeIfDetachedFromEdge', 'prepareTemporaryShortcutFrame', 'edgeGeometry', 'getWindowFrame',
-             'canRevealForTemporaryAppActivation', 'beginTargetedActivationWindow',
+             'canRevealForTemporaryAppActivation', 'temporaryActivationFocusIsOutside', 'cancelTemporaryActivationReveal', 'beginTargetedActivationWindow',
              'shouldIgnoreTemporaryAppActivation', 'hideForTemporaryAppActivation',
              'setWindowPosition', 'setWindowPositionWithoutSystemAnimation',
              'temporaryStashTabDescriptor', 'temporaryStashRecoveryRecord', 'clampFrameYToBounds', 'isWindowOnScreen', 'animateWindowPositionFast']:
     matches = list(re.finditer(r'(?:    @discardableResult\n)?    (?:private )?(?:static )?func ' + name + r'\(.*?\n    }', session_source, re.S))
     if len(matches) != 1:
         sys.exit(f'Expected exactly one production method: {name}')
-    methods.append(matches[0].group())
+    methods.append(matches[0].group().replace('[WindowSession]', '[Session]'))
 state = re.search(r'enum SnapState:.*?\n}', session_source, re.S).group()
 session_fixture = (repo / 'Tests/TemporaryStashSessionHarness.swift.txt').read_text()
 session_fixture = session_fixture.replace('__SNAP_STATE__', state).replace('__METHODS__', '\n\n'.join(methods))
+space_source = (source / 'TemporaryStashAppVisibility.swift').read_text()
+space_parser = re.search(r'    static func activeSpaces\(in .*?\n    }', space_source, re.S).group()
+session_fixture = session_fixture.replace('__SPACE_PARSER__', space_parser)
 descriptor = coordinator[coordinator.index('struct TemporaryStashTabDescriptor'):coordinator.index('enum TemporaryStashTabEvent')]
 session_fixture += '\n' + descriptor.replace('WindowSession', 'Session')
-session_fixture += '\n' + (source / 'TemporaryStashRecovery.swift').read_text()
+session_fixture += '\n' + (source / 'TemporaryStashRecovery.swift').read_text().replace('Foundation.UserDefaults', 'TestHiddenDefaults')
 session_fixture += '\n' + (source / 'TemporaryStashLogic.swift').read_text()
 visibility_source = (source / 'TemporaryStashAppVisibility.swift').read_text()
 visibility_class = visibility_source[visibility_source.index('final class TemporaryStashAppVisibility'):]
-session_fixture += '\n' + visibility_class.replace('WindowSession', 'Session')
+session_fixture += '\n' + visibility_class.replace('WindowSession', 'Session').replace('CGWindowListCopyWindowInfo', 'testCGWindowListCopyWindowInfo').replace('TemporaryStashHiddenAppStore()', 'TemporaryStashHiddenAppStore(defaults: testHiddenDefaults)')
 session_base = session_fixture
 session_fixture += '\n' + (repo / 'Tests/TemporaryStashSessionTests.swift.txt').read_text()
 # Top-level Swift statements require a main.swift when compiling an executable.
@@ -117,6 +120,16 @@ if result.returncode:
 
 # Exercise the production visibility coordinator and session/recovery entry points.
 visibility_fixture = session_base + '\n' + recovery_harness
+rescue_source = (source / 'WindowRescueManager.swift').read_text()
+rescue_methods = []
+for name in ['recoverOwnedApplications', 'candidatePIDs']:
+    match = re.search(r'    (?:private )?func ' + name + r'\(.*?\n    }', rescue_source, re.S)
+    if match is None:
+        sys.exit(f'Missing production rescue method: {name}')
+    rescue_methods.append(match.group().replace('AXUIElementCreateApplication', 'testApplicationElement'))
+rescue_fixture = (repo / 'Tests/TemporaryStashRescueHarness.swift.txt').read_text()
+rescue_fixture = rescue_fixture.replace('__RESCUE_METHODS__', '\n\n'.join(rescue_methods))
+visibility_fixture += '\n' + rescue_fixture
 visibility_fixture += '\n' + (repo / 'Tests/TemporaryStashAppVisibilityTests.swift.txt').read_text()
 visibility_output = output / 'app-visibility'
 visibility_output.mkdir(exist_ok=True)

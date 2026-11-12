@@ -74,7 +74,7 @@ enum UpdateCheckFrequency: Int, CaseIterable {
 
 class AppConfig: ObservableObject {
     static let shared = AppConfig()
-    static let defaultHoverTolerance: CGFloat = 60
+    static let defaultHoverTolerance: CGFloat = 0
     static let maxHoverToleranceX: CGFloat = 400
     static let maxHoverToleranceY: CGFloat = 400
     private var temporaryDockMinimizeExcludedBundleIDs: Set<String> = []
@@ -119,7 +119,7 @@ class AppConfig: ObservableObject {
         }
     }
     
-    @Published var hoverTolerance: CGFloat = 60 {
+    @Published var hoverTolerance: CGFloat = AppConfig.defaultHoverTolerance {
         didSet {
             let clamped = Self.clamp(hoverTolerance, max: Self.maxHoverToleranceX)
             if hoverTolerance != clamped {
@@ -131,7 +131,7 @@ class AppConfig: ObservableObject {
         }
     }
     
-    @Published var hoverToleranceY: CGFloat = 60 {
+    @Published var hoverToleranceY: CGFloat = AppConfig.defaultHoverTolerance {
         didSet {
             let clamped = Self.clamp(hoverToleranceY, max: Self.maxHoverToleranceY)
             if hoverToleranceY != clamped {
@@ -261,14 +261,13 @@ class AppConfig: ObservableObject {
             self.windowRescueRecords = []
         }
         
-        let savedTolerance = CGFloat(UserDefaults.standard.float(forKey: "SideBarHoverTolerance"))
-        self.hoverTolerance = savedTolerance > 0
-            ? Self.clamp(savedTolerance, max: Self.maxHoverToleranceX)
+        // 容差同样用 object(forKey:) 区分「未配置」与「显式配置为 0」，否则保存的 0 会在重启后变回默认值。
+        self.hoverTolerance = UserDefaults.standard.object(forKey: "SideBarHoverTolerance") != nil
+            ? Self.clamp(CGFloat(UserDefaults.standard.float(forKey: "SideBarHoverTolerance")), max: Self.maxHoverToleranceX)
             : Self.defaultHoverTolerance
-        
-        let savedToleranceY = CGFloat(UserDefaults.standard.float(forKey: "SideBarHoverToleranceY"))
-        self.hoverToleranceY = savedToleranceY > 0
-            ? Self.clamp(savedToleranceY, max: Self.maxHoverToleranceY)
+
+        self.hoverToleranceY = UserDefaults.standard.object(forKey: "SideBarHoverToleranceY") != nil
+            ? Self.clamp(CGFloat(UserDefaults.standard.float(forKey: "SideBarHoverToleranceY")), max: Self.maxHoverToleranceY)
             : Self.defaultHoverTolerance
         
         // 注意：UserDefaults.integer 在键不存在时会返回 0，因此用 object(forKey:) 区分

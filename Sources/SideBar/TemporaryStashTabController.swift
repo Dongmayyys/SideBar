@@ -35,6 +35,33 @@ final class TemporaryStashTabCoordinator {
         var cancelled = false
     }
 
+    var onOrderChanged: (() -> Void)?
+    private var recoveryOrder: [TemporaryStashTabOrder] = []
+    private var recoveryRanks: [String: Int] = [:]
+    private var restoringIDs: Set<ObjectIdentifier> = []
+
+    func restoreOrder(_ orders: [TemporaryStashTabOrder]) {
+        recoveryOrder = orders
+        // Retain source-column ranks when a missing display/blocked edge moves a
+        // restored window to another column, including windows arriving on retry.
+        for id in orders.flatMap(\.ids) where recoveryRanks[id] == nil {
+            recoveryRanks[id] = recoveryRanks.count
+        }
+    }
+
+    func suppressRestoredHover(for session: WindowSession) {
+        // Restoring under a stationary pointer must not immediately reveal/focus it.
+        restoringIDs.insert(ObjectIdentifier(session))
+        hoverSuppressedUntilExit.insert(ObjectIdentifier(session))
+    }
+
+    func snapshotOrder() -> [TemporaryStashTabOrder] {
+        let stableIDs = Dictionary(uniqueKeysWithValues: sessions.map { (ObjectIdentifier($0), $0.temporaryStashID) })
+        return order.map { key, ids in
+            TemporaryStashTabOrder(screenID: key.screenID, edge: key.edge, ids: ids.compactMap { stableIDs[$0] })
+        }.sorted { ($0.screenID, $0.edge) < ($1.screenID, $1.edge) }
+    }
+
     private var panels: [ObjectIdentifier: TemporaryStashTabWindow] = [:]
     private var order: [EdgeKey: [ObjectIdentifier]] = [:]
     private var visibility: [ObjectIdentifier: TemporaryStashVisibility] = [:]
@@ -131,7 +158,17 @@ final class TemporaryStashTabCoordinator {
         for descriptor in descriptors {
             let key = EdgeKey(descriptor)
             let id = ObjectIdentifier(descriptor.session)
-            if !order[key, default: []].contains(id) { order[key, default: []].append(id) }
+            if !order[key, default: []].contains(id) {
+                let saved = recoveryOrder.first { $0.screenID == key.screenID && $0.edge == key.edge }?.ids ?? []
+                let isRestoring = restoringIDs.remove(id) != nil
+                let ranks = isRestoring ? recoveryRanks : Dictionary(saved.enumerated().map { ($0.element, $0.offset) }, uniquingKeysWith: { first, _ in first })
+                let rank = ranks[descriptor.session.temporaryStashID] ?? Int.max
+                let insertion = order[key, default: []].firstIndex { existing in
+                    guard let session = self.sessions.first(where: { ObjectIdentifier($0) == existing }) else { return false }
+                    return (ranks[session.temporaryStashID] ?? Int.max) > rank
+                } ?? order[key, default: []].count
+                order[key, default: []].insert(id, at: insertion)
+            }
         }
 
         let visible = descriptors.filter { descriptor in
@@ -245,10 +282,15 @@ final class TemporaryStashTabCoordinator {
                 }
                 ids.insert(id, at: destination)
                 order[current.key] = ids
+                let stableIDs = ids.compactMap { id in self.sessions.first { ObjectIdentifier($0) == id }?.temporaryStashID }
+                    .filter { recoveryRanks[$0] != nil }
+                let ranks = stableIDs.compactMap { recoveryRanks[$0] }.sorted()
+                for (stableID, rank) in zip(stableIDs, ranks) { recoveryRanks[stableID] = rank }
             }
             drag = nil
             resetHover()
             reconcile(sessions: sessions)
+            onOrderChanged?()
         }
     }
 
@@ -306,6 +348,9 @@ final class TemporaryStashTabCoordinator {
         panels.values.forEach { $0.close() }
         panels.removeAll()
         order.removeAll()
+        recoveryOrder.removeAll()
+        recoveryRanks.removeAll()
+        restoringIDs.removeAll()
         visibility.removeAll()
         layoutFrames.removeAll()
         hoverSuppressedUntilExit.removeAll()

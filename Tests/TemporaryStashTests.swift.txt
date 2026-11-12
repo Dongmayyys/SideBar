@@ -604,5 +604,69 @@ expect(fixed.isExpandedForCoordination && untouched.isExpandedForCoordination,
        "switch to stashed app still preserves pinned and configured windows")
 switchCoordinator.tearDownAll()
 
+// Saved stable IDs restore order independently of session creation/AX retry order.
+let restoredCoordinator = TemporaryStashTabCoordinator()
+let savedA = WindowSession("saved-a", edge: 2)
+let savedB = WindowSession("saved-b", edge: 2)
+let savedC = WindowSession("saved-c", edge: 2)
+let savedOrder = TemporaryStashTabOrder(screenID: 1, edge: 2, ids: ["saved-c", "saved-a", "saved-b"])
+restoredCoordinator.restoreOrder([savedOrder])
+NSEvent.mouseLocation = CGPoint(x: 500, y: 400)
+restoredCoordinator.reconcile(sessions: [savedB, savedA])
+expect(restoredCoordinator.snapshotOrder().first?.ids == ["saved-a", "saved-b"], "saved order overrides AX creation order")
+restoredCoordinator.reconcile(sessions: [savedB, savedA, savedC])
+expect(restoredCoordinator.snapshotOrder().first?.ids == savedOrder.ids, "late AX window inserts at saved slot instead of appending")
+let freshTab = WindowSession("fresh-tab", edge: 2)
+restoredCoordinator.reconcile(sessions: [freshTab, savedB, savedA, savedC])
+expect(restoredCoordinator.snapshotOrder().first?.ids == savedOrder.ids + ["fresh-tab"], "new stash appends after restored order")
+var orderNotifications = 0
+restoredCoordinator.onOrderChanged = { orderNotifications += 1 }
+let savedDown = tabPoint("saved-b")
+let savedTop = tabPoint("saved-c")
+TemporaryStashTabWindow.emit("saved-b", .down(savedDown))
+TemporaryStashTabWindow.emit("saved-b", .dragged(savedTop))
+TemporaryStashTabWindow.emit("saved-b", .up(savedTop))
+expect(restoredCoordinator.snapshotOrder().first?.ids == ["saved-b", "saved-c", "saved-a", "fresh-tab"]
+       && orderNotifications == 1, "drag after restore publishes updated persistent order on mouse-up")
+savedC.screenID = 2
+restoredCoordinator.reconcile(sessions: [savedA, savedB, savedC, freshTab])
+expect(restoredCoordinator.snapshotOrder().contains { $0.screenID == 2 && $0.ids == ["saved-c"] },
+       "changing display moves stable order membership to that display")
+savedB.isManagedByTemporaryShortcut = false
+restoredCoordinator.reconcile(sessions: [savedA, savedB, savedC, freshTab])
+expect(restoredCoordinator.snapshotOrder().allSatisfy { !$0.ids.contains("saved-b") }, "cancel/close removes stable ID from saved tab order")
+restoredCoordinator.tearDownAll()
+
+let fallbackCoordinator = TemporaryStashTabCoordinator()
+fallbackCoordinator.restoreOrder([TemporaryStashTabOrder(screenID: 9, edge: 1, ids: ["f-c", "f-a", "f-b"])])
+let fallbackA = WindowSession("f-a", edge: 2), fallbackB = WindowSession("f-b", edge: 2), fallbackC = WindowSession("f-c", edge: 2)
+fallbackCoordinator.suppressRestoredHover(for: fallbackA)
+fallbackCoordinator.suppressRestoredHover(for: fallbackB)
+fallbackCoordinator.reconcile(sessions: [fallbackB, fallbackA])
+expect(fallbackCoordinator.snapshotOrder().first?.ids == ["f-a", "f-b"], "fallback to another screen/edge retains source-column order")
+fallbackCoordinator.restoreOrder([TemporaryStashTabOrder(screenID: 9, edge: 1, ids: ["f-c"]),
+                                   TemporaryStashTabOrder(screenID: 1, edge: 2, ids: ["f-a", "f-b"])])
+fallbackCoordinator.suppressRestoredHover(for: fallbackC)
+fallbackCoordinator.reconcile(sessions: [fallbackB, fallbackA, fallbackC])
+expect(fallbackCoordinator.snapshotOrder().first?.ids == ["f-c", "f-a", "f-b"], "late retry preserves original relative order after fallback migration")
+fallbackCoordinator.tearDownAll()
+
+let hoverRestore = TemporaryStashTabCoordinator()
+let underPointer = WindowSession("under-pointer")
+AppConfig.shared.hoverDelayMS = 0
+let restoredFrame = TemporaryStashGeometry.labelFrames(count: 1, edge: 1, visibleFrame: mainScreen)[0]
+NSEvent.mouseLocation = CGPoint(x: restoredFrame.midX, y: restoredFrame.midY)
+hoverRestore.suppressRestoredHover(for: underPointer)
+hoverRestore.reconcile(sessions: [underPointer])
+Clock.now += 1
+hoverRestore.reconcile(sessions: [underPointer])
+expect(!underPointer.isExpandedForCoordination, "restoring beneath stationary mouse stays collapsed even with zero hover delay")
+NSEvent.mouseLocation = CGPoint(x: 500, y: 400)
+hoverRestore.reconcile(sessions: [underPointer])
+NSEvent.mouseLocation = CGPoint(x: restoredFrame.midX, y: restoredFrame.midY)
+hoverRestore.reconcile(sessions: [underPointer])
+expect(underPointer.isExpandedForCoordination, "leaving and reentering restored tab resumes normal hover behavior")
+hoverRestore.tearDownAll()
+
 print("RESULT checks=\(total) failures=\(failures)")
 exit(failures == 0 ? 0 : 1)

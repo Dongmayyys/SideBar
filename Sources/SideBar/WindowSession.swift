@@ -555,7 +555,8 @@ class WindowSession {
     private var isTemporaryShortcutManaged = false
     private var temporaryOriginalFrame: CGRect?
     private var temporaryLastExpandedFrame: CGRect?
-    let temporaryStashID = UUID().uuidString
+    let temporaryStashID: String
+    private var temporaryStashWindowID: CGWindowID?
     var temporaryStashOrdinal = 1
     private var isTemporarilyPinned = false
     /// 置顶能力是否处于激活状态：源窗口被钉住后，面板显示实时采集画面。
@@ -643,12 +644,13 @@ class WindowSession {
     }
     var isManagedForCoordination: Bool { !isFloatingForCoordination }
     
-    init(appElement: AXUIElement, windowElement: AXUIElement, pid: pid_t, bundleID: String, temporaryShortcut: Bool = false) {
+    init(appElement: AXUIElement, windowElement: AXUIElement, pid: pid_t, bundleID: String, temporaryShortcut: Bool = false, temporaryStashID: String = UUID().uuidString) {
         self.appElement = appElement
         self.windowElement = windowElement
         self.pid = pid
         self.bundleID = bundleID
         self.isTemporaryShortcutManaged = temporaryShortcut
+        self.temporaryStashID = temporaryStashID
         if let runningApp = NSRunningApplication(processIdentifier: pid) {
             self.appDisplayName = runningApp.localizedName ?? bundleID
             if let bundleURL = runningApp.bundleURL {
@@ -3917,22 +3919,45 @@ class WindowSession {
     }
 
     @discardableResult
-    func startTemporaryShortcutStash() -> Bool {
+    func startTemporaryShortcutStash(restoring record: TemporaryStashRecoveryRecord? = nil) -> Bool {
         guard isTemporaryShortcutManaged, let frame = getRawWindowFrame() else { return false }
-        let bounds = detectDisplayBounds()
-        guard let edge = TemporaryStashGeometry.nearestEdge(window: frame, screen: bounds,
-                                                           visibleWidth: getScreenForWindow().visibleFrame.width,
-                                                           screens: NSScreen.screens.map { cgBounds(for: $0) }) else { return false }
-        temporaryOriginalFrame = frame
+        let savedScreen = record.flatMap { saved in NSScreen.screens.first { $0.displayID == saved.screenID } }
+        let screen = savedScreen ?? detectScreen()
+        let bounds = cgBounds(for: screen)
+        guard let edge = TemporaryStashGeometry.recoveryEdge(savedEdge: savedScreen == nil ? nil : record?.edge,
+                    window: frame, screen: bounds, visibleWidth: screen.visibleFrame.width,
+                    screens: NSScreen.screens.map { cgBounds(for: $0) }) else { return false }
+        temporaryOriginalFrame = record?.originalFrame ?? frame
+        temporaryStashWindowID = record?.windowID ?? WindowAlphaManager.shared.findWindowID(for: windowElement, pid: pid)
         lockedWidth = frame.width
         initialFrameCaptured = true
-        lockCurrentScreen()
+        snappedScreen = screen
+        snappedScreenFrame = screen.frame
+        snappedDisplayBounds = bounds
         currentEdge = edge
+        let expanded = record == nil ? frame : clampFrameYToBounds(frame, bounds: bounds)
         temporaryLastExpandedFrame = CGRect(x: edge == 1 ? bounds.minX : bounds.maxX - frame.width,
-                                            y: frame.minY, width: frame.width, height: frame.height)
+                                            y: expanded.minY, width: frame.width, height: frame.height)
+        if record != nil && expanded.minY != frame.minY {
+            guard setWindowPositionWithoutSystemAnimation(position: expanded.origin,
+                      context: "WindowSession.startTemporaryShortcutStash.restoreY") == .success else { return false }
+        }
         guard collapseWindow(immediate: true, triggerEffects: false) else { return false }
-        scheduleFocusRelease(after: 0.5)
+        // Startup restoration must not activate an app or schedule a focus handoff.
+        if record == nil { scheduleFocusRelease(after: 0.5) }
         return true
+    }
+
+    func temporaryStashRecoveryRecord() -> TemporaryStashRecoveryRecord? {
+        guard isTemporaryShortcutManaged, !isFloatingForCoordination,
+              let original = temporaryOriginalFrame else { return nil }
+        if temporaryStashWindowID == nil {
+            temporaryStashWindowID = WindowAlphaManager.shared.findWindowID(for: windowElement, pid: pid)
+        }
+        guard let windowID = temporaryStashWindowID else { return nil }
+        return TemporaryStashRecoveryRecord(id: temporaryStashID, bundleID: bundleID, pid: pid,
+                    windowID: windowID, edge: currentEdge, screenID: getScreenForWindow().displayID,
+                    originalFrame: original, ordinal: temporaryStashOrdinal)
     }
 
     func cancelTemporaryShortcutStash(keepingFrame: CGRect? = nil) {

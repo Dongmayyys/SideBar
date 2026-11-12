@@ -6,6 +6,10 @@ class AXWindowManager {
     private let fusionCoordinator = FusionStripCoordinator()
     private let temporaryTabCoordinator = TemporaryStashTabCoordinator()
     private var temporaryOrdinals = TemporaryStashOrdinals()
+    private let temporaryRecoveryStore = TemporaryStashRecoveryStore()
+    private var temporaryRecovery = TemporaryStashRecoverySnapshot()
+    private var pendingTemporaryRecovery: [TemporaryStashRecoveryRecord] = []
+    private var temporaryRecoveryRetry: DispatchWorkItem?
     private var temporarilyExcludedWindowKeys: Set<String> = []
     private var bundleControlOwnerOverrides: [String: SideBarHotkeyClaim.HotkeyOwner] = [:]
     private var bundlePreferredClaimSessionIDs: [String: String] = [:]
@@ -26,6 +30,15 @@ class AXWindowManager {
     private var sessionSyncTimer: Timer?
     
     init() {
+        // AppDelegate has already completed synchronous hidden-window rescue.
+        temporaryRecovery = temporaryRecoveryStore.load()
+        pendingTemporaryRecovery = temporaryRecovery.windows
+        for record in pendingTemporaryRecovery {
+            temporaryOrdinals.reserve(bundleID: record.bundleID, windowID: record.id, ordinal: record.ordinal)
+        }
+        temporaryTabCoordinator.restoreOrder(temporaryRecovery.orders)
+        temporaryTabCoordinator.onOrderChanged = { [weak self] in self?.persistTemporaryRecovery() }
+
         SideBarBridge.shared.hotkeyActionHandler = { [weak self] bundleID in
             self?.handleForwardedHotkeyAction(bundleID: bundleID) ?? .unhandled
         }
@@ -53,6 +66,7 @@ class AXWindowManager {
         // 启动时同步一次所有运行中应用
         synchronizeSessions()
         refreshSideBarHotkeyRuntime()
+        restoreTemporaryShortcuts(attemptsRemaining: 6)
 
         fusionRefreshTimer = Timer.scheduledTimer(withTimeInterval: 0.12, repeats: true) { [weak self] _ in
             guard let self else { return }
@@ -214,7 +228,7 @@ class AXWindowManager {
     
     func cleanup() {
         guard !hasCleanedUp else { return }
-        hasCleanedUp = true
+        stopTemporaryRecovery()
 
         for session in sessions {
             session.restoreAndDestroy()
@@ -267,7 +281,7 @@ class AXWindowManager {
 
     func suspendForAccessibilityLoss() {
         guard !hasCleanedUp else { return }
-        hasCleanedUp = true
+        stopTemporaryRecovery()
 
         for session in sessions {
             session.suspendForAccessibilityLoss()
@@ -332,6 +346,7 @@ class AXWindowManager {
     }
     
     private func monitorApp(pid: pid_t, bundleID: String, maxRetries: Int = 0) {
+        guard !hasCleanedUp else { return }
         let appElement = AXUIElementCreateApplication(pid)
         
         // 注册应用级别的监听器 (只需要一次)，为了拦截 Cmd+N 和 Cmd+W 导致的焦点切换
@@ -530,6 +545,12 @@ class AXWindowManager {
             existing?.cancelTemporaryShortcutStash()
             return true
         case .stash:
+            // A user's new stash supersedes a not-yet-restored record for this exact window.
+            if let windowID = WindowAlphaManager.shared.findWindowID(for: target.windowElement, pid: target.pid) {
+                for record in pendingTemporaryRecovery where record.matches(pid: target.pid, bundleID: target.bundleID, windowID: windowID) {
+                    discardPendingTemporaryRecovery(record)
+                }
+            }
             let session = WindowSession(appElement: target.appElement, windowElement: target.windowElement,
                                         pid: target.pid, bundleID: target.bundleID, temporaryShortcut: true)
             attachSessionLifecycle(to: session)
@@ -550,6 +571,81 @@ class AXWindowManager {
     private func reconcileIndicators() {
         fusionCoordinator.reconcile(sessions: sessions.filter { !$0.isManagedByTemporaryShortcut })
         temporaryTabCoordinator.reconcile(sessions: sessions)
+        persistTemporaryRecovery()
+    }
+
+    private func persistTemporaryRecovery() {
+        guard !hasCleanedUp else { return }
+        let live = sessions.compactMap { $0.temporaryStashRecoveryRecord() }
+        temporaryRecovery.update(windows: pendingTemporaryRecovery + live,
+                                 liveOrders: temporaryTabCoordinator.snapshotOrder())
+        temporaryRecoveryStore.save(temporaryRecovery)
+        temporaryTabCoordinator.restoreOrder(temporaryRecovery.orders)
+    }
+
+    private func stopTemporaryRecovery() {
+        persistTemporaryRecovery()
+        hasCleanedUp = true
+        temporaryRecoveryRetry?.cancel()
+        temporaryRecoveryRetry = nil
+    }
+
+    private func discardPendingTemporaryRecovery(_ record: TemporaryStashRecoveryRecord) {
+        pendingTemporaryRecovery.removeAll { $0.id == record.id }
+        temporaryRecovery.remove(id: record.id)
+        temporaryOrdinals.release(bundleID: record.bundleID, windowID: record.id)
+        refreshTemporaryDockExclusion(bundleID: record.bundleID)
+    }
+
+    /// Runs only after crash rescue, and never calls rescue again after re-stashing.
+    /// AX/window enumeration can lag startup; retry for at most three seconds.
+    private func restoreTemporaryShortcuts(attemptsRemaining: Int) {
+        guard !hasCleanedUp else { return }
+        for record in pendingTemporaryRecovery {
+            guard let app = NSRunningApplication(processIdentifier: record.pid), !app.isTerminated,
+                  app.bundleIdentifier == record.bundleID,
+                  !AppConfig.shared.isAppEnabled(bundleID: record.bundleID) else {
+                discardPendingTemporaryRecovery(record)
+                continue
+            }
+            if let window = findTemporaryRecoveryWindow(record) {
+                let session = WindowSession(appElement: AXUIElementCreateApplication(record.pid), windowElement: window,
+                                            pid: record.pid, bundleID: record.bundleID, temporaryShortcut: true,
+                                            temporaryStashID: record.id)
+                session.temporaryStashOrdinal = record.ordinal
+                if session.startTemporaryShortcutStash(restoring: record) {
+                    attachSessionLifecycle(to: session)
+                    sessions.append(session)
+                    temporaryTabCoordinator.suppressRestoredHover(for: session)
+                    pendingTemporaryRecovery.removeAll { $0.id == record.id }
+                    refreshTemporaryDockExclusion(bundleID: record.bundleID)
+                    continue
+                }
+                session.restoreAndDestroy()
+            }
+            if attemptsRemaining == 0 { discardPendingTemporaryRecovery(record) }
+        }
+        reconcileIndicators()
+        guard !pendingTemporaryRecovery.isEmpty else { return }
+        let retry = DispatchWorkItem { [weak self] in
+            self?.restoreTemporaryShortcuts(attemptsRemaining: attemptsRemaining - 1)
+        }
+        temporaryRecoveryRetry = retry
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: retry)
+    }
+
+    private func findTemporaryRecoveryWindow(_ record: TemporaryStashRecoveryRecord) -> AXUIElement? {
+        let appElement = AXUIElementCreateApplication(record.pid)
+        var value: CFTypeRef?
+        guard AccessibilityRuntimeGuard.copyAttributeValue(of: appElement, attribute: kAXWindowsAttribute as CFString,
+                    value: &value, context: "AXWindowManager.findTemporaryRecoveryWindow.windows") == .success,
+              let windows = value as? [AXUIElement] else { return nil }
+        return windows.first { window in
+            guard let windowID = WindowAlphaManager.shared.findWindowID(for: window, pid: record.pid),
+                  record.matches(pid: record.pid, bundleID: record.bundleID, windowID: windowID) else { return false }
+            return WindowCapabilityProfiler.profile(of: window, bundleID: record.bundleID,
+                       context: "AXWindowManager.findTemporaryRecoveryWindow.profile").isStandardWindow
+        }
     }
 
     private func refreshTemporaryDockExclusion(bundleID: String) {
@@ -624,6 +720,11 @@ class AXWindowManager {
     private func handleTemporaryShortcutSessionEnded(_ session: WindowSession, excludeWindow: Bool, removeSession: Bool) {
         if excludeWindow, let windowKey = windowKey(for: session.windowElement, pid: session.pid) {
             temporarilyExcludedWindowKeys.insert(windowKey)
+        }
+        if !hasCleanedUp {
+            // Do not read sessions here: this callback can run inside sessions.removeAll.
+            temporaryRecovery.remove(id: session.temporaryStashID)
+            temporaryRecoveryStore.save(temporaryRecovery)
         }
         temporaryOrdinals.release(bundleID: session.bundleID, windowID: session.temporaryStashID)
         refreshTemporaryDockExclusion(bundleID: session.bundleID)

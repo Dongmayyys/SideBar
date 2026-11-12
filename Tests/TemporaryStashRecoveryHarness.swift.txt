@@ -1,0 +1,75 @@
+// The production archive and manager entry points run with in-memory AX and defaults.
+final class UserDefaults {
+    static let standard = UserDefaults()
+    var values: [String: Data] = [:]
+    var writes = 0
+    func data(forKey key: String) -> Data? { values[key] }
+    func set(_ data: Data, forKey key: String) { values[key] = data; writes += 1 }
+}
+typealias AXUIElement = Element
+var applicationElements: [Int32: Element] = [:]
+func testApplicationElement(_ pid: Int32) -> Element { applicationElements[pid] ?? Element() }
+enum WindowCapabilityProfiler {
+    struct Profile { let isStandardWindow: Bool }
+    static func profile(of window: Element, bundleID: String, context: String) -> Profile {
+        Profile(isStandardWindow: window.standard)
+    }
+}
+final class AppConfig {
+    static let shared = AppConfig()
+    var enabled: Set<String> = []
+    func isAppEnabled(bundleID: String) -> Bool { enabled.contains(bundleID) }
+}
+final class TemporaryStashTabCoordinator {
+    var orders: [TemporaryStashTabOrder] = []
+    var suppressedIDs: Set<String> = []
+    func snapshotOrder() -> [TemporaryStashTabOrder] { orders }
+    func restoreOrder(_ orders: [TemporaryStashTabOrder]) { self.orders = orders }
+    func suppressRestoredHover(for session: Session) { suppressedIDs.insert(session.temporaryStashID) }
+}
+final class RecoveryManager {
+    var sessions: [Session] = []
+    let temporaryTabCoordinator = TemporaryStashTabCoordinator()
+    var temporaryOrdinals = TemporaryStashOrdinals()
+    let temporaryRecoveryStore: TemporaryStashRecoveryStore
+    var temporaryRecovery: TemporaryStashRecoverySnapshot
+    var pendingTemporaryRecovery: [TemporaryStashRecoveryRecord]
+    var temporaryRecoveryRetry: DispatchWorkItem?
+    var hasCleanedUp = false
+    var temporarilyExcludedWindowKeys: Set<String> = []
+    var dockExclusions: Set<String> = []
+    init(_ records: [TemporaryStashRecoveryRecord], defaults: UserDefaults = UserDefaults()) {
+        temporaryRecoveryStore = TemporaryStashRecoveryStore(defaults: defaults, bootSessionID: "test-boot")
+        temporaryRecovery = TemporaryStashRecoverySnapshot()
+        temporaryRecovery.update(windows: records, liveOrders: [])
+        pendingTemporaryRecovery = records
+        for record in records {
+            temporaryOrdinals.reserve(bundleID: record.bundleID, windowID: record.id, ordinal: record.ordinal)
+        }
+        temporaryTabCoordinator.restoreOrder(temporaryRecovery.orders)
+    }
+    func attachSessionLifecycle(to session: Session) {
+        session.onTemporaryShortcutSessionEnded = { [weak self] session, exclude, remove in
+            self?.handleTemporaryShortcutSessionEnded(session, excludeWindow: exclude, removeSession: remove)
+        }
+    }
+    func reconcileIndicators() { persistTemporaryRecovery() }
+    func refreshSideBarHotkeyRuntime() {}
+    func windowKey(for window: Element, pid: Int32) -> String? { "\(pid):\(window.systemWindowID ?? 42)" }
+    func refreshTemporaryDockExclusion(bundleID: String) {
+        if temporaryOrdinals.hasMembers(bundleID: bundleID) { dockExclusions.insert(bundleID) }
+        else { dockExclusions.remove(bundleID) }
+    }
+    func run(attemptsRemaining: Int = 0) {
+        temporaryRecoveryRetry?.cancel()
+        restoreTemporaryShortcuts(attemptsRemaining: attemptsRemaining)
+    }
+    func persist() { persistTemporaryRecovery() }
+    func stop() {
+        stopTemporaryRecovery()
+        sessions.forEach { $0.restoreAndDestroy() }
+        sessions.removeAll()
+    }
+
+__MANAGER_METHODS__
+}

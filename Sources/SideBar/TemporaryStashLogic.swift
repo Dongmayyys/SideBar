@@ -44,6 +44,14 @@ enum TemporaryStashGeometry {
         return leftDistance < rightDistance ? 1 : 2
     }
 
+    static func recoveryEdge(savedEdge: Int?, window: CGRect, screen: CGRect,
+                             visibleWidth: CGFloat, screens: [CGRect]) -> Int? {
+        if let savedEdge, !hasAdjacentScreen(edge: savedEdge, screen: screen, screens: screens) {
+            return savedEdge
+        }
+        return nearestEdge(window: window, screen: screen, visibleWidth: visibleWidth, screens: screens)
+    }
+
     static func restorePosition(original: CGRect, expanded: CGRect, screens: [CGRect]) -> CGPoint {
         let isVisible = screens.contains {
             let overlap = $0.intersection(original)
@@ -111,6 +119,11 @@ struct TemporaryStashOrdinals {
         members[bundleID, default: [:]][windowID] = ordinal
         next[bundleID] = ordinal + 1
         return ordinal
+    }
+
+    mutating func reserve(bundleID: String, windowID: String, ordinal: Int) {
+        members[bundleID, default: [:]][windowID] = ordinal
+        next[bundleID] = max(next[bundleID, default: 1], ordinal + 1)
     }
 
     mutating func release(bundleID: String, windowID: String) {

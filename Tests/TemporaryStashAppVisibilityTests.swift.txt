@@ -146,6 +146,141 @@ unknownSessions[0].windowElement.subroleUnavailable = true
 unknownWindows.reconcile(sessions: unknownSessions)
 expect(!NSRunningApplication.hidden.contains(123), "unknown subrole restores owned app rather than assuming an unreadable window is nonstandard")
 
+// Finder regression: AX eligibility can change solely because the app is hidden.
+// Neither a fresh AX snapshot nor ordinary visibility transitions may rearm hide.
+for failure in ["unknown-windows", "unknown-window-subrole", "unmanaged-standard-window"] {
+    for immediateHide in [false, true] {
+        resetVisibilityBackend()
+        var moment = Date()
+        let visibility = TemporaryStashAppVisibility(now: { moment })
+        let sessions = collapsedSessions(visibility: visibility, count: 2)
+        NSRunningApplication.hideIsImmediate = immediateHide
+        visibility.reconcile(sessions: sessions)
+        let appElement = applicationElements[123]!
+        if failure == "unknown-windows" { appElement.windows = nil }
+        else if failure == "unknown-window-subrole" { sessions[0].windowElement.subroleUnavailable = true }
+        else { appElement.windows!.append(Element()) }
+        visibility.reconcile(sessions: sessions)
+        visibility.reconcile(sessions: sessions)
+        let context = "\(failure) immediateHide=\(immediateHide)"
+        expect(!NSRunningApplication.hidden.contains(123) && NSRunningApplication.pendingHides.isEmpty
+               && appVisibilityEvents.filter { $0 == "unhide:123" }.count == 1,
+               "AX invalidation restores owned or in-flight hide: \(context)")
+        expect(StashDebugLog.messages.filter { $0.contains("circuit-breaker triggered") && $0.contains("reason=\(failure)") }.count == 1,
+               "AX invalidation trips and logs the breaker once: \(context)")
+        appElement.windows = sessions.map(\.windowElement)
+        sessions[0].windowElement.subroleUnavailable = false
+        appVisibilityEvents.removeAll()
+        // Reordering the same session set and repeated grace expiry are not changes.
+        for _ in 0..<3 {
+            moment = moment.addingTimeInterval(2)
+            visibility.reconcile(sessions: Array(sessions.reversed()))
+        }
+        expect(!NSRunningApplication.hidden.contains(123) && !appVisibilityEvents.contains("hide:123"),
+               "AX recovery and expired grace cannot restart the hide-unhide loop: \(context)")
+        visibility.spaceDidChange()
+        visibility.spaceDidChange(topologyChanged: true)
+        sessions[0].revealForTemporaryStashTab()
+        expect(sessions[0].isExpandedForCoordination && sessions[0].alpha == 1,
+               "breaker permits normal expansion: \(context)")
+        visibility.reconcile(sessions: sessions)
+        _ = sessions[0].hideForTemporaryStashTab()
+        moment = moment.addingTimeInterval(2)
+        visibility.reconcile(sessions: sessions)
+        expect(sessions[0].isSnappedForCoordination && !appVisibilityEvents.contains("hide:123")
+               && !StashDebugLog.messages.contains { $0.contains("circuit-breaker cleared") },
+               "Space events and expand-collapse leave breaker armed: \(context)")
+        sessions[0].cancelTemporaryShortcutStash()
+        expect(!sessions[0].isTemporaryShortcutManaged && sessions[0].alpha == 1,
+               "breaker permits cancel and geometry/alpha restoration: \(context)")
+        visibility.reconcile(sessions: sessions)
+        expect(StashDebugLog.messages.filter { $0.contains("circuit-breaker cleared") && $0.contains("reason=managed-session-set-changed") }.count == 1,
+               "removing a managed session clears and logs the breaker once: \(context)")
+        appElement.windows = [sessions[1].windowElement]
+        NSRunningApplication.hideIsImmediate = true
+        visibility.reconcile(sessions: sessions)
+        expect(NSRunningApplication.hidden.contains(123) && appVisibilityEvents.filter { $0 == "hide:123" }.count == 1,
+               "changed stash set can auto-hide again when eligible: \(context)")
+        visibility.restoreAll(reason: "cleanup")
+    }
+}
+
+// Changing membership (not just count), process identity, or the SideBar runtime
+// clears suppression; process identity must include launch time, not only PID.
+for reset in ["replace-session", "process-restart", "sidebar-restart"] {
+    resetVisibilityBackend()
+    var moment = Date()
+    let visibility = TemporaryStashAppVisibility(now: { moment })
+    var sessions = collapsedSessions(visibility: visibility)
+    visibility.reconcile(sessions: sessions)
+    applicationElements[123]!.windows = nil
+    visibility.reconcile(sessions: sessions)
+    applicationElements[123]!.windows = sessions.map(\.windowElement)
+    moment = moment.addingTimeInterval(2)
+    visibility.reconcile(sessions: sessions)
+    appVisibilityEvents.removeAll()
+    var resumedVisibility = visibility
+    if reset == "replace-session" {
+        let replacement = Session(appElement: sessions[0].appElement, windowElement: sessions[0].windowElement,
+                                  pid: 123, bundleID: "same.app", temporaryStashID: "replacement")
+        replacement.temporaryAppVisibility = visibility
+        _ = replacement.startTemporaryShortcutStash()
+        sessions = [replacement]
+    } else if reset == "process-restart" {
+        NSRunningApplication.launches[123] = Date(timeIntervalSince1970: 200)
+    } else {
+        resumedVisibility = TemporaryStashAppVisibility(now: { moment })
+        sessions[0].temporaryAppVisibility = resumedVisibility
+    }
+    resumedVisibility.reconcile(sessions: sessions)
+    resumedVisibility.reconcile(sessions: sessions)
+    expect(NSRunningApplication.hidden.contains(123) && appVisibilityEvents.filter { $0 == "hide:123" }.count == 1,
+           "auto-hide rearms after \(reset)")
+    if reset != "sidebar-restart" {
+        let reason = reset == "process-restart" ? "process-identity-changed" : "managed-session-set-changed"
+        expect(StashDebugLog.messages.filter { $0.contains("circuit-breaker cleared") && $0.contains("reason=\(reason)") }.count == 1,
+               "breaker reset logs once with its cause: \(reset)")
+    }
+    resumedVisibility.restoreAll(reason: "cleanup")
+}
+
+// A latched breaker only guards new hide. Pending unhide recovery must continue
+// through polls, expansion, cancellation and the normal exit restore entry point.
+for finish in ["reveal", "cancel", "cleanup"] {
+    resetVisibilityBackend()
+    var moment = Date()
+    let visibility = TemporaryStashAppVisibility(now: { moment })
+    let session = collapsedSessions(visibility: visibility)[0]
+    visibility.reconcile(sessions: [session])
+    NSRunningApplication.unhideSucceeds = false
+    applicationElements[123]!.windows = nil
+    visibility.reconcile(sessions: [session])
+    applicationElements[123]!.windows = [session.windowElement]
+    appVisibilityEvents.removeAll()
+    moment = moment.addingTimeInterval(0.25)
+    visibility.reconcile(sessions: [session])
+    expect(NSRunningApplication.hidden.contains(123) && appVisibilityEvents == ["unhide:123"],
+           "breaker preserves failed-unhide retries: \(finish)")
+    if finish == "reveal" { session.revealForTemporaryStashTab() }
+    else if finish == "cancel" { session.cancelTemporaryShortcutStash() }
+    else { session.restoreAndDestroy(); visibility.restoreAll(reason: "cleanup", timeout: 0) }
+    NSRunningApplication.unhideSucceeds = true
+    moment = moment.addingTimeInterval(0.25)
+    visibility.reconcile(sessions: [session])
+    visibility.reconcile(sessions: [session])
+    expect(!NSRunningApplication.hidden.contains(123) && visibility.restorationIsConfirmed(pid: 123)
+           && !appVisibilityEvents.contains("hide:123"),
+           "breaker permits outstanding recovery to finish: \(finish)")
+    if finish == "reveal" {
+        expect(session.isExpandedForCoordination && session.alpha == 1,
+               "pending expansion completes after failed-unhide recovery while breaker is armed")
+    } else {
+        expect(!session.isTemporaryShortcutManaged && session.alpha == 1,
+               "cancel/exit restores window alpha while unhide is retried: \(finish)")
+    }
+    visibility.restoreAll(reason: "cleanup")
+}
+
 resetVisibilityBackend()
 let configuredOnly = TemporaryStashAppVisibility()
 let configuredSession = Session(temporaryShortcut: false)

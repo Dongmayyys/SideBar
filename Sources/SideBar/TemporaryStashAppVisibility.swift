@@ -87,8 +87,15 @@ final class TemporaryStashAppVisibility {
         var onReady: (() -> Void)?
         var isResuming = false
     }
+    private struct AutoHideCircuitBreaker {
+        let launchDate: Date
+        let bundleID: String
+        let sessionIDs: Set<String>
+    }
     private var pendingReveals: [pid_t: [String: PendingReveal]] = [:]
     private var applications: [pid_t: HiddenApplication] = [:]
+    // Runtime-only, independent of ownership release, reveal and AX snapshots.
+    private var autoHideCircuitBreakers: [pid_t: AutoHideCircuitBreaker] = [:]
     private var spaceGeneration = 0
     private var sequence = 0
     private var pendingActivationPID: pid_t?
@@ -215,6 +222,31 @@ final class TemporaryStashAppVisibility {
         _ = restore(pid: pid, reason: reason)
     }
 
+    private func restoreForInvalidAXEligibility(pid: pid_t, sessionIDs: Set<String>, reason: String) {
+        if autoHideCircuitBreakers[pid] == nil, let current = applications[pid],
+           current.phase == .hideRequested || current.phase == .hiddenOwned {
+            autoHideCircuitBreakers[pid] = AutoHideCircuitBreaker(launchDate: current.launchDate,
+                bundleID: current.bundleID, sessionIDs: sessionIDs)
+            StashDebugLog.write("app auto-hide circuit-breaker triggered pid=\(pid) bundle=\(current.bundleID) identity=\(current.launchDate) sessions=\(sessionIDs.sorted()) reason=\(reason)")
+        }
+        skipHiding(pid: pid, reason: reason)
+    }
+
+    private func reconcileAutoHideCircuitBreakers(groups: [pid_t: [WindowSession]]) {
+        for (pid, breaker) in autoHideCircuitBreakers {
+            let app = NSRunningApplication(processIdentifier: pid)
+            let reason: String
+            if app == nil || app?.isTerminated == true || app?.processStartDate != breaker.launchDate
+                || app?.bundleIdentifier != breaker.bundleID {
+                reason = "process-identity-changed"
+            } else if Set((groups[pid] ?? []).map(\.temporaryStashID)) != breaker.sessionIDs {
+                reason = "managed-session-set-changed"
+            } else { continue }
+            autoHideCircuitBreakers[pid] = nil
+            StashDebugLog.write("app auto-hide circuit-breaker cleared pid=\(pid) bundle=\(breaker.bundleID) identity=\(breaker.launchDate) sessions=\(breaker.sessionIDs.sorted()) reason=\(reason)")
+        }
+    }
+
     func reconcile(sessions: [WindowSession], activatingPID: pid_t? = nil) {
         pendingActivationPID = activatingPID
         expireReveals()
@@ -228,6 +260,7 @@ final class TemporaryStashAppVisibility {
             if NSRunningApplication(processIdentifier: pid)?.isHidden == false { resumeReveals(pid: pid) }
         }
         let groups = Dictionary(grouping: sessions.filter(\.isManagedByTemporaryShortcut), by: \.pid)
+        reconcileAutoHideCircuitBreakers(groups: groups)
         notHiddenReasons = notHiddenReasons.filter { groups[$0.key] != nil || applications[$0.key] != nil }
         for pid in Array(applications.keys) where groups[pid] == nil {
             skipHiding(pid: pid, reason: "no-managed-windows")
@@ -235,6 +268,10 @@ final class TemporaryStashAppVisibility {
         for (pid, group) in groups {
             guard let first = group.first, let app = NSRunningApplication(processIdentifier: pid),
                   !app.isTerminated else { release(pid: pid, reason: "terminated"); continue }
+            // 访达隐藏后窗口列表会变化，导致隐藏/恢复循环；它不参与自动隐藏。
+            guard first.bundleID != "com.apple.finder" else {
+                skipHiding(pid: pid, reason: "excluded-app"); continue
+            }
             guard group.allSatisfy(\.isSnappedForCoordination) else {
                 skipHiding(pid: pid, reason: "expanded-window"); continue
             }
@@ -254,7 +291,7 @@ final class TemporaryStashAppVisibility {
             guard AccessibilityRuntimeGuard.copyAttributeValue(of: first.appElement, attribute: kAXWindowsAttribute as CFString,
                       value: &value, context: "TemporaryStashAppVisibility.windows") == .success,
                   let windows = value as? [AXUIElement] else {
-                skipHiding(pid: pid, reason: "unknown-windows"); continue
+                restoreForInvalidAXEligibility(pid: pid, sessionIDs: Set(group.map(\.temporaryStashID)), reason: "unknown-windows"); continue
             }
             let elements = windows.map { element -> (window: AXUIElement, role: String?) in
                 var role: CFTypeRef?
@@ -270,17 +307,20 @@ final class TemporaryStashAppVisibility {
                     context: "TemporaryStashAppVisibility.standard"))
             }
             guard profiled.allSatisfy({ $0.profile.subrole != nil }) else {
-                skipHiding(pid: pid, reason: "unknown-window-subrole"); continue
+                restoreForInvalidAXEligibility(pid: pid, sessionIDs: Set(group.map(\.temporaryStashID)), reason: "unknown-window-subrole"); continue
             }
             let standard = profiled.filter { $0.profile.isStandardWindow }.map { $0.window }
             guard !standard.isEmpty, standard.allSatisfy({ window in group.contains { CFEqual($0.windowElement, window) } }) else {
-                skipHiding(pid: pid, reason: "unmanaged-standard-window"); continue
+                restoreForInvalidAXEligibility(pid: pid, sessionIDs: Set(group.map(\.temporaryStashID)), reason: "unmanaged-standard-window"); continue
             }
             if let current = applications[pid], current.phase == .released,
                current.activationUntil != .distantPast, now() >= current.activationUntil, pendingActivationPID != pid {
                 release(pid: pid, reason: "activation-grace-ended")
             }
             if applications[pid] != nil { continue }
+            if autoHideCircuitBreakers[pid] != nil {
+                skipHiding(pid: pid, reason: "auto-hide-circuit-breaker"); continue
+            }
             if pendingActivationPID == pid {
                 skipHiding(pid: pid, reason: "activation-pending"); continue
             }

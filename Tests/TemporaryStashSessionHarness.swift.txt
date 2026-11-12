@@ -10,7 +10,10 @@ final class TestHiddenDefaults {
 import ApplicationServices
 let testHiddenDefaults = TestHiddenDefaults()
 
-enum StashDebugLog { static func write(_ message: String) {} }
+enum StashDebugLog {
+    static var messages: [String] = []
+    static func write(_ message: String) { messages.append(message) }
+}
 
 typealias AXResult = AXError
 var axEvents: [String] = []
@@ -23,6 +26,7 @@ final class Element: NSObject {
     var windows: [Element]?
     var mainWindow: Element?
     var focusedWindow: Element?
+    var role: String? = "AXWindow"
     var standard = true
     var subroleUnavailable = false
     var writes = 0
@@ -64,6 +68,10 @@ final class RuntimeTrust {
 enum AccessibilityRuntimeGuard {
     static let shared = RuntimeTrust()
     static func copyAttributeValue(of element: Element, attribute: CFString, value: inout CFTypeRef?, context: String) -> AXError {
+        if attribute as String == "AXRole" {
+            value = element.role as CFTypeRef?
+            return value == nil ? .noValue : .success
+        }
         if attribute as String == "AXWindows" {
             value = element.windows as CFTypeRef?
             return element.windows == nil ? .cannotComplete : .success
@@ -132,6 +140,7 @@ final class NSRunningApplication {
     static var hideSucceeds = true
     static var unhideSucceeds = true
     static var unhideIsImmediate = true
+    static var onUnhide: ((Int32) -> Void)?
     static var pendingUnhides: Set<Int32> = []
     static var hideIsImmediate = true
     static var pendingHides: Set<Int32> = []
@@ -164,6 +173,7 @@ final class NSRunningApplication {
                 Self.pendingHides.remove(processIdentifier)
             } else { Self.pendingUnhides.insert(processIdentifier) }
         }
+        Self.onUnhide?(processIdentifier)
         return Self.unhideSucceeds
     }
 }
@@ -235,6 +245,7 @@ final class Session {
     var temporaryStashSlotCapacity: Int { TemporaryStashGeometry.slotCapacity(visibleFrame: getScreenForWindow().visibleFrame) }
     var temporaryOriginalFrame: CGRect?
     var temporaryOriginalSize: CGSize?
+    var temporaryStashSpaceIDs: Set<UInt64>?
     var temporaryStashPresence: TemporaryStashAppVisibility.Presence?
     var lastTemporaryDescriptorDiagnostic = ""
     weak var temporaryAppVisibility: TemporaryStashAppVisibility?
@@ -315,6 +326,7 @@ final class Session {
     func collapseWindow(immediate: Bool, triggerEffects: Bool) -> Bool {
         guard !isAnimating, let frame = getRawWindowFrame(), let geometry = edgeGeometry(for: frame) else { return false }
         state = .snapped(edge: currentEdge, hiddenOrX: geometry.visualHidden.x)
+        notifyTemporaryShortcutStashStateChanged(isStashed: true)
         windowElement.frame.origin = geometry.visualHidden
         alpha = 0
         return true

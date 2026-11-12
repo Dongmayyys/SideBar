@@ -901,5 +901,126 @@ do {
     mixedManager.temporaryTabCoordinator.tearDownAll()
 }
 
+// Space-scoped allocation and collision-aware shared-column moves.
+func spaceSlot(_ id: String, _ space: UInt64?, _ slot: Int, screen: UInt32 = 1, edge: Int = 2) -> TemporaryStashSlotAssignment {
+    TemporaryStashSlotAssignment(id: id, screenID: screen, edge: edge, slot: slot, spaceID: space)
+}
+func hasSlotOverlap(_ assignments: [TemporaryStashSlotAssignment]) -> Bool {
+    assignments.contains { item in
+        assignments.contains { $0.id != item.id && $0.slot == item.slot && $0.conflicts(with: item) }
+    }
+}
+let desktopSlots = TemporaryStashSlots.resolve(existing: [], requested: [spaceSlot("a", 1, 0), spaceSlot("b", 2, 0)])
+expect(desktopSlots.map(\.slot) == [1, 1], "different desktops independently allocate slot one")
+let sharedSlots = TemporaryStashSlots.resolve(existing: desktopSlots, requested: desktopSlots + [spaceSlot("shared", nil, 0)])
+expect(sharedSlots.map(\.slot) == [1, 1, 2] && !hasSlotOverlap(sharedSlots), "shared column reserves a globally free slot across all desktops")
+let localAfterShared = TemporaryStashSlots.resolve(existing: sharedSlots, requested: sharedSlots + [spaceSlot("c", 3, 0)])
+expect(localAfterShared.last?.slot == 1, "new desktop reuses other desktops' slots but never a shared reservation")
+expect(TemporaryStashSlotAssignment.singleSpace(in: [7]) == 7
+       && TemporaryStashSlotAssignment.singleSpace(in: [7, 8]) == nil
+       && TemporaryStashSlotAssignment.singleSpace(in: []) == nil
+       && TemporaryStashSlotAssignment.singleSpace(in: nil) == nil, "multiple or unknown Spaces use shared column")
+let oldDesktop = [spaceSlot("moving", 1, 4), spaceSlot("resident", 2, 1)]
+let newDesktop = [spaceSlot("moving", 2, 4), oldDesktop[1]]
+expect(TemporaryStashSlots.resolve(existing: oldDesktop, requested: newDesktop).map(\.slot) == [4, 1], "cross-desktop move keeps original slot when free")
+let collisionDesktop = [spaceSlot("moving", 2, 1), oldDesktop[1]]
+expect(TemporaryStashSlots.resolve(existing: oldDesktop, requested: collisionDesktop).map(\.slot) == [2, 1], "cross-desktop collision preserves destination resident and fills topmost gap")
+let localSwap = TemporaryStashSlots.move(id: "a", to: 3, assignments: sharedSlots)
+expect(localSwap.map(\.slot) == [3, 1, 2], "local drag never swaps an unrelated desktop's label")
+let sharedSwap = TemporaryStashSlots.move(id: "shared", to: 1, assignments: sharedSlots)
+expect(sharedSwap.map(\.slot) == [2, 2, 1] && !hasSlotOverlap(sharedSwap), "shared drag swaps every conflicting local label without overlap")
+let expandedShared = [spaceSlot("a", 1, 3), spaceSlot("b", 2, 3), spaceSlot("shared", nil, 1)]
+let intoShared = TemporaryStashSlots.move(id: "a", to: 1, assignments: expandedShared)
+expect(intoShared[0].slot == 1 && intoShared[2].slot == 3 && !hasSlotOverlap(intoShared), "local/shared swap also resolves other desktops at shared destination")
+let fullShared = [spaceSlot("a", 1, 2), spaceSlot("b", 2, 1), spaceSlot("shared", nil, 3)]
+expect(TemporaryStashSlots.move(id: "a", to: 3, assignments: fullShared, capacity: 3) != fullShared,
+       "shared swap can reuse unrelated desktop slots within capacity")
+let blockedShared = [spaceSlot("a", 1, 2), spaceSlot("b", 2, 2), spaceSlot("c", 2, 1), spaceSlot("shared", nil, 3)]
+expect(TemporaryStashSlots.move(id: "a", to: 4, assignments: blockedShared, capacity: 3) == blockedShared,
+       "out-of-capacity shared move leaves all columns unchanged")
+for space in [UInt64(1), 2, 3] {
+    let requested = (1...3).map { spaceSlot("local-\($0)", UInt64($0), 1) }
+        + [spaceSlot("shared", nil, 2), spaceSlot("second", space, 3)]
+    for source in requested {
+        for target in 1...5 {
+            let moved = TemporaryStashSlots.move(id: source.id, to: target, assignments: requested, capacity: 5)
+            expect(!hasSlotOverlap(moved), "shared/local moves maintain non-overlap space=\(space) source=\(source.id) target=\(target)")
+        }
+    }
+}
+
+// Exercise allocation, drag placeholders and desktop migration via real coordinator entry points.
+do {
+    let coordinator = TemporaryStashTabCoordinator()
+    let first = WindowSession("desktop-first"), second = WindowSession("desktop-second"), shared = WindowSession("desktop-shared")
+    first.spaceID = 1
+    second.spaceID = 2
+    shared.spaceID = nil
+    first.activeSpaceID = 1
+    second.activeSpaceID = 1
+    shared.activeSpaceID = 1
+    second.eligible = false
+    NSEvent.mouseLocation = CGPoint(x: 500, y: 500)
+    coordinator.reconcile(sessions: [first, second, shared])
+    expect(first.temporaryStashSlot == 1 && second.temporaryStashSlot == 1 && shared.temporaryStashSlot == 2,
+           "UI assigns independent desktop columns and one shared reservation")
+    let sharedFrame = TemporaryStashTabWindow.live[shared.temporaryStashID]!
+    first.eligible = false
+    coordinator.reconcile(sessions: [first, second, shared])
+    expect(TemporaryStashTabWindow.live[first.temporaryStashID] != nil,
+           "brief CG absence on the same known desktop retains existing visibility debounce")
+    first.eligible = true
+    first.isExpandedForCoordination = true
+    AppConfig.shared.hoverDelayMS = 0
+    NSEvent.mouseLocation = CGPoint(x: sharedFrame.midX, y: sharedFrame.midY)
+    transitions.removeAll()
+    coordinator.reconcile(sessions: [first, second, shared])
+    expect(transitions == ["hide:desktop-first", "reveal:desktop-shared"],
+           "local and shared labels on the same physical edge still collapse each other before reveal")
+    NSEvent.mouseLocation = CGPoint(x: 500, y: 500)
+    expect(TemporaryStashTabWindow.live[second.temporaryStashID] == nil, "inactive desktop label is hidden immediately")
+    first.eligible = false
+    second.eligible = true
+    for session in [first, second, shared] { session.activeSpaceID = 2 }
+    coordinator.reconcile(sessions: [first, second, shared])
+    expect(TemporaryStashTabWindow.live[first.temporaryStashID] == nil
+           && TemporaryStashTabWindow.live[second.temporaryStashID] != nil
+           && TemporaryStashTabWindow.live[shared.temporaryStashID] == sharedFrame,
+           "desktop switch replaces local labels immediately without overlapping reused slots or moving shared label")
+    let secondFrame = TemporaryStashTabWindow.live[second.temporaryStashID]!
+    let point = CGPoint(x: secondFrame.midX, y: secondFrame.midY)
+    TemporaryStashTabWindow.emit(second.temporaryStashID, .down(point))
+    expect(TemporaryStashTabWindow.placeholders.count == TemporaryStashGeometry.slotCapacity(visibleFrame: mainScreen),
+           "desktop-local drag displays its entire column including empty slots")
+    let fourth = TemporaryStashGeometry.slotFrame(slot: 4, edge: second.edge, visibleFrame: mainScreen)!
+    TemporaryStashTabWindow.emit(second.temporaryStashID, .up(CGPoint(x: fourth.midX, y: fourth.midY)))
+    expect(second.temporaryStashSlot == 4 && first.temporaryStashSlot == 1 && shared.temporaryStashSlot == 2,
+           "desktop-local UI move leaves inactive desktop and shared slots intact")
+    second.spaceID = 3
+    second.activeSpaceID = 3
+    coordinator.reconcile(sessions: [first, second, shared])
+    expect(second.temporaryStashSlot == 4, "live desktop membership change preserves dragged slot")
+    let frame = TemporaryStashTabWindow.live[second.temporaryStashID]!
+    TemporaryStashTabWindow.emit(second.temporaryStashID, .down(CGPoint(x: frame.midX, y: frame.midY)))
+    second.activeSpaceID = 4
+    second.eligible = false
+    coordinator.reconcile(sessions: [first, second, shared])
+    TemporaryStashTabWindow.emit(second.temporaryStashID, .up(point))
+    expect(second.temporaryStashSlot == 4 && TemporaryStashTabWindow.placeholders.isEmpty,
+           "switching desktop cancels an in-flight drag instead of dropping into another desktop")
+    coordinator.tearDownAll()
+    let sharedOnly = TemporaryStashTabCoordinator()
+    shared.activeSpaceID = 1
+    sharedOnly.reconcile(sessions: [shared])
+    let sharedStart = TemporaryStashTabWindow.live[shared.temporaryStashID]!
+    TemporaryStashTabWindow.emit(shared.temporaryStashID, .down(CGPoint(x: sharedStart.midX, y: sharedStart.midY)))
+    shared.activeSpaceID = 2
+    sharedOnly.reconcile(sessions: [shared])
+    TemporaryStashTabWindow.emit(shared.temporaryStashID, .up(point))
+    expect(shared.temporaryStashSlot == 2 && TemporaryStashTabWindow.placeholders.isEmpty,
+           "desktop switch cancels a shared-only drag even when labels and assignments have not changed")
+    sharedOnly.tearDownAll()
+}
+
 print("RESULT checks=\(total) failures=\(failures)")
 exit(failures == 0 ? 0 : 1)

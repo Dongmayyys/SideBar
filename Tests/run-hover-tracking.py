@@ -19,11 +19,14 @@ else:
 
 methods = []
 for name in ['checkMouseForCollapse', 'collapseWindow', 'expandWindow', 'startMouseTrackingTimer', 'revealForTemporaryStashTab', 'focusForTemporaryStashTab',
-             'prepareTemporaryShortcutFrame', 'edgeGeometry', 'getWindowFrame', 'interactionHitTestFrame']:
+             'beginTemporaryStashReveal', 'prepareTemporaryShortcutFrame', 'edgeGeometry', 'getWindowFrame', 'interactionHitTestFrame']:
     # A top-level method closes at four spaces; nested closures are more indented.
     matches = list(re.finditer(r'(?:    @discardableResult\n)?    (?:private )?func ' + name + r'\(.*?\n    }', source, re.S))
     if args.baseline and name in ['revealForTemporaryStashTab', 'focusForTemporaryStashTab']:
         methods.append('    func revealForTemporaryStashTab(isAppActivated: Bool = false) {}' if name == 'revealForTemporaryStashTab' else '    func focusForTemporaryStashTab() {}')
+        continue
+    if args.baseline and name == 'beginTemporaryStashReveal':
+        methods.append('    func beginTemporaryStashReveal() -> Bool { true }')
         continue
     if args.baseline and name == 'prepareTemporaryShortcutFrame':
         methods.append('    private func prepareTemporaryShortcutFrame() -> CGRect? { getRawWindowFrame() }')

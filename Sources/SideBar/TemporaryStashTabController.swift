@@ -7,6 +7,8 @@ struct TemporaryStashTabDescriptor {
     let visibleFrame: CGRect
     let isOnScreen: Bool
     let title: String
+    var spaceID: UInt64? = nil
+    var activeSpaceID: UInt64? = nil
 }
 
 enum TemporaryStashTabEvent {
@@ -22,9 +24,13 @@ final class TemporaryStashTabCoordinator {
     private struct EdgeKey: Hashable {
         let edge: Int
         let screenID: UInt32
+        let spaceID: UInt64?
+        let activeSpaceID: UInt64?
         init(_ descriptor: TemporaryStashTabDescriptor) {
             edge = descriptor.edge
             screenID = descriptor.screenID
+            spaceID = descriptor.spaceID
+            activeSpaceID = descriptor.activeSpaceID
         }
     }
 
@@ -191,7 +197,7 @@ final class TemporaryStashTabCoordinator {
         var requested = existing.filter { pendingRecoveryIDs.contains($0.id) && !stableIDs.contains($0.id) }
         requested += descriptors.map { descriptor in
             TemporaryStashSlotAssignment(id: descriptor.session.temporaryStashID, screenID: descriptor.screenID,
-                                        edge: descriptor.edge, slot: descriptor.session.temporaryStashSlot)
+                                        edge: descriptor.edge, slot: descriptor.session.temporaryStashSlot, spaceID: descriptor.spaceID)
         }
         // A transient missing descriptor must not release an established live slot.
         requested += existing.filter { item in !requested.contains { $0.id == item.id } }
@@ -204,6 +210,9 @@ final class TemporaryStashTabCoordinator {
 
         let visible = descriptors.filter { descriptor in
             let id = ObjectIdentifier(descriptor.session)
+            if let spaceID = descriptor.spaceID, let active = descriptor.activeSpaceID, spaceID != active {
+                visibility[id, default: TemporaryStashVisibility()].expireDebounce()
+            }
             let visible = visibility[id, default: TemporaryStashVisibility()].isVisible(
                 isOnScreen: descriptor.isOnScreen, now: now.timeIntervalSinceReferenceDate)
             if descriptorVisibility[id] != visible {
@@ -229,7 +238,8 @@ final class TemporaryStashTabCoordinator {
         // 成员或屏幕几何变化时取消本次拖动，避免用过期的列范围插入。
         if let current = drag,
            previousFrames != layoutFrames || current.assignments != assignments
-            || descriptors.first(where: { ObjectIdentifier($0.session) == current.id })?.visibleFrame != current.visibleFrame {
+            || descriptors.first(where: { ObjectIdentifier($0.session) == current.id })?.visibleFrame != current.visibleFrame
+            || descriptors.first(where: { ObjectIdentifier($0.session) == current.id }).map(EdgeKey.init) != current.key {
             drag?.cancelled = true
             resetHover()
         }
@@ -321,7 +331,7 @@ final class TemporaryStashTabCoordinator {
                let slot = TemporaryStashGeometry.slot(at: point, edge: current.key.edge,
                                                      visibleFrame: current.visibleFrame, count: current.slotCount),
                let session = sessions.first(where: { ObjectIdentifier($0) == id }) {
-                assignments = TemporaryStashSlots.move(id: session.temporaryStashID, to: slot, assignments: assignments)
+                assignments = TemporaryStashSlots.move(id: session.temporaryStashID, to: slot, assignments: assignments, capacity: current.slotCount)
                 for session in sessions {
                     session.temporaryStashSlot = assignments.first { $0.id == session.temporaryStashID }?.slot ?? session.temporaryStashSlot
                 }
@@ -390,8 +400,9 @@ final class TemporaryStashTabCoordinator {
     }
 
     private func activate(_ target: TemporaryStashTabDescriptor, among descriptors: [TemporaryStashTabDescriptor], isAppActivated: Bool = false, waitForInteraction: Bool = false) -> Bool {
-        let siblings = descriptors.filter { EdgeKey($0) == EdgeKey(target) && $0.session !== target.session }
+        let siblings = descriptors.filter { $0.screenID == target.screenID && $0.edge == target.edge && $0.session !== target.session }
         for sibling in siblings { sibling.session.cancelTemporaryActivationReveal() }
+        if !target.session.isExpandedForCoordination && !target.session.beginTemporaryStashReveal() { return false }
         for sibling in siblings where sibling.session.isExpandedForCoordination {
             if !sibling.session.hideForTemporaryStashTab() { return false }
         }

@@ -40,13 +40,13 @@ if result.returncode:
 session_source = (source / 'WindowSession.swift').read_text()
 methods = []
 for name in ['snappedScreenIsStale', 'reseatTemporaryShortcutGeometry', 'startTemporaryShortcutStash', 'cancelTemporaryShortcutStash', 'restoreTemporaryShortcutWindow',
-             'finishTemporaryShortcutSession', 'hideForTemporaryStashTab', 'revealForTemporaryStashTab', 'focusForTemporaryStashTab',
+             'finishTemporaryShortcutSession', 'beginTemporaryStashReveal', 'hideForTemporaryStashTab', 'revealForTemporaryStashTab', 'focusForTemporaryStashTab',
              'restoreAndDestroy', 'handleDestroyed', 'handleMouseUp', 'suspendForAccessibilityLoss', 'isDetachedFromManagedEdge',
              'relinquishToDockMinimizeIfDetachedFromEdge', 'prepareTemporaryShortcutFrame', 'edgeGeometry', 'getWindowFrame',
              'canRevealForTemporaryAppActivation', 'temporaryActivationFocusIsOutside', 'cancelTemporaryActivationReveal', 'beginTargetedActivationWindow',
              'shouldIgnoreTemporaryAppActivation', 'hideForTemporaryAppActivation',
              'setWindowPosition', 'setWindowPositionWithoutSystemAnimation',
-             'temporaryStashTabDescriptor', 'temporaryStashRecoveryRecord', 'clampFrameYToBounds', 'isWindowOnScreen', 'animateWindowPositionFast']:
+             'refreshTemporaryStashSpaces', 'temporaryStashTabDescriptor', 'temporaryStashRecoveryRecord', 'clampFrameYToBounds', 'isWindowOnScreen', 'animateWindowPositionFast']:
     matches = list(re.finditer(r'(?:    @discardableResult\n)?    (?:private )?(?:static )?func ' + name + r'\(.*?\n    }', session_source, re.S))
     if len(matches) != 1:
         sys.exit(f'Expected exactly one production method: {name}')
@@ -130,6 +130,12 @@ for name in ['recoverOwnedApplications', 'candidatePIDs']:
 rescue_fixture = (repo / 'Tests/TemporaryStashRescueHarness.swift.txt').read_text()
 rescue_fixture = rescue_fixture.replace('__RESCUE_METHODS__', '\n\n'.join(rescue_methods))
 visibility_fixture += '\n' + rescue_fixture
+# Exercise the real hide-before-reveal switch transaction with real session and
+# visibility logic, including reentrant state notifications from the old window.
+switch_method = re.search(r'    private func activate\(.*?\n    }', coordinator, re.S).group()
+switch_method = switch_method.replace('private func activate', 'func activate')
+visibility_fixture += '\nfinal class LiveSwitchCoordinator {\n'
+visibility_fixture += '    func rememberExpansion(of session: Session) {}\n' + switch_method + '\n}\n'
 visibility_fixture += '\n' + (repo / 'Tests/TemporaryStashAppVisibilityTests.swift.txt').read_text()
 visibility_output = output / 'app-visibility'
 visibility_output.mkdir(exist_ok=True)

@@ -14,6 +14,7 @@ func resetVisibilityBackend() {
     NSRunningApplication.hideSucceeds = true
     NSRunningApplication.unhideSucceeds = true
     NSRunningApplication.unhideIsImmediate = true
+    NSRunningApplication.onUnhide = nil
     NSRunningApplication.pendingUnhides = []
     NSRunningApplication.hideIsImmediate = true
     NSRunningApplication.pendingHides = []
@@ -35,6 +36,7 @@ func resetVisibilityBackend() {
     applicationElements.removeAll()
     cgWindows = []
     appVisibilityEvents = []
+    StashDebugLog.messages = []
 }
 
 func collapsedSessions(visibility: TemporaryStashAppVisibility, count: Int = 1, pid: pid_t = 123) -> [Session] {
@@ -85,8 +87,8 @@ delayedHide.reconcile(sessions: [delayedSession])
 appVisibilityEvents.removeAll()
 delayedSession.revealForTemporaryStashTab()
 expect(appVisibilityEvents.first == "unhide:123" && NSRunningApplication.pendingHides.isEmpty
-       && delayedSession.isSnappedForCoordination,
-       "pending hide cancellation keeps reveal intent until the acknowledgement window settles")
+       && delayedSession.isExpandedForCoordination && delayedSession.alpha == 1,
+       "already effective unhide expands immediately even while an older hide acknowledgement is settling")
 Thread.sleep(forTimeInterval: 0.85)
 delayedHide.reconcile(sessions: [delayedSession])
 expect(delayedSession.isExpandedForCoordination, "confirmed cancellation resumes requested reveal without another hover")
@@ -407,8 +409,9 @@ raceVisibility.reconcile(sessions: raceSessions)
 raceSessions[0].revealForTemporaryStashTab()
 NSRunningApplication.hidden.insert(123) // Older hide completes AFTER unhide.
 raceVisibility.applicationWasHidden(pid: 123)
-expect(raceStore.load().first?.phase == "revealRequested" && raceSessions[0].isSnappedForCoordination,
-       "late hide acknowledgement cannot reverse a pending reveal or permit early geometry")
+expect(raceStore.load().first?.phase == "revealRequested" && raceSessions[0].isExpandedForCoordination
+       && !NSRunningApplication.hidden.contains(123),
+       "late hide is immediately unhidden without reversing the synchronously completed expansion")
 raceMoment = raceMoment.addingTimeInterval(0.3)
 raceVisibility.reconcile(sessions: raceSessions)
 raceMoment = raceMoment.addingTimeInterval(0.6)
@@ -525,6 +528,232 @@ expect(!NSRunningApplication.hidden.contains(123) && startupStore.load().isEmpty
 NSRunningApplication.launches[123] = Date(timeIntervalSince1970: 200)
 expect(!startupProbe.candidates(pid: 123, bundle: "same.app", launch: ownedRecord.launchDate).contains(123),
        "new geometry rescue records reject PID reuse even within the same bundle")
+
+// Finder exposes its desktop as an AXScrollArea without a subrole in AXWindows.
+resetVisibilityBackend()
+let finderVisibility = TemporaryStashAppVisibility()
+let finderSessions = collapsedSessions(visibility: finderVisibility, count: 2)
+let desktop = Element()
+desktop.role = "AXScrollArea"
+desktop.standard = false
+desktop.subroleUnavailable = true
+applicationElements[123]!.windows!.append(desktop)
+finderVisibility.reconcile(sessions: finderSessions)
+expect(NSRunningApplication.hidden.contains(123) && appVisibilityEvents.contains("hide:123"),
+       "Finder-style non-AXWindow desktop element with nil subrole does not block hiding")
+expect(desktop.writes == 0 && desktop.events.isEmpty && applicationElements[123]!.windows!.contains(desktop),
+       "hiding never changes desktop proxy position size visibility or membership")
+let hiddenSlot = 4
+finderSessions[0].temporaryStashSlot = hiddenSlot
+TemporaryStashWindowSpaces.memberships[finderSessions[0].windowElement.systemWindowID!] = [2]
+expect(finderSessions[0].temporaryStashTabDescriptor()?.isOnScreen == false
+       && finderSessions[0].temporaryStashTabDescriptor()?.spaceID == 2,
+       "hidden application's live desktop change updates label column and cached presence")
+TemporaryStashWindowSpaces.active = [2]
+expect(finderSessions[0].temporaryStashTabDescriptor()?.isOnScreen == true
+       && finderSessions[0].temporaryStashSlot == hiddenSlot,
+       "moved hidden label appears on destination desktop and retains slot preference")
+finderVisibility.restoreAll(reason: "cleanup")
+
+resetVisibilityBackend()
+let reasonVisibility = TemporaryStashAppVisibility()
+let reasonSessions = collapsedSessions(visibility: reasonVisibility)
+let unownedWindow = Element()
+applicationElements[123]!.windows!.append(unownedWindow)
+reasonVisibility.reconcile(sessions: reasonSessions)
+reasonVisibility.reconcile(sessions: reasonSessions)
+func skipMessages(_ reason: String) -> [String] {
+    StashDebugLog.messages.filter { $0.contains("app not-hidden") && $0.contains("reason=\(reason)") }
+}
+expect(skipMessages("unmanaged-standard-window").count == 1
+       && skipMessages("unmanaged-standard-window")[0].contains("phase=unowned"),
+       "unowned app logs why it is not hidden exactly once for unchanged state")
+unownedWindow.subroleUnavailable = true
+reasonVisibility.reconcile(sessions: reasonSessions)
+reasonVisibility.reconcile(sessions: reasonSessions)
+expect(skipMessages("unknown-window-subrole").count == 1 && !NSRunningApplication.hidden.contains(123),
+       "real AXWindow with unknown subrole still prevents hiding and logs changed reason once")
+unownedWindow.subroleUnavailable = false
+reasonVisibility.reconcile(sessions: reasonSessions)
+expect(skipMessages("unmanaged-standard-window").count == 2, "return to previous not-hidden reason logs a new state transition")
+applicationElements[123]!.windows = nil
+reasonVisibility.reconcile(sessions: reasonSessions)
+reasonVisibility.reconcile(sessions: reasonSessions)
+expect(skipMessages("unknown-windows").count == 1, "AX enumeration failure logs once rather than every polling tick")
+applicationElements[123]!.windows = reasonSessions.map(\.windowElement)
+reasonVisibility.reconcile(sessions: reasonSessions)
+expect(NSRunningApplication.hidden.contains(123), "fixed eligibility clears not-hidden diagnostic state and hides normally")
+reasonSessions[0].revealForTemporaryStashTab()
+reasonVisibility.reconcile(sessions: reasonSessions)
+reasonVisibility.reconcile(sessions: reasonSessions)
+expect(skipMessages("expanded-window").count == 1, "expanded-window exclusion is transition-logged without repeated polling messages")
+reasonVisibility.restoreAll(reason: "cleanup")
+
+// Regression: confirmation must synchronously finish geometry/alpha/activation,
+// even when the previous app's collapse re-enters visibility reconciliation.
+for delayed in [false, true] {
+    resetVisibilityBackend()
+    var switchMoment = Date()
+    let switching = TemporaryStashAppVisibility(now: { switchMoment })
+    let a = collapsedSessions(visibility: switching)[0]
+    let b = collapsedSessions(visibility: switching, pid: 456)[0]
+    let pair = [a, b]
+    switching.reconcile(sessions: pair)
+    a.revealForTemporaryStashTab()
+    let switcher = LiveSwitchCoordinator()
+    var reenteredBeforeAlpha = false
+    for session in pair {
+        session.onTemporaryShortcutStashStateChanged = { session, stashed in
+            if !stashed && session.pid == 456 { reenteredBeforeAlpha = session.alpha == 0 }
+            switching.reconcile(sessions: pair)
+        }
+    }
+    NSRunningApplication.unhideIsImmediate = !delayed
+    appVisibilityEvents.removeAll()
+    _ = switcher.activate(b.temporaryStashTabDescriptor()!, among: pair.compactMap { $0.temporaryStashTabDescriptor() })
+    expect(a.isSnappedForCoordination && !appVisibilityEvents.contains("hide:123"),
+           "A collapses but its app hide is deferred until B expansion finishes delayed=\(delayed)")
+    expect(!appVisibilityEvents.contains("hide:456")
+           && appVisibilityEvents.filter { $0 == "unhide:456" }.count == 1,
+           "fast A-to-B starts exactly one B unhide and never an intervening B hide delayed=\(delayed)")
+    if delayed {
+        expect(b.isSnappedForCoordination && b.alpha == 0, "unconfirmed B remains collapsed and transparent")
+        switchMoment = switchMoment.addingTimeInterval(0.05)
+        switching.reconcile(sessions: pair)
+        expect(!appVisibilityEvents.contains("hide:123") && !appVisibilityEvents.contains("hide:456"),
+               "poll while B unhide is pending cannot hide A or B")
+        NSRunningApplication.hidden.remove(456)
+        switching.applicationWasUnhidden(pid: 456)
+    }
+    expect(b.isExpandedForCoordination && b.alpha == 1 && NSWorkspace.shared.frontmostApplication?.processIdentifier == 456,
+           "B confirmation completes geometry alpha and activation before notification/request returns delayed=\(delayed)")
+    expect(reenteredBeforeAlpha && !appVisibilityEvents.contains("hide:123") && !appVisibilityEvents.contains("hide:456"),
+           "reentrant expanded-state notification before alpha cannot hide either side of switch delayed=\(delayed)")
+    switchMoment = switchMoment.addingTimeInterval(0.1)
+    switching.reconcile(sessions: pair)
+    expect(appVisibilityEvents.contains("hide:123") && !appVisibilityEvents.contains("hide:456")
+           && appVisibilityEvents.filter { $0 == "unhide:456" }.count == 1,
+           "only A is hidden after B has completely expanded delayed=\(delayed)")
+    NSRunningApplication.unhideIsImmediate = true
+    appVisibilityEvents.removeAll()
+    _ = switcher.activate(a.temporaryStashTabDescriptor()!, among: pair.compactMap { $0.temporaryStashTabDescriptor() })
+    expect(a.isExpandedForCoordination && a.alpha == 1 && b.isSnappedForCoordination
+           && !appVisibilityEvents.contains("hide:123") && !appVisibilityEvents.contains("hide:456"),
+           "immediate B-to-A return also avoids hide-unhide bouncing delayed=\(delayed)")
+    switching.restoreAll(reason: "cleanup")
+}
+
+// The failure in the captured log: unhide succeeds, but the first geometry
+// attempt cannot expand. Ownership release must not erase the reveal protection.
+resetVisibilityBackend()
+var retryMoment = Date()
+let retryReveal = TemporaryStashAppVisibility(now: { retryMoment })
+let retrySession = collapsedSessions(visibility: retryReveal)[0]
+retryReveal.reconcile(sessions: [retrySession])
+NSRunningApplication.unhideIsImmediate = false
+retrySession.revealForTemporaryStashTab()
+retrySession.rawUnavailable = true
+NSRunningApplication.hidden.remove(123)
+appVisibilityEvents.removeAll()
+retryReveal.applicationWasUnhidden(pid: 123)
+expect(retrySession.isSnappedForCoordination, "unhide confirmation may encounter temporary AX geometry failure")
+retryMoment = retryMoment.addingTimeInterval(0.1)
+retryReveal.reconcile(sessions: [retrySession])
+expect(!appVisibilityEvents.contains("hide:123") && !NSRunningApplication.hidden.contains(123),
+       "confirmed but not yet expanded app remains protected independently of hide ownership")
+retrySession.rawUnavailable = false
+retryMoment = retryMoment.addingTimeInterval(0.1)
+retryReveal.reconcile(sessions: [retrySession])
+expect(retrySession.isExpandedForCoordination && retrySession.alpha == 1
+       && !appVisibilityEvents.contains("unhide:123") && !appVisibilityEvents.contains("hide:123"),
+       "AX recovery resumes outstanding reveal without another hover or hide-unhide round trip")
+
+resetVisibilityBackend()
+var expiryMoment = Date()
+let expiry = TemporaryStashAppVisibility(now: { expiryMoment })
+let expirySession = collapsedSessions(visibility: expiry)[0]
+expiry.reconcile(sessions: [expirySession])
+expirySession.rawUnavailable = true
+expirySession.revealForTemporaryStashTab()
+appVisibilityEvents.removeAll()
+for _ in 0..<3 {
+    expiryMoment = expiryMoment.addingTimeInterval(0.3)
+    expirySession.revealForTemporaryStashTab()
+    expiry.reconcile(sessions: [expirySession])
+}
+expect(!NSRunningApplication.hidden.contains(123) && appVisibilityEvents.isEmpty,
+       "failed expansion stays protected for first 0.9 seconds without hide requests")
+expiryMoment = expiryMoment.addingTimeInterval(0.11)
+expiry.reconcile(sessions: [expirySession])
+expiry.reconcile(sessions: [expirySession])
+expect(NSRunningApplication.hidden.contains(123)
+       && StashDebugLog.messages.filter { $0.contains("app reveal timeout") }.count == 1,
+       "one-second deadline is not extended by polls; timeout logs once and resumes normal hide rules")
+expirySession.rawUnavailable = false
+expiryMoment = expiryMoment.addingTimeInterval(0.1)
+expiry.reconcile(sessions: [expirySession])
+expect(expirySession.isSnappedForCoordination && NSRunningApplication.hidden.contains(123),
+       "expired reveal callback cannot revive a window after AX recovery")
+
+resetVisibilityBackend()
+var hiddenExpiryMoment = Date()
+let hiddenExpiry = TemporaryStashAppVisibility(now: { hiddenExpiryMoment })
+let hiddenExpirySession = collapsedSessions(visibility: hiddenExpiry)[0]
+hiddenExpiry.reconcile(sessions: [hiddenExpirySession])
+NSRunningApplication.unhideSucceeds = false
+hiddenExpirySession.revealForTemporaryStashTab()
+hiddenExpiryMoment = hiddenExpiryMoment.addingTimeInterval(1.01)
+appVisibilityEvents.removeAll()
+hiddenExpiry.reconcile(sessions: [hiddenExpirySession])
+expect(hiddenExpirySession.isSnappedForCoordination && NSRunningApplication.hidden.contains(123)
+       && appVisibilityEvents.isEmpty && StashDebugLog.messages.contains { $0.contains("app reveal timeout") },
+       "unhide that never becomes effective times out without continued unhide retries or losing hide ownership")
+
+// Deferral is scoped to a physical edge, and cancellation/cleanup removes it
+// even for an already visible app that has no hide ownership record.
+for finish in ["cancel", "cleanup"] {
+    resetVisibilityBackend()
+    let visiblePending = TemporaryStashAppVisibility()
+    let target = collapsedSessions(visibility: visiblePending)[0]
+    let source = collapsedSessions(visibility: visiblePending, pid: 456)[0]
+    target.rawUnavailable = true
+    target.revealForTemporaryStashTab()
+    appVisibilityEvents.removeAll()
+    visiblePending.reconcile(sessions: [target, source])
+    expect(!appVisibilityEvents.contains("hide:123") && !appVisibilityEvents.contains("hide:456"),
+           "unowned visible reveal protects itself and defers same-edge source hide finish=\(finish)")
+    source.currentEdge = 1
+    visiblePending.reconcile(sessions: [target, source])
+    expect(appVisibilityEvents.contains("hide:456") && !appVisibilityEvents.contains("hide:123"),
+           "pending reveal does not defer an unrelated edge's app hiding finish=\(finish)")
+    if finish == "cancel" { target.cancelTemporaryShortcutStash() }
+    else { visiblePending.restoreAll(reason: "cleanup") }
+    target.rawUnavailable = false
+    appVisibilityEvents.removeAll()
+    visiblePending.reconcile(sessions: [target, source])
+    expect(!target.isExpandedForCoordination,
+           "\(finish) removes visible unowned reveal callback instead of reviving it on AX recovery")
+    visiblePending.restoreAll(reason: "cleanup")
+}
+
+resetVisibilityBackend()
+let inlineConfirmation = TemporaryStashAppVisibility()
+let inlineSession = collapsedSessions(visibility: inlineConfirmation)[0]
+inlineConfirmation.reconcile(sessions: [inlineSession])
+NSRunningApplication.onUnhide = { pid in
+    inlineConfirmation.applicationWasUnhidden(pid: pid)
+    inlineConfirmation.reconcile(sessions: [inlineSession])
+}
+appVisibilityEvents.removeAll()
+inlineSession.revealForTemporaryStashTab()
+expect(inlineSession.isExpandedForCoordination && inlineSession.alpha == 1
+       && appVisibilityEvents.filter { $0 == "unhide:123" }.count == 1
+       && appVisibilityEvents.filter { $0 == "size" }.count == 1
+       && appVisibilityEvents.filter { $0 == "alpha:1.0" }.count == 1
+       && !appVisibilityEvents.contains("hide:123"),
+       "unhide notification and reconciliation inside request return expand exactly once without reentrant hiding")
+NSRunningApplication.onUnhide = nil
+inlineConfirmation.restoreAll(reason: "cleanup")
 
 print("RESULT app-visibility checks=\(total) failures=\(failures)")
 exit(failures == 0 ? 0 : 1)

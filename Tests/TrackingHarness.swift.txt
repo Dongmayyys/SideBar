@@ -61,6 +61,7 @@ func advance(_ ticks: Int) {
 enum NSEvent { static var mouseLocation = CGPoint(x: 900, y: 700); static var pressedMouseButtons = 0 }
 struct Color {}
 struct Screen {
+    let displayID: UInt32 = 1
     let frame = CGRect(x: 0, y: 0, width: 1000, height: 800)
     var visibleFrame = CGRect(x: 0, y: 40, width: 1000, height: 730)
 }
@@ -94,6 +95,8 @@ final class NSWorkspace { static let shared = NSWorkspace(); var frontmostApplic
 @discardableResult func axSetBoolAttribute(on element: AXUIElement, attribute: CFString, value: Bool, context: String) -> Bool { true }
 struct Pins { let safeRect: CGRect }
 final class TemporaryStashAppVisibility {
+    func beginReveal(pid: pid_t, sessionID: String, screenID: UInt32, edge: Int) -> Bool { true }
+    func completeReveal(pid: pid_t, sessionID: String) {}
     func prepareToReveal(pid: pid_t, sessionID: String, onReady: @escaping () -> Void) -> Bool { true }
 }
 

@@ -62,7 +62,7 @@ enum TemporaryStashWindowSpaces {
 final class TemporaryStashAppVisibility {
     struct Presence {
         let displayUUID: String
-        let spaces: Set<UInt64>
+        var spaces: Set<UInt64>
         var lastVisible: Bool
         let generation: Int
     }
@@ -80,7 +80,14 @@ final class TemporaryStashAppVisibility {
         var settleUntil = Date.distantPast
         var activationUntil = Date.distantPast
     }
-    private var revealCallbacks: [pid_t: [String: () -> Void]] = [:]
+    private struct PendingReveal {
+        let screenID: UInt32
+        let edge: Int
+        let deadline: Date
+        var onReady: (() -> Void)?
+        var isResuming = false
+    }
+    private var pendingReveals: [pid_t: [String: PendingReveal]] = [:]
     private var applications: [pid_t: HiddenApplication] = [:]
     private var spaceGeneration = 0
     private var sequence = 0
@@ -89,6 +96,7 @@ final class TemporaryStashAppVisibility {
     private let now: () -> Date
     private var lastActiveDescription = ""
     private var presenceDiagnostics: [String: String] = [:]
+    private var notHiddenReasons: [pid_t: String] = [:]
     private var nextPresenceSampleAt: [pid_t: Date] = [:]
     private static var sampleDiagnostics: [String: String] = [:]
 
@@ -126,9 +134,8 @@ final class TemporaryStashAppVisibility {
         if remove { applications[pid] = nil }
         else { applications[pid]?.phase = .released }
         if reason == "unhide-confirmed" {
-            let callbacks = revealCallbacks.removeValue(forKey: pid)?.values.map { $0 } ?? []
-            callbacks.forEach { $0() }
-        } else { revealCallbacks[pid] = nil }
+            resumeReveals(pid: pid)
+        } else { pendingReveals[pid] = nil }
     }
 
     private func persist(pid: pid_t) {
@@ -157,6 +164,7 @@ final class TemporaryStashAppVisibility {
     }
 
     private func advance(pid: pid_t) {
+        expireReveals()
         guard let current = applications[pid] else { return }
         guard !current.app.isTerminated,
               let live = NSRunningApplication(processIdentifier: pid), !live.isTerminated,
@@ -175,11 +183,14 @@ final class TemporaryStashAppVisibility {
                 else { release(pid: pid, reason: "hide-confirmation-timeout", remove: false) }
             }
         case .revealRequested:
-            if !live.isHidden && now() >= current.settleUntil {
-                // Retain logical presence across CG/AX publication lag until the
-                // requesting session writes its geometry or activation expires.
-                applications[pid]?.activationUntil = now().addingTimeInterval(0.8)
-                release(pid: pid, reason: "unhide-confirmed", remove: false)
+            if !live.isHidden {
+                // Geometry must not wait for a poll or for an older hide's
+                // acknowledgement window. Keep that transaction durable while
+                // allowing the requested window to expand immediately.
+                if now() >= current.settleUntil {
+                    applications[pid]?.activationUntil = now().addingTimeInterval(0.8)
+                    release(pid: pid, reason: "unhide-confirmed", remove: false)
+                } else { resumeReveals(pid: pid) }
             } else if now().timeIntervalSince(current.requestedAt) >= 0.2 {
                 // Keep a cancelled pending hide's intent through its acknowledgement
                 // window: an older hide can complete after the first unhide.
@@ -196,48 +207,89 @@ final class TemporaryStashAppVisibility {
         }
     }
 
+    private func skipHiding(pid: pid_t, reason: String) {
+        if notHiddenReasons[pid] != reason {
+            StashDebugLog.write("app not-hidden pid=\(pid) phase=\(applications[pid]?.phase.rawValue ?? "unowned") reason=\(reason)")
+            notHiddenReasons[pid] = reason
+        }
+        _ = restore(pid: pid, reason: reason)
+    }
+
     func reconcile(sessions: [WindowSession], activatingPID: pid_t? = nil) {
         pendingActivationPID = activatingPID
+        expireReveals()
         let activeDescription = String(describing: TemporaryStashWindowSpaces.activeSpacesByDisplay()?.sorted { $0.key < $1.key })
         if activeDescription != lastActiveDescription {
             StashDebugLog.write("space active changed generation=\(spaceGeneration) value=\(activeDescription) previous=\(lastActiveDescription)")
             lastActiveDescription = activeDescription
         }
         for pid in Array(applications.keys) { advance(pid: pid) }
+        for pid in Array(pendingReveals.keys) {
+            if NSRunningApplication(processIdentifier: pid)?.isHidden == false { resumeReveals(pid: pid) }
+        }
         let groups = Dictionary(grouping: sessions.filter(\.isManagedByTemporaryShortcut), by: \.pid)
+        notHiddenReasons = notHiddenReasons.filter { groups[$0.key] != nil || applications[$0.key] != nil }
         for pid in Array(applications.keys) where groups[pid] == nil {
-            _ = restore(pid: pid, reason: "no-managed-windows")
+            skipHiding(pid: pid, reason: "no-managed-windows")
         }
         for (pid, group) in groups {
             guard let first = group.first, let app = NSRunningApplication(processIdentifier: pid),
                   !app.isTerminated else { release(pid: pid, reason: "terminated"); continue }
             guard group.allSatisfy(\.isSnappedForCoordination) else {
-                _ = restore(pid: pid, reason: "expanded-window"); continue
+                skipHiding(pid: pid, reason: "expanded-window"); continue
             }
+            if pendingReveals[pid]?.isEmpty == false { continue }
             if let current = applications[pid], current.phase == .revealRequested { continue }
+            let revealOnSameEdge = group.contains { session in
+                guard let descriptor = session.temporaryStashTabDescriptor() else { return false }
+                return pendingReveals.values.contains { intents in
+                    intents.values.contains { $0.screenID == descriptor.screenID && $0.edge == descriptor.edge }
+                }
+            }
+            if revealOnSameEdge && !app.isHidden
+                && (applications[pid] == nil || applications[pid]?.phase == .released) {
+                skipHiding(pid: pid, reason: "same-edge-reveal-pending"); continue
+            }
             var value: CFTypeRef?
             guard AccessibilityRuntimeGuard.copyAttributeValue(of: first.appElement, attribute: kAXWindowsAttribute as CFString,
                       value: &value, context: "TemporaryStashAppVisibility.windows") == .success,
                   let windows = value as? [AXUIElement] else {
-                _ = restore(pid: pid, reason: "unknown-windows"); continue
+                skipHiding(pid: pid, reason: "unknown-windows"); continue
             }
-            let profiled = windows.map { window in
-                (window: window, profile: WindowCapabilityProfiler.profile(of: window, bundleID: first.bundleID,
+            let elements = windows.map { element -> (window: AXUIElement, role: String?) in
+                var role: CFTypeRef?
+                _ = AccessibilityRuntimeGuard.copyAttributeValue(of: element, attribute: kAXRoleAttribute as CFString,
+                    value: &role, context: "TemporaryStashAppVisibility.role")
+                return (element, role as? String)
+            }
+            // Finder includes its desktop AXScrollArea in AXWindows. Only real
+            // AXWindow elements can veto hiding; desktop icons are OS-managed.
+            let profiled = elements.filter { $0.role == kAXWindowRole }.map { element in
+                let window = element.window
+                return (window: window, profile: WindowCapabilityProfiler.profile(of: window, bundleID: first.bundleID,
                     context: "TemporaryStashAppVisibility.standard"))
             }
             guard profiled.allSatisfy({ $0.profile.subrole != nil }) else {
-                _ = restore(pid: pid, reason: "unknown-window-subrole"); continue
+                skipHiding(pid: pid, reason: "unknown-window-subrole"); continue
             }
             let standard = profiled.filter { $0.profile.isStandardWindow }.map { $0.window }
             guard !standard.isEmpty, standard.allSatisfy({ window in group.contains { CFEqual($0.windowElement, window) } }) else {
-                _ = restore(pid: pid, reason: "unmanaged-standard-window"); continue
+                skipHiding(pid: pid, reason: "unmanaged-standard-window"); continue
             }
             if let current = applications[pid], current.phase == .released,
                current.activationUntil != .distantPast, now() >= current.activationUntil, pendingActivationPID != pid {
                 release(pid: pid, reason: "activation-grace-ended")
             }
-            if applications[pid] != nil || pendingActivationPID == pid { continue }
-            guard !app.isHidden, let launchDate = app.launchDate else { continue }
+            if applications[pid] != nil { continue }
+            if pendingActivationPID == pid {
+                skipHiding(pid: pid, reason: "activation-pending"); continue
+            }
+            guard !app.isHidden else {
+                skipHiding(pid: pid, reason: "externally-hidden"); continue
+            }
+            guard let launchDate = app.launchDate else {
+                skipHiding(pid: pid, reason: "unknown-process-identity"); continue
+            }
             guard now() >= (nextPresenceSampleAt[pid] ?? .distantPast) else { continue }
             nextPresenceSampleAt[pid] = now().addingTimeInterval(1)
             var presence: [String: Presence] = [:]
@@ -250,7 +302,10 @@ final class TemporaryStashAppVisibility {
                 presence[session.temporaryStashID] = session.temporaryStashPresence
                 if let id = WindowAlphaManager.shared.findWindowID(for: session.windowElement, pid: pid) { ids.append(id) }
             }
-            guard presence.count == group.count, ids.count == group.count else { continue }
+            guard presence.count == group.count, ids.count == group.count else {
+                skipHiding(pid: pid, reason: "unknown-window-presence"); continue
+            }
+            notHiddenReasons[pid] = nil
             nextPresenceSampleAt[pid] = nil
             sequence += 1
             applications[pid] = HiddenApplication(app: app, launchDate: launchDate, bundleID: first.bundleID, windows: presence,
@@ -260,10 +315,11 @@ final class TemporaryStashAppVisibility {
         }
     }
 
-    func isOnScreen(sessionID: String, pid: pid_t) -> Bool? {
+    func isOnScreen(sessionID: String, pid: pid_t, spaces: Set<UInt64>? = nil) -> Bool? {
         guard let current = applications[pid], !current.app.isTerminated,
-              current.phase != .released || (!current.app.isHidden && (now() < current.activationUntil || pendingActivationPID == pid)),
+              current.phase != .released || (!current.app.isHidden && (now() < current.activationUntil || pendingActivationPID == pid || pendingReveals[pid] != nil)),
               var presence = current.windows[sessionID] else { return nil }
+        if let spaces, !spaces.isEmpty { presence.spaces = spaces }
         let active = TemporaryStashWindowSpaces.activeSpacesByDisplay()?[presence.displayUUID]
         if let active { presence.lastVisible = presence.spaces.contains(active) }
         applications[pid]?.windows[sessionID] = presence
@@ -303,7 +359,12 @@ final class TemporaryStashAppVisibility {
         notification(pid: pid, kind: "hide")
         if applications[pid]?.phase == .released, NSRunningApplication(processIdentifier: pid)?.isHidden == true {
             release(pid: pid, reason: "user-hide")
-        } else { advance(pid: pid) }
+        } else {
+            if applications[pid]?.phase == .revealRequested {
+                request(pid: pid, reveal: true, reason: "late-hide-during-reveal")
+            }
+            advance(pid: pid)
+        }
     }
 
     func spaceDidChange(topologyChanged: Bool = false) {
@@ -314,21 +375,73 @@ final class TemporaryStashAppVisibility {
         }
     }
 
+    /// Registered before collapsing the previous label, including its reentrant
+    /// state notifications. Polling retries never extend this deadline.
+    @discardableResult
+    func beginReveal(pid: pid_t, sessionID: String, screenID: UInt32, edge: Int) -> Bool {
+        guard let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated,
+              !app.isHidden || (applications[pid] != nil && applications[pid]?.phase != .released) else { return false }
+        if pendingReveals[pid]?[sessionID] == nil {
+            pendingReveals[pid, default: [:]][sessionID] = PendingReveal(screenID: screenID, edge: edge,
+                deadline: now().addingTimeInterval(1))
+            StashDebugLog.write("app reveal pending pid=\(pid) session=\(sessionID) timeout=1s")
+        }
+        return true
+    }
+
+    private func resumeReveals(pid: pid_t) {
+        guard NSRunningApplication(processIdentifier: pid)?.isHidden == false else { return }
+        for id in Array((pendingReveals[pid] ?? [:]).keys) {
+            guard let intent = pendingReveals[pid]?[id], !intent.isResuming,
+                  now() < intent.deadline, let callback = intent.onReady else { continue }
+            pendingReveals[pid]?[id]?.isResuming = true
+            callback()
+            pendingReveals[pid]?[id]?.isResuming = false
+        }
+    }
+
+    private func expireReveals() {
+        for (pid, intents) in pendingReveals {
+            for (id, intent) in intents where now() >= intent.deadline {
+                pendingReveals[pid]?[id] = nil
+                StashDebugLog.write("app reveal timeout pid=\(pid) session=\(id) reason=not-expanded normal-hide-rules=true")
+            }
+            guard pendingReveals[pid]?.isEmpty == true else { continue }
+            pendingReveals[pid] = nil
+            if applications[pid]?.phase == .revealRequested {
+                if applications[pid]?.app.isHidden == true {
+                    applications[pid]?.phase = .hiddenOwned
+                    persist(pid: pid)
+                } else { release(pid: pid, reason: "reveal-timeout") }
+            }
+        }
+    }
+
+    func completeReveal(pid: pid_t, sessionID: String) {
+        guard pendingReveals[pid]?.removeValue(forKey: sessionID) != nil else { return }
+        if pendingReveals[pid]?.isEmpty == true { pendingReveals[pid] = nil }
+        StashDebugLog.write("app reveal complete pid=\(pid) session=\(sessionID)")
+    }
+
     func prepareToReveal(pid: pid_t, sessionID: String = "", onReady: @escaping () -> Void = {}) -> Bool {
         guard let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated else { return false }
         if app.isHidden && (applications[pid] == nil || applications[pid]?.phase == .released) { return false }
+        pendingReveals[pid]?[sessionID]?.onReady = onReady
+        // A confirmed unhide may call back while restore() is still on the stack.
+        // Do not restart or release that transaction from the nested prepare.
+        if !app.isHidden && applications[pid]?.phase != .hideRequested { return true }
         let ready = restore(pid: pid, reason: "reveal")
-        if !ready { revealCallbacks[pid, default: [:]][sessionID] = onReady }
-        return ready
+        return ready || (!app.isHidden && applications[pid]?.phase == .revealRequested)
     }
 
     @discardableResult
     func restore(pid: pid_t, reason: String) -> Bool {
-        guard let current = applications[pid] else { return true }
-        if reason == "cancel" || reason == "session-cleanup" || reason == "cleanup" {
-            revealCallbacks[pid] = nil
+        if reason == "cancel" || reason == "session-cleanup" || reason == "cleanup" || reason == "no-managed-windows" {
+            pendingReveals[pid] = nil
         }
+        guard let current = applications[pid] else { return true }
         if current.phase == .released {
+            if pendingReveals[pid]?.isEmpty == false { return !current.app.isHidden }
             // No hide ownership remains (e.g. a user hide following external unhide).
             release(pid: pid, reason: reason)
             return !current.app.isHidden
@@ -346,7 +459,8 @@ final class TemporaryStashAppVisibility {
     }
 
     func cancelPendingReveal(pid: pid_t, sessionID: String) {
-        if revealCallbacks[pid]?.removeValue(forKey: sessionID) != nil {
+        if pendingReveals[pid]?.removeValue(forKey: sessionID) != nil {
+            if pendingReveals[pid]?.isEmpty == true { pendingReveals[pid] = nil }
             StashDebugLog.write("app reveal intent cancelled pid=\(pid) session=\(sessionID) reason=activation-reset")
         }
     }
@@ -364,6 +478,7 @@ final class TemporaryStashAppVisibility {
     }
 
     func restoreAll(reason: String, timeout: TimeInterval = 1) {
+        pendingReveals.removeAll()
         for pid in Array(applications.keys) { _ = restore(pid: pid, reason: reason) }
         let deadline = Date().addingTimeInterval(timeout)
         while applications.values.contains(where: { $0.phase == .revealRequested }), Date() < deadline {

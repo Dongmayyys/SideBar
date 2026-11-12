@@ -77,8 +77,22 @@ struct TemporaryStashSlotAssignment: Codable, Equatable {
     let screenID: UInt32
     let edge: Int
     var slot: Int
+    // nil is the shared all-desktops column (unknown or multiple Spaces).
+    var spaceID: UInt64? = nil
 
-    func sharesColumn(with other: Self) -> Bool { screenID == other.screenID && edge == other.edge }
+    func sharesColumn(with other: Self) -> Bool {
+        screenID == other.screenID && edge == other.edge && spaceID == other.spaceID
+    }
+
+    func conflicts(with other: Self) -> Bool {
+        screenID == other.screenID && edge == other.edge
+            && (spaceID == nil || other.spaceID == nil || spaceID == other.spaceID)
+    }
+
+    static func singleSpace(in spaces: Set<UInt64>?) -> UInt64? {
+        guard let spaces, spaces.count == 1, let id = spaces.first, id > 0 else { return nil }
+        return id
+    }
 }
 
 enum TemporaryStashSlots {
@@ -89,28 +103,40 @@ enum TemporaryStashSlots {
         return slot <= capacity ? slot : nil
     }
 
-    /// Existing residents claim their slots before windows arriving from another display.
+    /// Existing residents claim their slots before windows arriving from another column.
     static func resolve(existing: [TemporaryStashSlotAssignment], requested: [TemporaryStashSlotAssignment]) -> [TemporaryStashSlotAssignment] {
         let residents = requested.filter { item in existing.contains { $0.id == item.id && $0.sharesColumn(with: item) } }
         let arrivals = requested.filter { item in !residents.contains { $0.id == item.id } }
         var resolved: [TemporaryStashSlotAssignment] = []
         for var item in residents + arrivals {
             let previous = existing.first { $0.id == item.id }
-            let occupied = Set(resolved.filter { $0.sharesColumn(with: item) }.map(\.slot))
+            let occupied = Set(resolved.filter { $0.conflicts(with: item) }.map(\.slot))
             item.slot = allocate(preferred: item.slot > 0 ? item.slot : previous?.slot ?? 0, occupied: occupied) ?? 0
             resolved.append(item)
         }
         return requested.compactMap { item in resolved.first { $0.id == item.id } }
     }
 
-    static func move(id: String, to slot: Int, assignments: [TemporaryStashSlotAssignment]) -> [TemporaryStashSlotAssignment] {
-        guard slot > 0, let source = assignments.first(where: { $0.id == id }) else { return assignments }
-        return assignments.map { item in
+    static func move(id: String, to slot: Int, assignments: [TemporaryStashSlotAssignment],
+                     capacity: Int = Int.max - 1) -> [TemporaryStashSlotAssignment] {
+        guard slot > 0, slot <= capacity, var source = assignments.first(where: { $0.id == id }) else { return assignments }
+        let oldSlot = source.slot
+        source.slot = slot
+        let targets = assignments.filter { $0.id != id && $0.conflicts(with: source) && $0.slot == slot }
+        let swapped = targets.map { item in
             var item = item
-            if item.id == id { item.slot = slot }
-            else if item.sharesColumn(with: source) && item.slot == slot { item.slot = source.slot }
+            item.slot = oldSlot
             return item
         }
+        // A shared label may swap with several desktop-local labels. If a local
+        // label swaps with a shared one, reserve the shared destination before
+        // resolving other desktops' residents at that same slot.
+        let untouched = assignments.filter { $0.id != id && !targets.contains($0) }
+        let resolved = resolve(existing: [], requested: [source] + swapped + untouched)
+        guard resolved.allSatisfy({ item in
+            item.slot <= capacity || assignments.first(where: { $0.id == item.id })?.slot == item.slot
+        }) else { return assignments }
+        return assignments.compactMap { item in resolved.first { $0.id == item.id } }
     }
 }
 

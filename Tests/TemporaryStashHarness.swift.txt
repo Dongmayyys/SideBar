@@ -68,6 +68,8 @@ final class WindowSession {
     func focusForTemporaryStashTab() { focusCount += 1 }
     var focusCount = 0
     func toggleExpandCollapse() {}
+    var spaceID: UInt64?
+    var activeSpaceID: UInt64?
     var temporaryStashSlot = 0
     let temporaryStashID: String
     var isManagedByTemporaryShortcut = true
@@ -92,7 +94,7 @@ final class WindowSession {
     func temporaryStashTabDescriptor() -> TemporaryStashTabDescriptor? {
         return TemporaryStashTabDescriptor(session: self, edge: edge, screenID: screenID,
                                            visibleFrame: visibleFrame,
-                                           isOnScreen: eligible, title: temporaryStashID)
+                                           isOnScreen: eligible, title: temporaryStashID, spaceID: spaceID, activeSpaceID: activeSpaceID)
     }
     func temporaryActivationDiagnostics(activatedPID: pid_t) -> String { temporaryStashID }
     func cancelTemporaryActivationReveal() {}
@@ -117,6 +119,7 @@ final class WindowSession {
         isExpandedForCoordination = false
         return true
     }
+    func beginTemporaryStashReveal() -> Bool { true }
     func revealForTemporaryStashTab(isAppActivated: Bool = false) {
         guard canReveal else { return }
         appActivationReveal = isAppActivated

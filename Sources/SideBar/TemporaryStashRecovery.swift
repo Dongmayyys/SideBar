@@ -18,17 +18,18 @@ struct TemporaryStashRecoveryRecord: Codable, Equatable {
     var closedAt: Date? = nil
     var slot: Int = 0
     var windowFrame: CGRect? = nil
+    var spaceIDs: Set<UInt64>? = nil
     var matchingFrame: CGRect { windowFrame ?? originalFrame }
 
     private enum CodingKeys: String, CodingKey {
-        case id, bundleID, pid, windowID, edge, screenID, originalFrame, ordinal, originalSize, awaitingRelaunch, closedAt, slot, windowFrame
+        case id, bundleID, pid, windowID, edge, screenID, originalFrame, ordinal, originalSize, awaitingRelaunch, closedAt, slot, windowFrame, spaceIDs
     }
 
     private enum LegacyKeys: String, CodingKey { case waitForProcessExit }
 
     init(id: String, bundleID: String, pid: Int32, windowID: UInt32, edge: Int, screenID: UInt32,
          originalFrame: CGRect, ordinal: Int, originalSize: CGSize? = nil,
-         awaitingRelaunch: Bool = false, slot: Int = 0, windowFrame: CGRect? = nil) {
+         awaitingRelaunch: Bool = false, slot: Int = 0, windowFrame: CGRect? = nil, spaceIDs: Set<UInt64>? = nil) {
         self.id = id
         self.bundleID = bundleID
         self.pid = pid
@@ -41,6 +42,7 @@ struct TemporaryStashRecoveryRecord: Codable, Equatable {
         self.awaitingRelaunch = awaitingRelaunch
         self.slot = slot
         self.windowFrame = windowFrame
+        self.spaceIDs = spaceIDs
     }
 
     init(from decoder: Decoder) throws {
@@ -62,6 +64,7 @@ struct TemporaryStashRecoveryRecord: Codable, Equatable {
         }
         slot = try values.decodeIfPresent(Int.self, forKey: .slot) ?? 0
         windowFrame = try values.decodeIfPresent(CGRect.self, forKey: .windowFrame)
+        spaceIDs = try values.decodeIfPresent(Set<UInt64>.self, forKey: .spaceIDs)
     }
 
     func waitingForRelaunch() -> Self {
@@ -131,7 +134,8 @@ struct TemporaryStashRecoverySnapshot: Codable, Equatable {
 
 extension TemporaryStashRecoveryRecord {
     var slotAssignment: TemporaryStashSlotAssignment {
-        TemporaryStashSlotAssignment(id: id, screenID: screenID, edge: edge, slot: slot)
+        TemporaryStashSlotAssignment(id: id, screenID: screenID, edge: edge, slot: slot,
+                                     spaceID: TemporaryStashSlotAssignment.singleSpace(in: spaceIDs))
     }
 }
 

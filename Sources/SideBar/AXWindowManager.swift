@@ -689,6 +689,11 @@ class AXWindowManager {
                 session.temporaryStashSlot = record.slot
             }
         }
+        for index in pendingTemporaryRecovery.indices {
+            if let record = temporaryRecovery.windows.first(where: { $0.id == pendingTemporaryRecovery[index].id }) {
+                pendingTemporaryRecovery[index].slot = record.slot
+            }
+        }
         temporaryRecoveryStore.save(temporaryRecovery)
         temporaryTabCoordinator.restoreSlots(temporaryRecovery.assignments, pendingIDs: Set(pendingTemporaryRecovery.map(\.id)))
     }
@@ -708,7 +713,7 @@ class AXWindowManager {
         let liveIDs = Set(live.map(\.id))
         let allRecords = temporaryRecovery.windows.filter { !liveIDs.contains($0.id) } + live
         let occupied = Set(allRecords.filter {
-            $0.id != record.id && $0.screenID == record.screenID && $0.edge == record.edge
+            $0.id != record.id && $0.slotAssignment.conflicts(with: record.slotAssignment)
         }.map(\.slot))
         let existing = temporaryRecovery.windows.first { $0.id == record.id }
         let retainsSlot = existing?.screenID == record.screenID && existing?.edge == record.edge && existing?.slot == preferred

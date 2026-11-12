@@ -14,6 +14,10 @@ func record(_ id: String = "saved", pid: Int32 = 123, bundle: String = "same.app
                                  originalSize: original.size, slot: slot, windowFrame: frame)
 }
 func resetBackend() {
+    TemporaryStashWindowSpaces.available = true
+    TemporaryStashWindowSpaces.memberships = [:]
+    TemporaryStashWindowSpaces.active = [1]
+    TemporaryStashWindowSpaces.displays = nil
     NSWorkspace.shared.frontmostApplication = nil
     NSScreen.screens = [NSScreen(frame: primary)]
     NSRunningApplication.knownAppsOnly = true
@@ -117,6 +121,7 @@ expect(manager.temporaryTabCoordinator.suppressedIDs == [saved.id], "stationary 
 expect(manager.temporaryOrdinals.assign(bundleID: "same.app", windowID: "new") == 3,
        "manager reserves saved ordinal before accepting any new stash")
 var normalizedSaved = saved
+normalizedSaved.spaceIDs = [1]
 normalizedSaved.windowFrame = CGRect(origin: original.origin, size: CGSize(width: original.width, height: 1000))
 expect(manager.temporaryRecoveryStore.load().windows == [normalizedSaved],
        "restoration persists normalized matching size without changing original identity or restore geometry")
@@ -508,6 +513,77 @@ shorterDisplay.run()
 expect(shorterDisplay.sessions.first?.temporaryStashSlot == 6
        && shorterDisplay.temporaryRecoveryStore.load().windows.first?.slot == 6,
        "restart on a temporarily shorter display preserves original slot instead of filling an earlier empty slot")
+
+// Persist membership, but never trust archived Space IDs for a live restored window.
+resetBackend()
+var spaceRecord = record("space-restored", slot: 4)
+spaceRecord.spaceIDs = [999]
+let spaceEncoded = try! JSONEncoder().encode(spaceRecord)
+expect(try! JSONDecoder().decode(TemporaryStashRecoveryRecord.self, from: spaceEncoded) == spaceRecord,
+       "Space membership round-trips with recovery record")
+var oldSpaceJSON = try! JSONSerialization.jsonObject(with: spaceEncoded) as! [String: Any]
+oldSpaceJSON.removeValue(forKey: "spaceIDs")
+let oldSpaceRecord = try! JSONDecoder().decode(TemporaryStashRecoveryRecord.self, from: JSONSerialization.data(withJSONObject: oldSpaceJSON))
+expect(oldSpaceRecord.spaceIDs == nil && oldSpaceRecord.slot == 4 && oldSpaceRecord.slotAssignment.spaceID == nil,
+       "old fixed-slot archives without Space information decode as shared and keep slot number")
+TemporaryStashWindowSpaces.memberships[42] = [22]
+let spaceRecovery = RecoveryManager([spaceRecord])
+spaceRecovery.run()
+expect(spaceRecovery.sessions.first?.temporaryStashSlot == 4
+       && spaceRecovery.temporaryRecovery.windows.first?.spaceIDs == [22],
+       "recovery replaces stale archived Space IDs with current window membership and keeps slot")
+TemporaryStashWindowSpaces.memberships[42] = [33]
+spaceRecovery.persist()
+expect(spaceRecovery.temporaryRecovery.windows.first?.spaceIDs == [33]
+       && spaceRecovery.sessions.first?.temporaryStashSlot == 4,
+       "window moved between desktops updates persistence without renumbering")
+spaceRecovery.stop()
+
+resetBackend()
+TemporaryStashWindowSpaces.available = false
+let unknownRecovery = RecoveryManager([spaceRecord])
+unknownRecovery.run()
+expect(unknownRecovery.sessions.first?.temporaryStashSlot == 4
+       && unknownRecovery.temporaryRecovery.windows.first?.spaceIDs == nil,
+       "unknown current membership uses shared column while preserving archived slot when free")
+unknownRecovery.stop()
+
+resetBackend()
+let anotherWindow = Element()
+anotherWindow.systemWindowID = 43
+applicationElements[123]!.windows!.append(anotherWindow)
+TemporaryStashWindowSpaces.memberships = [42: [1], 43: [2]]
+let independent = RecoveryManager([])
+expect(independent.stash(applicationElements[123]!.windows![0]) && independent.stash(anotherWindow),
+       "normal shortcut entry stashes windows on different desktops")
+expect(independent.sessions.map(\.temporaryStashSlot) == [1, 1], "normal shortcut allocation reuses slot one across desktops")
+let firstID = independent.sessions[0].temporaryStashID
+TemporaryStashWindowSpaces.memberships[42] = [2]
+independent.persist()
+expect(independent.sessions[0].temporaryStashSlot == 2 && independent.sessions[1].temporaryStashSlot == 1,
+       "live cross-desktop collision preserves destination resident and fills topmost empty slot")
+TemporaryStashWindowSpaces.memberships[42] = [2, 3]
+independent.persist()
+let unknownWindow = Element()
+unknownWindow.systemWindowID = 44
+applicationElements[123]!.windows!.append(unknownWindow)
+TemporaryStashWindowSpaces.memberships[44] = [3]
+expect(independent.stash(unknownWindow) && independent.sessions.last?.temporaryStashSlot == 1,
+       "new desktop-local stash reuses unrelated local slots but respects multi-Space shared slot")
+expect(independent.temporaryRecovery.windows.first { $0.id == firstID }?.spaceIDs == [2, 3],
+       "multi-Space membership is persisted rather than collapsed into an arbitrary Space")
+independent.stop()
+
+resetBackend()
+var waitingShared = record("waiting-shared", bundle: "waiting.app", windowID: 60, slot: 4)
+waitingShared.awaitingRelaunch = true
+waitingShared.spaceIDs = nil
+let conflictUnknown = RecoveryManager([waitingShared, spaceRecord])
+TemporaryStashWindowSpaces.available = false
+conflictUnknown.run()
+expect(conflictUnknown.sessions.first?.temporaryStashSlot == 1,
+       "unknown recovery membership keeps waiting shared reservation and uses topmost free slot on conflict")
+conflictUnknown.stop()
 
 print("RESULT checks=\(total) failures=\(failures)")
 exit(failures == 0 ? 0 : 1)

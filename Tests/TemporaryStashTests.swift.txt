@@ -39,7 +39,7 @@ expect(TemporaryStashGeometry.restorePosition(original: original.offsetBy(dx: 85
 let usable = CGRect(x: 60, y: 50, width: 900, height: 900)
 let isolated = TemporaryStashGeometry.labelFrames(count: 1, edge: 1, visibleFrame: usable)
 expect(isolated[0].midY == usable.midY && isolated[0].minX == usable.minX, "single label centers inside visibleFrame")
-expect(isolated[0].width == 24 && isolated[0].height == 120, "fixed label dimensions")
+expect(isolated[0].width == 18 && isolated[0].height == 120, "fixed label dimensions")
 let column = TemporaryStashGeometry.labelFrames(count: 3, edge: 2, visibleFrame: usable)
 expect(near((column[0].maxY + column[2].minY) / 2, usable.midY), "whole column centers vertically")
 expect(zip(column, column.dropFirst()).allSatisfy { near($0.minY - $1.maxY, 4) }, "top-to-bottom order with four point gaps")

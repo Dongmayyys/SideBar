@@ -3,9 +3,9 @@ import CoreGraphics
 
 /// 快捷键标签的原型参数集中在这里；不处理一条边排不下的情况。
 enum TemporaryStashDefaults {
-    static let labelWidth: CGFloat = 24
+    static let labelWidth: CGFloat = 18
     static let labelHeight: CGFloat = 120
-    static let fontSize: CGFloat = 12
+    static let fontSize: CGFloat = 11
     static let lineHeight: CGFloat = 15
     static let textPadding: CGFloat = 8
     static let labelGap: CGFloat = 4

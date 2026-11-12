@@ -218,6 +218,8 @@ class AXWindowManager {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { [weak self] in
             guard let self else { return }
             self.reconcileIndicators()
+            // 辅助功能只能读到当前桌面的窗口；切到窗口所在桌面后再尝试恢复等待中的收纳。
+            if !self.pendingTemporaryRecovery.isEmpty { self.restoreTemporaryShortcuts(attemptsRemaining: 20) }
         }
     }
 

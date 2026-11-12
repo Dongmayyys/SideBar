@@ -3070,7 +3070,7 @@ class WindowSession {
             safeRestorePosition: PersistedPoint(safeRestorePosition(for: visibleFrame)),
             displayFrame: PersistedRect(getDisplayBounds()),
             updatedAt: Date().timeIntervalSince1970,
-            processLaunchDate: NSRunningApplication(processIdentifier: pid)?.launchDate
+            processLaunchDate: NSRunningApplication(processIdentifier: pid)?.processStartDate
         )
         AppConfig.shared.upsertWindowRescueRecord(record)
     }

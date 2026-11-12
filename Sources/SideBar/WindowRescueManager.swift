@@ -18,7 +18,7 @@ final class WindowRescueManager {
                   let windows = standardWindows(in: AXUIElementCreateApplication(record.pid)) else { continue }
             let ids = Set(windows.compactMap { WindowAlphaManager.shared.findWindowID(for: $0, pid: record.pid) })
             guard record.matches(pid: app.processIdentifier, bundleID: app.bundleIdentifier,
-                                 launchDate: app.launchDate, windowIDs: ids) else {
+                                 launchDate: app.processStartDate, windowIDs: ids) else {
                 StashDebugLog.write("rescue app rejected pid=\(record.pid) reason=identity-or-window-mismatch")
                 continue
             }
@@ -177,13 +177,13 @@ final class WindowRescueManager {
 
         if let app = NSRunningApplication(processIdentifier: record.pid), !app.isTerminated,
            app.bundleIdentifier == record.bundleID,
-           record.processLaunchDate == nil || record.processLaunchDate == app.launchDate {
+           record.processLaunchDate == nil || record.processLaunchDate == app.processStartDate {
             result.append(record.pid)
         }
 
         let bundleMatches = NSWorkspace.shared.runningApplications.compactMap { app -> pid_t? in
             guard app.bundleIdentifier == record.bundleID, !app.isTerminated,
-                  record.processLaunchDate == nil || record.processLaunchDate == app.launchDate else { return nil }
+                  record.processLaunchDate == nil || record.processLaunchDate == app.processStartDate else { return nil }
             return app.processIdentifier
         }
 

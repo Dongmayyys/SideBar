@@ -146,6 +146,7 @@ final class NSRunningApplication {
     static var pendingHides: Set<Int32> = []
     static var launches: [Int32: Date] = [:]
     var launchDate: Date? { Self.launches[processIdentifier] ?? Date(timeIntervalSince1970: 100) }
+    var processStartDate: Date? { launchDate }
     var isHidden: Bool { Self.hidden.contains(processIdentifier) }
     var bundleIdentifier: String? { Self.bundles[processIdentifier] ?? "same.app" }
     var isTerminated: Bool { Self.terminated.contains(processIdentifier) }

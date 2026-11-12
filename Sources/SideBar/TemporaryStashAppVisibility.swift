@@ -149,7 +149,7 @@ final class TemporaryStashAppVisibility {
         guard var current = applications[pid] else { return }
         guard !current.app.isTerminated,
               let live = NSRunningApplication(processIdentifier: pid), !live.isTerminated,
-              live.launchDate == current.launchDate, live.bundleIdentifier == current.bundleID else {
+              live.processStartDate == current.launchDate, live.bundleIdentifier == current.bundleID else {
             release(pid: pid, reason: "request-process-identity-invalid")
             return
         }
@@ -168,7 +168,7 @@ final class TemporaryStashAppVisibility {
         guard let current = applications[pid] else { return }
         guard !current.app.isTerminated,
               let live = NSRunningApplication(processIdentifier: pid), !live.isTerminated,
-              live.launchDate == current.launchDate, live.bundleIdentifier == current.bundleID else {
+              live.processStartDate == current.launchDate, live.bundleIdentifier == current.bundleID else {
             release(pid: pid, reason: "process-identity-invalid")
             return
         }
@@ -287,7 +287,7 @@ final class TemporaryStashAppVisibility {
             guard !app.isHidden else {
                 skipHiding(pid: pid, reason: "externally-hidden"); continue
             }
-            guard let launchDate = app.launchDate else {
+            guard let launchDate = app.processStartDate else {
                 skipHiding(pid: pid, reason: "unknown-process-identity"); continue
             }
             guard now() >= (nextPresenceSampleAt[pid] ?? .distantPast) else { continue }

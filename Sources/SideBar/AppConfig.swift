@@ -68,7 +68,7 @@ enum DockAvoidanceMode: String, CaseIterable {
 
 class AppConfig: ObservableObject {
     static let shared = AppConfig()
-    static let defaultHoverTolerance: CGFloat = 0
+    static let defaultHoverTolerance: CGFloat = 60
     static let maxHoverToleranceX: CGFloat = 400
     static let maxHoverToleranceY: CGFloat = 400
     private var temporaryDockMinimizeExcludedBundleIDs: Set<String> = []

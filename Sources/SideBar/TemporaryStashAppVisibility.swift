@@ -110,13 +110,11 @@ final class TemporaryStashAppVisibility {
                 presence[session.temporaryStashID] = Presence(spaces: spaces,
                     wasOnScreen: session.temporaryStashTabDescriptor()?.isOnScreen == true, generation: spaceGeneration)
             }
-            if app.hide() {
-                applications[pid] = HiddenApplication(app: app, windows: presence)
-                resampleUntil[pid] = nil
-                StashDebugLog.write("app hide pid=\(pid) bundle=\(first.bundleID) windows=\(standard.count)")
-            } else {
-                StashDebugLog.write("app hide failed pid=\(pid) bundle=\(first.bundleID)")
-            }
+            // hide() 是异步的，返回值不可靠（常返回 false 但随后真的隐藏）；先记下归属再请求隐藏。
+            applications[pid] = HiddenApplication(app: app, windows: presence)
+            resampleUntil[pid] = nil
+            let accepted = app.hide()
+            StashDebugLog.write("app hide pid=\(pid) bundle=\(first.bundleID) windows=\(standard.count) accepted=\(accepted)")
         }
     }
 

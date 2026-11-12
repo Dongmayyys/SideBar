@@ -285,8 +285,11 @@ let failureSession = collapsedSessions(visibility: failuresVisibility)[0]
 NSRunningApplication.hideSucceeds = false
 failuresVisibility.reconcile(sessions: [failureSession])
 appVisibilityEvents.removeAll()
+failuresVisibility.reconcile(sessions: [failureSession])
+// hide() 是异步的：返回 false 时系统仍可能随后隐藏，所以 SideBar 照样记下归属，不会反复请求隐藏。
+expect(!appVisibilityEvents.contains("hide:\(failureSession.pid)"),
+       "hide request records ownership even when hide() returns false")
 failuresVisibility.restoreAll(reason: "cleanup")
-expect(appVisibilityEvents.isEmpty, "failed hide request never grants unhide ownership")
 NSRunningApplication.hideSucceeds = true
 failuresVisibility.reconcile(sessions: [failureSession])
 NSRunningApplication.unhideSucceeds = false

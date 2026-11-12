@@ -98,6 +98,9 @@ class AppConfig: ObservableObject {
     private let suppressMultiWindowTipKey = "SideBarSuppressMultiWindowTip"
     private let temporaryShortcutModifiersKey = "SideBarTemporaryShortcutModifiers"
     private let temporaryShortcutKeyCodeKey = "SideBarTemporaryShortcutKeyCode"
+    private let mainInterfaceShortcutModifiersKey = "SideBarMainInterfaceShortcutModifiers"
+    private let mainInterfaceShortcutKeyCodeKey = "SideBarMainInterfaceShortcutKeyCode"
+    private let mainInterfaceShortcutConfiguredKey = "SideBarMainInterfaceShortcutConfigured"
     private let dockAvoidanceModeKey = "SideBarDockAvoidanceMode"
     private let updateCheckFrequencyKey = "SideBarUpdateCheckFrequency"
     private let lastSuccessfulUpdateCheckAtKey = "SideBarLastSuccessfulUpdateCheckAt"
@@ -175,6 +178,30 @@ class AppConfig: ObservableObject {
         }
     }
     
+    @Published var mainInterfaceShortcutModifiers: UInt? {
+        didSet {
+            if let mainInterfaceShortcutModifiers {
+                UserDefaults.standard.set(mainInterfaceShortcutModifiers, forKey: mainInterfaceShortcutModifiersKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: mainInterfaceShortcutModifiersKey)
+            }
+            UserDefaults.standard.set(true, forKey: mainInterfaceShortcutConfiguredKey)
+            NotificationCenter.default.post(name: NSNotification.Name("AppConfigDidChange"), object: nil)
+        }
+    }
+
+    @Published var mainInterfaceShortcutKeyCode: UInt16? {
+        didSet {
+            if let mainInterfaceShortcutKeyCode {
+                UserDefaults.standard.set(Int(mainInterfaceShortcutKeyCode), forKey: mainInterfaceShortcutKeyCodeKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: mainInterfaceShortcutKeyCodeKey)
+            }
+            UserDefaults.standard.set(true, forKey: mainInterfaceShortcutConfiguredKey)
+            NotificationCenter.default.post(name: NSNotification.Name("AppConfigDidChange"), object: nil)
+        }
+    }
+
     @Published var launchAtLogin: Bool = true {
         didSet {
             UserDefaults.standard.set(launchAtLogin, forKey: "SideBarLaunchAtLogin")
@@ -290,6 +317,16 @@ class AppConfig: ObservableObject {
             self.temporaryShortcutKeyCode = nil
         }
         
+        if UserDefaults.standard.bool(forKey: mainInterfaceShortcutConfiguredKey)
+            || UserDefaults.standard.object(forKey: mainInterfaceShortcutModifiersKey) != nil
+            || UserDefaults.standard.object(forKey: mainInterfaceShortcutKeyCodeKey) != nil {
+            self.mainInterfaceShortcutModifiers = (UserDefaults.standard.object(forKey: mainInterfaceShortcutModifiersKey) as? NSNumber)?.uintValue
+            self.mainInterfaceShortcutKeyCode = (UserDefaults.standard.object(forKey: mainInterfaceShortcutKeyCodeKey) as? NSNumber).flatMap { UInt16(exactly: $0.intValue) }
+        } else {
+            self.mainInterfaceShortcutModifiers = NSEvent.ModifierFlags([.control, .option, .command]).rawValue
+            self.mainInterfaceShortcutKeyCode = 4
+        }
+
         if UserDefaults.standard.object(forKey: "SideBarLaunchAtLogin") == nil {
             self.launchAtLogin = true
             UserDefaults.standard.set(true, forKey: "SideBarLaunchAtLogin")
@@ -378,6 +415,13 @@ class AppConfig: ObservableObject {
             self.appSettings = newDict
         }
         
+        // 旧版可把收纳快捷键改为 H；保留它，停用有冲突的新默认值。
+        if mainInterfaceShortcutModifiers == temporaryShortcutModifiers,
+           mainInterfaceShortcutKeyCode == temporaryShortcutKeyCode {
+            self.mainInterfaceShortcutModifiers = nil
+            self.mainInterfaceShortcutKeyCode = nil
+        }
+
         // 监听系统外观切换，驱动所有 WindowSession 刷新快照条颜色
         DistributedNotificationCenter.default().addObserver(
             self,
@@ -570,6 +614,7 @@ class AppConfig: ObservableObject {
     }
 
     func setTemporaryShortcut(modifiers: UInt, keyCode: UInt16) {
+        guard mainInterfaceShortcutModifiers != modifiers || mainInterfaceShortcutKeyCode != keyCode else { return }
         temporaryShortcutModifiers = modifiers
         temporaryShortcutKeyCode = keyCode
     }
@@ -577,6 +622,17 @@ class AppConfig: ObservableObject {
     func clearTemporaryShortcut() {
         temporaryShortcutModifiers = nil
         temporaryShortcutKeyCode = nil
+    }
+
+    func setMainInterfaceShortcut(modifiers: UInt, keyCode: UInt16) {
+        guard temporaryShortcutModifiers != modifiers || temporaryShortcutKeyCode != keyCode else { return }
+        mainInterfaceShortcutModifiers = modifiers
+        mainInterfaceShortcutKeyCode = keyCode
+    }
+
+    func clearMainInterfaceShortcut() {
+        mainInterfaceShortcutModifiers = nil
+        mainInterfaceShortcutKeyCode = nil
     }
 
     func setTemporaryDockMinimizeExclusion(bundleID: String, excluded: Bool) {

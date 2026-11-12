@@ -668,5 +668,182 @@ hoverRestore.reconcile(sessions: [underPointer])
 expect(underPointer.isExpandedForCoordination, "leaving and reentering restored tab resumes normal hover behavior")
 hoverRestore.tearDownAll()
 
+do {
+    // Production manager recording/dispatch + production coordinator toggle. AX and apps stay in memory.
+    func activatedApp(_ pid: pid_t, window: Element = Element()) -> NSRunningApplication {
+        let app = NSRunningApplication(processIdentifier: pid)
+        let element = Element()
+        element.focused = window
+        appElements[pid] = element
+        return app
+    }
+    NSEvent.mouseLocation = CGPoint(x: 500, y: 400)
+    NSEvent.pressedMouseButtons = 0
+    WindowSession.ignoredActivationPIDs = []
+    AppConfig.shared.hoverDelayMS = 0
+    let home = activatedApp(9001)
+    let appA = activatedApp(9002)
+    let appB = activatedApp(9003)
+    let toggleManager = MainInterfaceManager()
+    let toggleA = WindowSession("toggle-a")
+    let toggleB = WindowSession("toggle-b", edge: 2)
+    toggleA.pid = appA.processIdentifier
+    toggleB.pid = appB.processIdentifier
+    appElements[appA.processIdentifier]?.focused = toggleA.windowElement
+    appElements[appB.processIdentifier]?.focused = toggleB.windowElement
+    // A was a normal focused window just before being stashed, so it must no longer be home.
+    toggleManager.activated(home)
+    toggleManager.activated(appA)
+    toggleManager.sessions = [toggleA, toggleB]
+    toggleManager.temporaryTabCoordinator.reconcile(sessions: toggleManager.sessions)
+    toggleManager.activated(appB)
+    let sidebar = activatedApp(ProcessInfo.processInfo.processIdentifier)
+    toggleManager.activated(sidebar)
+    let accessory = activatedApp(9004)
+    accessory.activationPolicy = .accessory
+    toggleManager.activated(accessory)
+    let prohibited = activatedApp(9005)
+    prohibited.activationPolicy = .prohibited
+    toggleManager.activated(prohibited)
+    // Hover A and then B, with both edges expanded before returning home.
+    for session in [toggleA, toggleB] {
+        let label = TemporaryStashTabWindow.live[session.temporaryStashID]!
+        NSEvent.mouseLocation = CGPoint(x: label.midX, y: label.midY)
+        toggleManager.temporaryTabCoordinator.reconcile(sessions: toggleManager.sessions)
+    }
+    expect(toggleA.isExpandedForCoordination && toggleB.isExpandedForCoordination, "hover records expansions on both edges")
+    let pinned = WindowSession("toggle-pin")
+    pinned.isPinned = true
+    pinned.isExpandedForCoordination = true
+    let configured = WindowSession("configured")
+    configured.isManagedByTemporaryShortcut = false
+    configured.isExpandedForCoordination = true
+    toggleManager.sessions += [pinned, configured]
+    toggleManager.temporaryTabCoordinator.reconcile(sessions: toggleManager.sessions)
+    expect(toggleManager.key(), "default H dispatch consumes shortcut")
+    expect(!toggleA.isExpandedForCoordination && !toggleB.isExpandedForCoordination, "H synchronously collapses all unpinned expanded stash windows")
+    expect(pinned.isExpandedForCoordination && configured.isExpandedForCoordination, "H leaves pinned and settings-managed windows unchanged")
+    expect(home.activations == 1, "home recording excludes stashed focus, SideBar, accessory and prohibited apps; reclassifies newly stashed A")
+    expect(WindowSession.ignoredActivationPIDs.contains(home.processIdentifier), "home activation is marked programmatic before activation")
+    let sameMouse = NSEvent.mouseLocation
+    Clock.now += 1
+    toggleManager.temporaryTabCoordinator.reconcile(sessions: toggleManager.sessions)
+    expect(!toggleA.isExpandedForCoordination && !toggleB.isExpandedForCoordination, "stationary mouse over B cannot undo return-home even at zero hover delay")
+    expect(toggleManager.key() && toggleB.isExpandedForCoordination && !toggleA.isExpandedForCoordination, "scenario 16 second H reveals most recent B, not A")
+    expect(toggleB.appActivationReveal, "H reveal uses Dock first-interaction gate with mouse outside window")
+    expect(toggleManager.key() && !toggleB.isExpandedForCoordination && home.activations == 2, "scenario 16 third H returns to original home")
+    expect(NSEvent.mouseLocation == sameMouse, "toggle needs no mouse movement")
+    for _ in 0..<4 { toggleManager.key() }
+    expect(!toggleB.isExpandedForCoordination && home.activations == 4, "repeated H alternates deterministically")
+    // Invisible latest candidate falls back immediately, without waiting for Space debounce.
+    toggleB.eligible = false
+    toggleManager.key()
+    expect(toggleA.isExpandedForCoordination && !toggleB.isExpandedForCoordination, "latest window on other Space falls back to A")
+    toggleManager.key()
+    toggleB.eligible = true
+    toggleB.isManagedByTemporaryShortcut = false
+    toggleManager.key()
+    expect(toggleA.isExpandedForCoordination && !toggleB.isExpandedForCoordination, "canceled recent stash falls back to previous window")
+    toggleManager.key()
+    toggleManager.sessions.removeAll { $0 === toggleA }
+    let homeBeforeNoop = home.activations
+    toggleManager.key()
+    expect(home.activations == homeBeforeNoop && pinned.isExpandedForCoordination, "closed/canceled history exhausted and only pinned remain: no action")
+    // Exited home is not replaced by an older app.
+    let exitedManager = MainInterfaceManager()
+    let oldHome = activatedApp(9010)
+    let exitedHome = activatedApp(9011)
+    exitedManager.activated(oldHome)
+    exitedManager.activated(exitedHome)
+    exitedHome.isTerminated = true
+    let exitedWindow = WindowSession("exited-window")
+    exitedWindow.isExpandedForCoordination = true
+    exitedManager.sessions = [exitedWindow]
+    exitedManager.key()
+    expect(!exitedWindow.isExpandedForCoordination && oldHome.activations == 0 && exitedHome.activations == 0, "exited primary app: collapse only, no activation or fallback")
+    let emptyManager = MainInterfaceManager()
+    expect(emptyManager.key() && !emptyManager.key(4, modifiers: 0), "no history H is no-op; unmatched combination is unhandled")
+    expect(emptyManager.key(1) && emptyManager.stashCalls == 1, "existing S still dispatches to stash handler")
+    AppConfig.shared.mainInterfaceShortcutKeyCode = 8
+    expect(!emptyManager.key() && emptyManager.key(8), "modified shortcut dispatches only new key")
+    AppConfig.shared.mainInterfaceShortcutKeyCode = 4
+    // A normal window of a stashed app is still a valid primary interface.
+    WindowSession.ignoredActivationPIDs = []
+    let normalWindow = Element()
+    appElements[appA.processIdentifier]?.focused = normalWindow
+    let mixedManager = MainInterfaceManager()
+    mixedManager.sessions = [toggleA]
+    mixedManager.activated(home)
+    mixedManager.activated(appA)
+    toggleA.isExpandedForCoordination = true
+    mixedManager.key()
+    expect(appA.activations == 1, "ordinary focused window in same software as a stash can become home")
+    // An ignored own activation must not replace the recorded home or reveal sibling stashes.
+    let ignoredApp = activatedApp(9012)
+    WindowSession.ignoredActivationPIDs.insert(ignoredApp.processIdentifier)
+    mixedManager.activated(ignoredApp)
+    toggleA.isExpandedForCoordination = true
+    mixedManager.key()
+    expect(ignoredApp.activations == 0 && appA.activations == 2, "programmatic activation does not replace home")
+    // Same-edge switch uses the same synchronous coordination and pinned exception as hover.
+    let edgeCoordinator = TemporaryStashTabCoordinator()
+    let edgeOld = WindowSession("edge-old")
+    let edgeRecent = WindowSession("edge-recent")
+    let edgePin = WindowSession("edge-pin")
+    edgePin.isPinned = true
+    edgePin.isExpandedForCoordination = true
+    edgeCoordinator.rememberExpansion(of: edgeRecent)
+    edgeCoordinator.reconcile(sessions: [edgeOld, edgeRecent, edgePin])
+    NSEvent.mouseLocation = CGPoint(x: 500, y: 400)
+    expect(edgeCoordinator.toggleMainInterface(sessions: [edgeOld, edgeRecent, edgePin]) == .revealed && edgeRecent.isExpandedForCoordination && edgePin.isExpandedForCoordination, "only pin expanded: toggle can reveal recent same-edge window without hiding pin")
+    edgeRecent.canHide = false
+    expect(edgeCoordinator.toggleMainInterface(sessions: [edgeOld, edgeRecent, edgePin]) == .unchanged && edgeRecent.isExpandedForCoordination, "failed AX collapse does not claim successful return home")
+    edgeRecent.canHide = true
+    _ = edgeCoordinator.toggleMainInterface(sessions: [edgeOld, edgeRecent, edgePin])
+    edgeRecent.eligible = false
+    expect(edgeCoordinator.toggleMainInterface(sessions: [edgeOld, edgeRecent, edgePin]) == .unchanged, "all history invisible: no action")
+    edgeCoordinator.tearDownAll()
+    let dockHistoryCoordinator = TemporaryStashTabCoordinator()
+    let dockRecent = WindowSession("dock-recent")
+    dockRecent.pid = 9101
+    dockRecent.activationFocused = true
+    WindowSession.ignoredActivationPIDs = []
+    NSWorkspace.shared.frontmostApplication = Application(processIdentifier: dockRecent.pid)
+    dockHistoryCoordinator.handleAppActivation(activatedPID: dockRecent.pid, activationPolicy: .regular, sessions: [dockRecent])
+    expect(dockRecent.isExpandedForCoordination && dockRecent.appActivationReveal, "Dock activation expands via production coordinator")
+    expect(dockHistoryCoordinator.toggleMainInterface(sessions: [dockRecent]) == .collapsed
+           && dockHistoryCoordinator.toggleMainInterface(sessions: [dockRecent]) == .revealed,
+           "Dock activation enters recent expansion history used by H")
+    dockHistoryCoordinator.tearDownAll()
+    let suppressedCoordinator = TemporaryStashTabCoordinator()
+    let suppressedA = WindowSession("suppressed-a")
+    let suppressedB = WindowSession("suppressed-b")
+    NSEvent.mouseLocation = CGPoint(x: 500, y: 400)
+    suppressedCoordinator.reconcile(sessions: [suppressedA, suppressedB])
+    suppressedCoordinator.rememberExpansion(of: suppressedB)
+    let pointerFrame = TemporaryStashTabWindow.live["suppressed-a"]!
+    NSEvent.mouseLocation = CGPoint(x: pointerFrame.midX, y: pointerFrame.midY)
+    AppConfig.shared.hoverDelayMS = 200
+    suppressedCoordinator.reconcile(sessions: [suppressedA, suppressedB])
+    expect(suppressedCoordinator.toggleMainInterface(sessions: [suppressedA, suppressedB]) == .revealed && suppressedB.isExpandedForCoordination, "H overrides pending hover timer on a different label")
+    Clock.now += 1
+    Timer.fireDue()
+    suppressedCoordinator.reconcile(sessions: [suppressedA, suppressedB])
+    expect(suppressedB.isExpandedForCoordination && !suppressedA.isExpandedForCoordination, "stationary hover does not replace the shortcut-revealed window")
+    NSEvent.mouseLocation = CGPoint(x: 500, y: 400)
+    suppressedCoordinator.reconcile(sessions: [suppressedA, suppressedB])
+    AppConfig.shared.hoverDelayMS = 0
+    NSEvent.mouseLocation = CGPoint(x: pointerFrame.midX, y: pointerFrame.midY)
+    transitions.removeAll()
+    suppressedCoordinator.reconcile(sessions: [suppressedA, suppressedB])
+    expect(suppressedA.isExpandedForCoordination && !suppressedB.isExpandedForCoordination
+           && transitions == ["hide:suppressed-b", "reveal:suppressed-a"], "exit/reenter restores hover and same-edge hide-before-reveal")
+    suppressedCoordinator.tearDownAll()
+    toggleManager.temporaryTabCoordinator.tearDownAll()
+    exitedManager.temporaryTabCoordinator.tearDownAll()
+    emptyManager.temporaryTabCoordinator.tearDownAll()
+    mixedManager.temporaryTabCoordinator.tearDownAll()
+}
+
 print("RESULT checks=\(total) failures=\(failures)")
 exit(failures == 0 ? 0 : 1)

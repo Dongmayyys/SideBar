@@ -16,7 +16,9 @@ class AXWindowManager {
     private var bundleLastExpandedSessions: [String: ObjectIdentifier] = [:]
     private var bundleLastSnappedSessions: [String: ObjectIdentifier] = [:]
     private var hasCleanedUp = false
-    
+    // 保留每个软件最后的普通焦点窗口；刚收纳该窗口时可回退到此前的主界面。
+    private var mainInterfaceHistory: [(app: NSRunningApplication, window: AXUIElement)] = []
+
     // 监听应用级别的通知 (如焦点窗口变化)，跟踪新建的窗口
     private var appObservers: [pid_t: (AXObserver, CFRunLoopSource)] = [:]
     
@@ -67,6 +69,7 @@ class AXWindowManager {
         synchronizeSessions()
         refreshSideBarHotkeyRuntime()
         restoreTemporaryShortcuts(attemptsRemaining: 6)
+        if let app = NSWorkspace.shared.frontmostApplication { recordMainInterfaceActivation(app) }
 
         fusionRefreshTimer = Timer.scheduledTimer(withTimeInterval: 0.12, repeats: true) { [weak self] _ in
             guard let self else { return }
@@ -214,6 +217,7 @@ class AXWindowManager {
     
     private func handleAppActivation(app: NSRunningApplication, isActivationNotification: Bool) {
         if isActivationNotification {
+            recordMainInterfaceActivation(app)
             temporaryTabCoordinator.handleAppActivation(activatedPID: app.processIdentifier,
                                                        activationPolicy: app.activationPolicy, sessions: sessions)
         }
@@ -234,6 +238,7 @@ class AXWindowManager {
             session.restoreAndDestroy()
         }
         sessions.removeAll()
+        mainInterfaceHistory.removeAll()
         bundleControlOwnerOverrides.removeAll()
         bundlePreferredClaimSessionIDs.removeAll()
         bundleLastExpandedSessions.removeAll()
@@ -500,6 +505,12 @@ class AXWindowManager {
         // 只关心修饰键中的四大标志位
         let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask).rawValue
 
+        if let mainModifiers = AppConfig.shared.mainInterfaceShortcutModifiers,
+           let mainKeyCode = AppConfig.shared.mainInterfaceShortcutKeyCode,
+           keyCode == mainKeyCode, modifiers == mainModifiers {
+            return handleMainInterfaceShortcut()
+        }
+
         if let temporaryModifiers = AppConfig.shared.temporaryShortcutModifiers,
            let temporaryKeyCode = AppConfig.shared.temporaryShortcutKeyCode,
            keyCode == temporaryKeyCode,
@@ -527,6 +538,33 @@ class AXWindowManager {
             }
         }
         return false
+    }
+
+    private func recordMainInterfaceActivation(_ app: NSRunningApplication) {
+        guard app.activationPolicy == .regular,
+              app.processIdentifier != ProcessInfo.processInfo.processIdentifier,
+              !WindowSession.shouldIgnoreTemporaryAppActivation(activatedPID: app.processIdentifier) else { return }
+        var value: CFTypeRef?
+        guard AccessibilityRuntimeGuard.copyAttributeValue(
+            of: AXUIElementCreateApplication(app.processIdentifier),
+            attribute: kAXFocusedWindowAttribute as CFString,
+            value: &value, context: "AXWindowManager.mainInterface.focusedWindow"
+        ) == .success, let value else { return }
+        let window = value as! AXUIElement
+        guard !sessions.contains(where: { $0.isManagedByTemporaryShortcut && CFEqual($0.windowElement, window) }) else { return }
+        mainInterfaceHistory.removeAll { $0.app.processIdentifier == app.processIdentifier || $0.app.isTerminated }
+        mainInterfaceHistory.append((app, window))
+    }
+
+    private func handleMainInterfaceShortcut() -> Bool {
+        if temporaryTabCoordinator.toggleMainInterface(sessions: sessions) == .collapsed,
+           let main = mainInterfaceHistory.last(where: { entry in
+               !sessions.contains { $0.isManagedByTemporaryShortcut && CFEqual($0.windowElement, entry.window) }
+           })?.app, !main.isTerminated {
+            WindowSession.suppressProgrammaticActivation(for: main.processIdentifier, duration: 0.6)
+            main.activate(options: .activateIgnoringOtherApps)
+        }
+        return true
     }
 
     private func handleTemporaryShortcut() -> Bool {
@@ -750,6 +788,9 @@ class AXWindowManager {
     }
 
     private func handleSessionStateTransition(_ session: WindowSession, oldState: SnapState, newState: SnapState) {
+        if session.isManagedByTemporaryShortcut, case .expanded = newState {
+            temporaryTabCoordinator.rememberExpansion(of: session)
+        }
         guard !session.isManagedByTemporaryShortcut else { return }
         rememberBundleWindowHistory(for: session, newState: newState)
         guard case .floating = oldState else { return }

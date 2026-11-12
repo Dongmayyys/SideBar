@@ -4074,6 +4074,7 @@ class WindowSession {
         guard isTemporaryShortcutManaged else { return false }
         if isTemporarilyPinned { return true }
         if !isExpandedForCoordination { return !isAnimating }
+        invalidatePendingFocusRelease()
         return collapseWindow(immediate: true, triggerEffects: false)
     }
 
@@ -4091,7 +4092,6 @@ class WindowSession {
         outsideCollapseCandidateSince = nil
         edgeDetachCandidateSince = nil
         rememberFocusReturnTargetBeforeReveal()
-        beginTargetedActivationWindow(for: 0.6)
         // ⌘Tab/Dock 激活时鼠标可能仍在窗外，沿用原 Dock 等待首次交互的门禁。
         pendingDockInteraction = isAppActivated
         hasReleasedDockClick = NSEvent.pressedMouseButtons & 1 == 0
@@ -4103,13 +4103,19 @@ class WindowSession {
         setWindowPosition(position: geometry.expanded)
         temporaryLastExpandedFrame = CGRect(origin: geometry.expanded, size: frame.size)
         setWindowAlpha(1, isHidden: false, frameHint: temporaryLastExpandedFrame)
+        focusForTemporaryStashTab()
+        startMouseTrackingTimer()
+        updatePinControlWindow()
+    }
+
+    func focusForTemporaryStashTab() {
+        guard isTemporaryShortcutManaged, isExpandedForCoordination else { return }
+        beginTargetedActivationWindow(for: 0.6)
         NSRunningApplication(processIdentifier: pid)?.activate(options: .activateIgnoringOtherApps)
         axSetBoolAttribute(on: windowElement, attribute: kAXMainAttribute as CFString, value: true,
                            context: "WindowSession.revealForTemporaryStashTab.main")
         axSetBoolAttribute(on: windowElement, attribute: kAXFocusedAttribute as CFString, value: true,
                            context: "WindowSession.revealForTemporaryStashTab.focused")
-        startMouseTrackingTimer()
-        updatePinControlWindow()
     }
 
     func handleMouseUp() {

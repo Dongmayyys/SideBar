@@ -358,5 +358,18 @@ axEvents.removeAll()
 dragWithoutWrite.cancelTemporaryShortcutStash(keepingFrame: dragWithoutWrite.windowElement.frame)
 expect(axEvents.isEmpty, "drag-away cancellation still writes neither position nor enhanced UI")
 
+let shortcutDismissed = Session()
+expect(shortcutDismissed.startTemporaryShortcutStash(), "prepare toggle focus-release cancellation")
+shortcutDismissed.revealForTemporaryStashTab(isAppActivated: true)
+expect(NSWorkspace.shared.frontmostApplication?.processIdentifier == shortcutDismissed.pid
+       && shortcutDismissed.windowElement.boolAttributes[kAXMainAttribute as String] == true
+       && shortcutDismissed.windowElement.boolAttributes[kAXFocusedAttribute as String] == true,
+       "toggle reveal activates app and focuses the exact source window for input")
+expect(Session.shouldIgnoreTemporaryAppActivation(activatedPID: shortcutDismissed.pid),
+       "toggle reveal marks its own activation before routing can reveal another stash")
+shortcutDismissed.focusReleasePending = true
+expect(shortcutDismissed.hideForTemporaryStashTab() && !shortcutDismissed.focusReleasePending,
+       "synchronous shortcut collapse invalidates old delayed focus release without scheduling another")
+
 print("RESULT checks=\(total) failures=\(failures)")
 exit(failures == 0 ? 0 : 1)

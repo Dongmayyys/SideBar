@@ -18,6 +18,7 @@ final class Element: NSObject {
     var enhancedUI: Bool? = false
     var enhancedUIReadResult: AXError = .success
     var boolResults: [AXError] = []
+    var boolAttributes: [String: Bool] = [:]
 }
 enum AccessibilityRuntimeGuard {
     static func copyAttributeValue(of element: Element, attribute: CFString, value: inout CFTypeRef?, context: String) -> AXError {
@@ -87,7 +88,10 @@ func axSetPositionAttribute(on element: Element, position: CGPoint, context: Str
 }
 @discardableResult
 func axSetBoolAttribute(on element: Element, attribute: CFString, value: Bool, context: String) -> AXResult {
-    guard attribute as String == "AXEnhancedUserInterface" else { return .success }
+    guard attribute as String == "AXEnhancedUserInterface" else {
+        element.boolAttributes[attribute as String] = value
+        return .success
+    }
     axEvents.append(value ? "restore" : "disable")
     let result = element.boolResults.isEmpty ? .success : element.boolResults.removeFirst()
     if result == .success { element.enhancedUI = value }

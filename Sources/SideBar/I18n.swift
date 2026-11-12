@@ -28,6 +28,8 @@ class I18n {
         "在 DockMinimize 中修改": "Change it in DockMinimize",
         "决定鼠标悬停在融合条、屏幕边缘或快捷键收纳标签多久后展开窗口。屏幕边缘等待期间点击会中止等待；按住标签可拖动排序。": "Sets how long to hover over a fusion bar, screen edge, or shortcut stash label before revealing the window. Clicking cancels a screen-edge wait; drag a label to reorder it.",
         "切换应用 (⌘Tab)": "Switch App (⌘Tab)",
+        "回到主界面": "Return to Main App",
+        "收起未固定的收纳窗口并回到主界面；再次按下展开最近使用的收纳窗口。": "Collapse unpinned stashed windows and return to the main app; press again to reveal the most recently used stashed window.",
         "切换窗口 (⌘`)": "Switch Window (⌘`)",
         "前往下载": "Go to Download",
         "剪切 (⌘X)": "Cut (⌘X)",

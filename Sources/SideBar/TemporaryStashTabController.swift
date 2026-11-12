@@ -13,6 +13,10 @@ enum TemporaryStashTabEvent {
     case hover, down(CGPoint), dragged(CGPoint), up(CGPoint)
 }
 
+enum TemporaryStashToggleResult {
+    case collapsed, revealed, unchanged
+}
+
 /// 快捷键标签独立于设置托管的融合条，面板只占标签本身的命中区域。
 final class TemporaryStashTabCoordinator {
     private struct EdgeKey: Hashable {
@@ -77,6 +81,41 @@ final class TemporaryStashTabCoordinator {
     // 只限制等待 Workspace 前台更新的时间；前台到位后的 AX 忙沿用原有重试。
     private var appActivationDeadline: Date?
     private var appActivationRetryTimer: Timer?
+    private var recentExpandedIDs: [String] = []
+
+    func rememberExpansion(of session: WindowSession) {
+        guard session.isManagedByTemporaryShortcut else { return }
+        recentExpandedIDs.removeAll { $0 == session.temporaryStashID }
+        recentExpandedIDs.append(session.temporaryStashID)
+    }
+
+    func toggleMainInterface(sessions: [WindowSession]) -> TemporaryStashToggleResult {
+        resetAppActivation()
+        resetHover()
+        // 快捷键优先于鼠标当前所在标签，移出再移入后才恢复悬停。
+        for (id, frame) in layoutFrames where frame.contains(NSEvent.mouseLocation) {
+            hoverSuppressedUntilExit.insert(id)
+        }
+        let managed = sessions.filter(\.isManagedByTemporaryShortcut)
+        let expanded = managed.filter { $0.isExpandedForCoordination && !$0.isTemporaryPinnedForFusion() }
+        if !expanded.isEmpty {
+            var allCollapsed = true
+            for session in expanded {
+                if !session.hideForTemporaryStashTab() { allCollapsed = false }
+            }
+            return allCollapsed ? .collapsed : .unchanged
+        }
+
+        let descriptors = managed.compactMap { $0.temporaryStashTabDescriptor() }.filter(\.isOnScreen)
+        for id in recentExpandedIDs.reversed() {
+            guard let target = descriptors.first(where: { $0.session.temporaryStashID == id }) else { continue }
+            // 当前可见性直接读取会话，不使用标签离屏去抖后的缓存。
+            guard activate(target, among: descriptors, waitForInteraction: true) else { return .unchanged }
+            if target.session.isTemporaryPinnedForFusion() { target.session.focusForTemporaryStashTab() }
+            return .revealed
+        }
+        return .unchanged
+    }
 
     func handleAppActivation(activatedPID: pid_t, activationPolicy: NSApplication.ActivationPolicy, sessions: [WindowSession]) {
         resetAppActivation()
@@ -123,6 +162,8 @@ final class TemporaryStashTabCoordinator {
             scheduleAppActivationRetry()
         }
         self.sessions = sessions.filter(\.isManagedByTemporaryShortcut)
+        let liveIDs = Set(self.sessions.map(\.temporaryStashID))
+        recentExpandedIDs.removeAll { !liveIDs.contains($0) }
         let now = Date()
         if let pending = pendingAppActivation {
             let isFrontmost = NSWorkspace.shared.frontmostApplication?.processIdentifier == pending.pid
@@ -333,14 +374,17 @@ final class TemporaryStashTabCoordinator {
         RunLoop.main.add(timer, forMode: .common)
     }
 
-    private func activate(_ target: TemporaryStashTabDescriptor, among descriptors: [TemporaryStashTabDescriptor], isAppActivated: Bool = false) -> Bool {
+    private func activate(_ target: TemporaryStashTabDescriptor, among descriptors: [TemporaryStashTabDescriptor], isAppActivated: Bool = false, waitForInteraction: Bool = false) -> Bool {
         let siblings = descriptors.filter { EdgeKey($0) == EdgeKey(target) && $0.session !== target.session }
         for sibling in siblings where sibling.session.isExpandedForCoordination {
             if !sibling.session.hideForTemporaryStashTab() { return false }
         }
         // 同边窗口收回可能经过 AX 调用；真正展开前再次确认前台及其余门槛。
         if isAppActivated && !target.session.canRevealForTemporaryAppActivation(activatedPID: target.session.pid) { return false }
-        if !target.session.isExpandedForCoordination { target.session.revealForTemporaryStashTab(isAppActivated: isAppActivated) }
+        if !target.session.isExpandedForCoordination {
+            target.session.revealForTemporaryStashTab(isAppActivated: isAppActivated || waitForInteraction)
+            if target.session.isExpandedForCoordination { rememberExpansion(of: target.session) }
+        }
         return target.session.isExpandedForCoordination
     }
 
@@ -355,6 +399,7 @@ final class TemporaryStashTabCoordinator {
         layoutFrames.removeAll()
         hoverSuppressedUntilExit.removeAll()
         sessions.removeAll()
+        recentExpandedIDs.removeAll()
         drag = nil
         resetHover()
         resetAppActivation()

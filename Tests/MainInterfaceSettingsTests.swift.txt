@@ -1,0 +1,81 @@
+import AppKit
+
+// Full production AppConfig, with only preference storage and cross-app export replaced.
+final class MemoryDefaults {
+    static let standard = MemoryDefaults()
+    var values: [String: Any] = [:]
+    init() {}
+    init?(suiteName: String) {}
+    func object(forKey key: String) -> Any? { values[key] }
+    func set(_ value: Any?, forKey key: String) { values[key] = value }
+    func removeObject(forKey key: String) { values[key] = nil }
+    func integer(forKey key: String) -> Int { (values[key] as? NSNumber)?.intValue ?? 0 }
+    func bool(forKey key: String) -> Bool { (values[key] as? NSNumber)?.boolValue ?? false }
+    func float(forKey key: String) -> Float { (values[key] as? NSNumber)?.floatValue ?? 0 }
+    func double(forKey key: String) -> Double { (values[key] as? NSNumber)?.doubleValue ?? 0 }
+    func string(forKey key: String) -> String? { values[key] as? String }
+    func stringArray(forKey key: String) -> [String]? { values[key] as? [String] }
+    func data(forKey key: String) -> Data? { values[key] as? Data }
+    func persistentDomain(forName name: String) -> [String: Any]? { nil }
+}
+enum AppLanguage: Int { case system = 0 }
+extension String { var localized: String { self } }
+struct AppInfo { let id: String; let name: String }
+final class SideBarBridge {
+    static let shared = SideBarBridge()
+    struct Binding { let bundleID: String }
+    func exportDockExclusions(bundleIDs: [String], reasons: [String: [String]]) {}
+    func mirroredHotkeyConflict(modifiers: UInt, keyCode: UInt16, excluding: String?) -> Binding? { nil }
+}
+
+__APP_CONFIG__
+
+__SHORTCUT_CONFLICTS__
+
+var total = 0
+var failures = 0
+func expect(_ condition: Bool, _ name: String) {
+    total += 1
+    if !condition { failures += 1 }
+    print("\(condition ? "PASS" : "FAIL") \(name)")
+}
+let modifiers = NSEvent.ModifierFlags([.control, .option, .command]).rawValue
+let config = AppConfig()
+expect(config.mainInterfaceShortcutModifiers == modifiers && config.mainInterfaceShortcutKeyCode == 4, "unset preferences default to control-option-command H")
+expect(config.temporaryShortcutModifiers == nil && config.temporaryShortcutKeyCode == nil, "new default does not rewrite existing stash settings")
+config.setMainInterfaceShortcut(modifiers: modifiers, keyCode: 8)
+expect(MemoryDefaults.standard.integer(forKey: "SideBarMainInterfaceShortcutModifiers") == Int(modifiers)
+       && MemoryDefaults.standard.integer(forKey: "SideBarMainInterfaceShortcutKeyCode") == 8, "custom binding writes independent preference keys")
+let restored = AppConfig()
+expect(restored.mainInterfaceShortcutModifiers == modifiers && restored.mainInterfaceShortcutKeyCode == 8, "custom binding reads back")
+restored.clearMainInterfaceShortcut()
+let cleared = AppConfig()
+expect(cleared.mainInterfaceShortcutModifiers == nil && cleared.mainInterfaceShortcutKeyCode == nil, "explicit clear survives reload rather than restoring H")
+cleared.setTemporaryShortcut(modifiers: modifiers, keyCode: 1)
+cleared.setMainInterfaceShortcut(modifiers: modifiers, keyCode: 1)
+expect(cleared.mainInterfaceShortcutKeyCode == nil && cleared.temporaryShortcutKeyCode == 1, "config rejects main shortcut matching stash shortcut")
+cleared.setMainInterfaceShortcut(modifiers: modifiers, keyCode: 4)
+cleared.setTemporaryShortcut(modifiers: modifiers, keyCode: 4)
+expect(cleared.temporaryShortcutKeyCode == 1 && cleared.mainInterfaceShortcutKeyCode == 4, "config rejects stash shortcut matching main shortcut")
+expect(shortcutConflictName(modifiers: modifiers, keyCode: 1, excludingID: mainInterfaceShortcutRecorderID, config: cleared, appInfos: []) != nil, "main recorder reports stash conflict")
+expect(shortcutConflictName(modifiers: modifiers, keyCode: 4, excludingID: temporaryShortcutRecorderID, config: cleared, appInfos: []) == "回到主界面", "stash recorder reports main conflict")
+expect(shortcutConflictName(modifiers: modifiers, keyCode: 4, excludingID: mainInterfaceShortcutRecorderID, config: cleared, appInfos: []) == nil, "recorder can retain its own current shortcut")
+expect(shortcutConflictName(modifiers: modifiers, keyCode: 4, excludingID: "another.app", config: cleared, appInfos: []) != nil, "app shortcut recorder also protects main shortcut")
+cleared.updateApp(bundleID: "other.app", isEnabled: true, colorName: "white")
+cleared.setShortcut(bundleID: "other.app", modifiers: modifiers, keyCode: 8)
+expect(shortcutConflictName(modifiers: modifiers, keyCode: 8, excludingID: mainInterfaceShortcutRecorderID, config: cleared, appInfos: [AppInfo(id: "other.app", name: "Other")]) == "Other", "main shortcut detects existing app bindings")
+cleared.clearTemporaryShortcut()
+cleared.setMainInterfaceShortcut(modifiers: 0, keyCode: 0)
+let zero = AppConfig()
+expect(zero.mainInterfaceShortcutModifiers == 0 && zero.mainInterfaceShortcutKeyCode == 0, "explicit zero modifier and keycode survive read/write")
+MemoryDefaults.standard.values = ["SideBarTemporaryShortcutModifiers": modifiers, "SideBarTemporaryShortcutKeyCode": 4]
+let legacyConflict = AppConfig()
+expect(legacyConflict.mainInterfaceShortcutKeyCode == nil && legacyConflict.temporaryShortcutKeyCode == 4, "legacy stash H preserved; conflicting new default disabled")
+MemoryDefaults.standard.values = ["SideBarTemporaryShortcutModifiers": modifiers, "SideBarTemporaryShortcutKeyCode": 1,
+    "SideBarMainInterfaceShortcutModifiers": modifiers, "SideBarMainInterfaceShortcutKeyCode": 1]
+let savedConflict = AppConfig()
+expect(savedConflict.mainInterfaceShortcutKeyCode == nil && savedConflict.temporaryShortcutKeyCode == 1, "conflicting saved preferences cannot dispatch both bindings")
+MemoryDefaults.standard.values = ["SideBarMainInterfaceShortcutModifiers": modifiers, "SideBarMainInterfaceShortcutKeyCode": 65536]
+expect(AppConfig().mainInterfaceShortcutKeyCode == nil, "out-of-range stored keycode is ignored without trapping")
+print("RESULT settings checks=\(total) failures=\(failures)")
+exit(failures == 0 ? 0 : 1)

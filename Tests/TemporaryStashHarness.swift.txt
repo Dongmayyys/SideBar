@@ -12,13 +12,38 @@ struct Date: Comparable {
     static func < (lhs: Date, rhs: Date) -> Bool { lhs.value < rhs.value }
 }
 enum StashDebugLog { static func write(_ message: String) {} }
-struct Application { let processIdentifier: pid_t }
+final class NSRunningApplication {
+    let processIdentifier: pid_t
+    var activationPolicy: NSApplication.ActivationPolicy = .regular
+    var isTerminated = false
+    var activations = 0
+    var bundleIdentifier: String? { "app.\(processIdentifier)" }
+    init(processIdentifier: pid_t) { self.processIdentifier = processIdentifier }
+    struct Options: OptionSet {
+        let rawValue: Int
+        static let activateIgnoringOtherApps = Options(rawValue: 1)
+    }
+    func activate(options: Options) {
+        activations += 1
+        NSWorkspace.shared.frontmostApplication = self
+    }
+}
+typealias Application = NSRunningApplication
 enum NSApplication { enum ActivationPolicy { case regular, accessory, prohibited } }
 final class NSWorkspace {
     static let shared = NSWorkspace()
     var frontmostApplication: Application? = Application(processIdentifier: 123)
 }
-enum NSEvent { static var mouseLocation = CGPoint(x: 500, y: 400); static var pressedMouseButtons = 0 }
+struct NSEvent {
+    static var mouseLocation = CGPoint(x: 500, y: 400)
+    static var pressedMouseButtons = 0
+    struct ModifierFlags: OptionSet {
+        let rawValue: UInt
+        static let deviceIndependentFlagsMask = ModifierFlags(rawValue: 0xffff0000)
+    }
+    let keyCode: UInt16
+    let modifierFlags: ModifierFlags
+}
 let mainScreen = CGRect(x: 0, y: 0, width: 1000, height: 1000)
 var transitions: [String] = []
 
@@ -28,6 +53,13 @@ final class WindowSession {
     static func shouldIgnoreTemporaryAppActivation(activatedPID: pid_t) -> Bool {
         ignoredActivationPIDs.contains(activatedPID)
     }
+    static func suppressProgrammaticActivation(for pid: pid_t, duration: TimeInterval) { ignoredActivationPIDs.insert(pid) }
+    static func noteGlobalKeyDown(_ event: NSEvent) {}
+    let windowElement = Element()
+    func isTemporaryPinnedForFusion() -> Bool { isPinned }
+    func focusForTemporaryStashTab() { focusCount += 1 }
+    var focusCount = 0
+    func toggleExpandCollapse() {}
     let temporaryStashID: String
     var isManagedByTemporaryShortcut = true
     var isExpandedForCoordination = false
@@ -81,6 +113,13 @@ final class WindowSession {
 final class AppConfig {
     static let shared = AppConfig()
     var hoverDelayMS = 200
+    var mainInterfaceShortcutModifiers: UInt? = 0x1c0000
+    var mainInterfaceShortcutKeyCode: UInt16? = 4
+    var temporaryShortcutModifiers: UInt? = 0x1c0000
+    var temporaryShortcutKeyCode: UInt16? = 1
+    struct Settings { var isEnabled = true; var shortcutModifiers: UInt?; var shortcutKeyCode: UInt16? }
+    var appSettings: [String: Settings] = [:]
+    func isAppEnabled(bundleID: String) -> Bool { false }
 }
 final class Timer {
     static var all: [Timer] = []
@@ -129,4 +168,40 @@ final class TemporaryStashTabWindow {
         }
         instances[title]?.onEvent?(event)
     }
+}
+
+
+final class Element: NSObject { var focused: Element? }
+typealias AXUIElement = Element
+var appElements: [pid_t: Element] = [:]
+let kAXFocusedWindowAttribute = "AXFocusedWindow"
+func AXUIElementCreateApplication(_ pid: pid_t) -> Element { appElements[pid] ?? Element() }
+enum AccessibilityRuntimeGuard {
+    enum Result { case success, cannotComplete }
+    static func copyAttributeValue(of element: Element, attribute: CFString, value: inout CFTypeRef?, context: String) -> Result {
+        value = element.focused
+        return element.focused == nil ? .cannotComplete : .success
+    }
+}
+final class SideBarBridge {
+    static let shared = SideBarBridge()
+    func isMirroredHotkey(modifiers: UInt, keyCode: UInt16) -> Bool { false }
+    func hotkeyBinding(for bundleID: String) -> Int? { nil }
+}
+final class MainInterfaceManager {
+    var sessions: [WindowSession] = []
+    let temporaryTabCoordinator = TemporaryStashTabCoordinator()
+    private var mainInterfaceHistory: [(app: NSRunningApplication, window: AXUIElement)] = []
+    var stashCalls = 0
+    func handleTemporaryShortcut() -> Bool { stashCalls += 1; return true }
+    func monitorApp(pid: pid_t, bundleID: String, maxRetries: Int) {}
+    func prepareDockActivationRoutingIfNeeded(bundleID: String) {}
+    func maybeShowMultiWindowTip(for bundleID: String) {}
+    func preferredControlSession(for bundleID: String) -> WindowSession? { nil }
+    func activated(_ app: NSRunningApplication) { handleAppActivation(app: app, isActivationNotification: true) }
+    @discardableResult
+    func key(_ keyCode: UInt16 = 4, modifiers: UInt = 0x1c0000) -> Bool {
+        handleGlobalKeyDown(event: NSEvent(keyCode: keyCode, modifierFlags: .init(rawValue: modifiers)))
+    }
+__MAIN_INTERFACE_METHODS__
 }

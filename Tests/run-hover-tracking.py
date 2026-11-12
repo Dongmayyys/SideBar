@@ -18,11 +18,11 @@ else:
     source = (REPO / source_path).read_text()
 
 methods = []
-for name in ['checkMouseForCollapse', 'collapseWindow', 'expandWindow', 'startMouseTrackingTimer', 'revealForTemporaryStashTab']:
+for name in ['checkMouseForCollapse', 'collapseWindow', 'expandWindow', 'startMouseTrackingTimer', 'revealForTemporaryStashTab', 'focusForTemporaryStashTab']:
     # A top-level method closes at four spaces; nested closures are more indented.
     matches = list(re.finditer(r'(?:    @discardableResult\n)?    (?:private )?func ' + name + r'\(.*?\n    }', source, re.S))
-    if args.baseline and name == 'revealForTemporaryStashTab':
-        methods.append('    func revealForTemporaryStashTab(isAppActivated: Bool = false) {}')
+    if args.baseline and name in ['revealForTemporaryStashTab', 'focusForTemporaryStashTab']:
+        methods.append('    func revealForTemporaryStashTab(isAppActivated: Bool = false) {}' if name == 'revealForTemporaryStashTab' else '    func focusForTemporaryStashTab() {}')
         continue
     if len(matches) != 1:
         raise SystemExit(f'Expected exactly one production method: {name}')

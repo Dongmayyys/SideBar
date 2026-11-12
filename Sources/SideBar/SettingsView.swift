@@ -3581,6 +3581,8 @@ struct ShortcutsSettingsView: View {
             List {
                 TemporaryShortcutRowView(config: config, appInfos: appListManager.apps)
                     .padding(.vertical, 6)
+                TemporaryShortcutRowView(config: config, appInfos: appListManager.apps, isMainInterface: true)
+                    .padding(.vertical, 6)
 
                 if enabledApps.isEmpty {
                     VStack(spacing: 8) {
@@ -3635,6 +3637,7 @@ private let systemShortcuts: [(UInt, UInt16, String)] = {
 }()
 
 private let temporaryShortcutRecorderID = "__temporaryShortcut__"
+private let mainInterfaceShortcutRecorderID = "__mainInterfaceShortcut__"
 
 private func shortcutConflictName(
     modifiers: UInt,
@@ -3643,7 +3646,7 @@ private func shortcutConflictName(
     config: AppConfig,
     appInfos: [AppInfo]
 ) -> String? {
-    let mirroredExclusion = excludingID == temporaryShortcutRecorderID ? nil : excludingID
+    let mirroredExclusion = (excludingID == temporaryShortcutRecorderID || excludingID == mainInterfaceShortcutRecorderID) ? nil : excludingID
     if let mirrored = SideBarBridge.shared.mirroredHotkeyConflict(
         modifiers: modifiers,
         keyCode: keyCode,
@@ -3656,6 +3659,12 @@ private func shortcutConflictName(
        config.temporaryShortcutModifiers == modifiers,
        config.temporaryShortcutKeyCode == keyCode {
         return "临时折叠当前活跃窗口".localized
+    }
+
+    if excludingID != mainInterfaceShortcutRecorderID,
+       config.mainInterfaceShortcutModifiers == modifiers,
+       config.mainInterfaceShortcutKeyCode == keyCode {
+        return "回到主界面".localized
     }
 
     for (otherID, otherSettings) in config.appSettings {
@@ -3677,6 +3686,9 @@ private func shortcutDisplayName(for bundleID: String, appInfos: [AppInfo]) -> S
 struct TemporaryShortcutRowView: View {
     @ObservedObject var config: AppConfig
     let appInfos: [AppInfo]
+    var isMainInterface = false
+
+    private var recorderID: String { isMainInterface ? mainInterfaceShortcutRecorderID : temporaryShortcutRecorderID }
     @ObservedObject var recorder: ShortcutRecorderManager = .shared
 
     @State private var conflictMessage: String? = nil
@@ -3684,7 +3696,7 @@ struct TemporaryShortcutRowView: View {
     @State private var shakeOffset: CGFloat = 0
 
     private var isThisRecording: Bool {
-        recorder.recordingTargetID == temporaryShortcutRecorderID
+        recorder.recordingTargetID == recorderID
     }
 
     var body: some View {
@@ -3694,9 +3706,11 @@ struct TemporaryShortcutRowView: View {
                     .frame(width: 24, height: 24)
 
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("临时折叠当前活跃窗口".localized)
+                    Text(isMainInterface ? "回到主界面".localized : "临时折叠当前活跃窗口".localized)
                         .font(.body)
-                    Text("仅对当前活跃窗口临时贴边折叠，并自动选择最近边缘。再次按下会立刻展开；手动拖离边缘后，本次临时折叠自动失效。".localized)
+                    Text(isMainInterface
+                         ? "收起未固定的收纳窗口并回到主界面；再次按下展开最近使用的收纳窗口。".localized
+                         : "仅对当前活跃窗口临时贴边折叠，并自动选择最近边缘。再次按下会立刻展开；手动拖离边缘后，本次临时折叠自动失效。".localized)
                         .font(.caption)
                         .foregroundColor(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -3705,17 +3719,17 @@ struct TemporaryShortcutRowView: View {
                 Spacer(minLength: 16)
 
                 ShortcutDisplayView(
-                    modifiers: config.temporaryShortcutModifiers,
-                    keyCode: config.temporaryShortcutKeyCode,
+                    modifiers: isMainInterface ? config.mainInterfaceShortcutModifiers : config.temporaryShortcutModifiers,
+                    keyCode: isMainInterface ? config.mainInterfaceShortcutKeyCode : config.temporaryShortcutKeyCode,
                     isRecording: isThisRecording,
                     onTap: {
                         ShortcutRecorderManager.shared.startRecording(
-                            targetID: temporaryShortcutRecorderID,
+                            targetID: recorderID,
                             onRecord: { modifiers, keyCode in
                                 if let conflictName = shortcutConflictName(
                                     modifiers: modifiers,
                                     keyCode: keyCode,
-                                    excludingID: temporaryShortcutRecorderID,
+                                    excludingID: recorderID,
                                     config: config,
                                     appInfos: appInfos
                                 ) {
@@ -3732,12 +3746,20 @@ struct TemporaryShortcutRowView: View {
                                 }
 
                                 conflictMessage = nil
-                                config.setTemporaryShortcut(modifiers: modifiers, keyCode: keyCode)
+                                if isMainInterface {
+                                    config.setMainInterfaceShortcut(modifiers: modifiers, keyCode: keyCode)
+                                } else {
+                                    config.setTemporaryShortcut(modifiers: modifiers, keyCode: keyCode)
+                                }
                             }
                         )
                     },
                     onClear: {
-                        config.clearTemporaryShortcut()
+                        if isMainInterface {
+                            config.clearMainInterfaceShortcut()
+                        } else {
+                            config.clearTemporaryShortcut()
+                        }
                         conflictMessage = nil
                         warningMessage = nil
                     }

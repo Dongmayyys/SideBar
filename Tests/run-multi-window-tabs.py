@@ -10,7 +10,15 @@ source = repo / 'Sources/SideBar'
 coordinator = (source / 'TemporaryStashTabController.swift').read_text()
 coordinator = coordinator.split('private final class TemporaryStashTabWindow:')[0]
 coordinator = coordinator.replace('import AppKit', 'import Foundation')
+manager_source = (source / 'AXWindowManager.swift').read_text()
+main_methods = []
+for name in ['recordMainInterfaceActivation', 'handleMainInterfaceShortcut', 'handleAppActivation', 'handleGlobalKeyDown']:
+    matches = list(re.finditer(r'    private func ' + name + r'\(.*?\n    }', manager_source, re.S))
+    if len(matches) != 1:
+        sys.exit(f'Expected exactly one production manager method: {name}')
+    main_methods.append(matches[0].group())
 fixture = (repo / 'Tests/TemporaryStashHarness.swift.txt').read_text()
+fixture = fixture.replace('__MAIN_INTERFACE_METHODS__', '\n\n'.join(main_methods))
 fixture += '\n' + (source / 'TemporaryStashRecovery.swift').read_text()
 fixture += '\n' + (source / 'TemporaryStashLogic.swift').read_text() + '\n' + coordinator
 fixture += '\n' + (repo / 'Tests/TemporaryStashTests.swift.txt').read_text()
@@ -32,7 +40,7 @@ if result.returncode:
 session_source = (source / 'WindowSession.swift').read_text()
 methods = []
 for name in ['startTemporaryShortcutStash', 'cancelTemporaryShortcutStash', 'restoreTemporaryShortcutWindow',
-             'finishTemporaryShortcutSession', 'hideForTemporaryStashTab', 'revealForTemporaryStashTab',
+             'finishTemporaryShortcutSession', 'hideForTemporaryStashTab', 'revealForTemporaryStashTab', 'focusForTemporaryStashTab',
              'restoreAndDestroy', 'handleDestroyed', 'handleMouseUp', 'isDetachedFromManagedEdge',
              'canRevealForTemporaryAppActivation', 'beginTargetedActivationWindow',
              'shouldIgnoreTemporaryAppActivation', 'hideForTemporaryAppActivation',
@@ -91,6 +99,29 @@ if compiled.returncode:
     sys.exit(compiled.returncode)
 result = subprocess.run([str(recovery_output / 'tests')], capture_output=True, text=True)
 (recovery_output / 'tests.log').write_text(result.stdout + result.stderr)
+print(result.stdout, end='')
+print(result.stderr, end='', file=sys.stderr)
+if result.returncode:
+    sys.exit(result.returncode)
+
+# Compile all of AppConfig; use an in-memory preference backend, never user defaults.
+config_source = (source / 'AppConfig.swift').read_text()
+config_source = config_source.replace('UserDefaults', 'MemoryDefaults').replace('private init()', 'init()')
+settings_source = (source / 'SettingsView.swift').read_text()
+conflicts = settings_source[settings_source.index('private let temporaryShortcutRecorderID'):settings_source.index('struct TemporaryShortcutRowView:')]
+settings_fixture = (repo / 'Tests/MainInterfaceSettingsTests.swift.txt').read_text()
+settings_fixture = settings_fixture.replace('__APP_CONFIG__', config_source).replace('__SHORTCUT_CONFLICTS__', conflicts)
+settings_output = output / 'settings'
+settings_output.mkdir(exist_ok=True)
+(settings_output / 'main.swift').write_text(settings_fixture)
+compiled = subprocess.run(['swiftc', str(settings_output / 'main.swift'), '-framework', 'AppKit',
+                           '-o', str(settings_output / 'tests')], capture_output=True, text=True)
+(settings_output / 'compile.log').write_text(compiled.stdout + compiled.stderr)
+if compiled.returncode:
+    print(compiled.stdout + compiled.stderr, file=sys.stderr)
+    sys.exit(compiled.returncode)
+result = subprocess.run([str(settings_output / 'tests')], capture_output=True, text=True)
+(settings_output / 'tests.log').write_text(result.stdout + result.stderr)
 print(result.stdout, end='')
 print(result.stderr, end='', file=sys.stderr)
 sys.exit(result.returncode)

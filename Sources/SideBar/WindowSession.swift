@@ -401,8 +401,7 @@ class WindowSession {
             // AppKit 的 visibleFrame 原点在左下角；AX 的坐标原点在主屏左上角。
             // primaryScreenHeight 表示主屏高度，转换公式与 showIndicator 中保持一致。
             let targetY = primaryScreenHeight - safeFrame.midY - frame.height / 2
-            axSetPositionAttribute(
-                on: windowElement,
+            setWindowPositionWithoutSystemAnimation(
                 position: CGPoint(x: targetX, y: targetY),
                 context: "WindowSession.recoverFromScreenParametersChange.position"
             )
@@ -611,6 +610,8 @@ class WindowSession {
     private static var targetedActivationByPID: [pid_t: (sessionID: ObjectIdentifier, expiresAt: Date)] = [:]
     private static var preferredSessionByPID: [pid_t: ObjectIdentifier] = [:]
     private static var programmaticActivationIgnoreUntilByPID: [pid_t: Date] = [:]
+    // 仅供快捷键标签路由使用，不改变设置托管窗口的激活门禁。
+    private static var temporaryFocusReturnActivationUntilByPID: [pid_t: Date] = [:]
     private static var lastObservedFocusSnapshot: FocusReturnSnapshot?
     private static var lastGlobalMouseDownAt: Date = .distantPast
     private static var lastGlobalMouseDownSample: GlobalMouseDownSample?
@@ -3230,6 +3231,7 @@ class WindowSession {
         sessionRegistry.removeAll { $0.session == nil }
         let now = Date()
         targetedActivationByPID = targetedActivationByPID.filter { $0.value.expiresAt > now }
+        temporaryFocusReturnActivationUntilByPID = temporaryFocusReturnActivationUntilByPID.filter { $0.value > now }
         preferredSessionByPID = preferredSessionByPID.filter { pid, sessionID in
             sessionRegistry.contains {
                 guard let session = $0.session else { return false }
@@ -3317,6 +3319,7 @@ class WindowSession {
         let sourcePID = pid
         let sourceWindowID = WindowAlphaManager.shared.findWindowID(for: windowElement, pid: pid)
         let focusSnapshot = focusReturnSnapshot
+        let suppressTemporaryActivation = isTemporaryShortcutManaged
         focusReturnSnapshot = nil
         let preferredTargetPID = Self.preferredReleaseTargetPID(sourcePID: sourcePID, sourceWindowID: sourceWindowID)
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
@@ -3326,14 +3329,16 @@ class WindowSession {
             }
 
             if let focusSnapshot,
-               Self.restoreFocus(to: focusSnapshot, sourcePID: sourcePID, sourceWindowID: sourceWindowID) {
+               Self.restoreFocus(to: focusSnapshot, sourcePID: sourcePID, sourceWindowID: sourceWindowID,
+                                 suppressTemporaryActivation: suppressTemporaryActivation) {
                 return
             }
 
             Self.activateNonManagedApp(
                 preferredTargetPID: preferredTargetPID,
                 sourcePID: sourcePID,
-                sourceWindowID: sourceWindowID
+                sourceWindowID: sourceWindowID,
+                suppressTemporaryActivation: suppressTemporaryActivation
             )
         }
     }
@@ -3474,7 +3479,8 @@ class WindowSession {
     private static func restoreFocus(
         to snapshot: FocusReturnSnapshot,
         sourcePID: pid_t,
-        sourceWindowID: CGWindowID?
+        sourceWindowID: CGWindowID?,
+        suppressTemporaryActivation: Bool = false
     ) -> Bool {
         let selfBundleID = Bundle.main.bundleIdentifier ?? ""
         guard snapshot.bundleID != selfBundleID else { return false }
@@ -3492,6 +3498,9 @@ class WindowSession {
         guard let app = NSRunningApplication(processIdentifier: snapshot.pid) else { return false }
         guard !app.isHidden else { return false }
 
+        if suppressTemporaryActivation {
+            temporaryFocusReturnActivationUntilByPID[snapshot.pid] = Date().addingTimeInterval(0.6)
+        }
         let activated = app.activate(options: .activateIgnoringOtherApps) || app.activate()
         guard activated else { return false }
 
@@ -3618,7 +3627,8 @@ class WindowSession {
         return nil
     }
 
-    private static func activatePreferredTarget(pid: pid_t, selfBundleID: String, sourcePID: pid_t?) -> Bool {
+    private static func activatePreferredTarget(pid: pid_t, selfBundleID: String, sourcePID: pid_t?,
+                                                suppressTemporaryActivation: Bool = false) -> Bool {
         let windowList = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
         for info in windowList {
             guard let layer = info[kCGWindowLayer as String] as? Int,
@@ -3646,6 +3656,9 @@ class WindowSession {
             guard app.activationPolicy == .regular, !app.isHidden, bundleID != selfBundleID else {
                 return false
             }
+            if suppressTemporaryActivation {
+                temporaryFocusReturnActivationUntilByPID[ownerPID] = Date().addingTimeInterval(0.6)
+            }
             app.activate()
             return true
         }
@@ -3665,12 +3678,14 @@ class WindowSession {
     static func activateNonManagedApp(
         preferredTargetPID: pid_t? = nil,
         sourcePID: pid_t? = nil,
-        sourceWindowID: CGWindowID? = nil
+        sourceWindowID: CGWindowID? = nil,
+        suppressTemporaryActivation: Bool = false
     ) {
         let selfBundleID = Bundle.main.bundleIdentifier ?? ""
 
         if let preferredTargetPID,
-           activatePreferredTarget(pid: preferredTargetPID, selfBundleID: selfBundleID, sourcePID: sourcePID) {
+           activatePreferredTarget(pid: preferredTargetPID, selfBundleID: selfBundleID, sourcePID: sourcePID,
+                                   suppressTemporaryActivation: suppressTemporaryActivation) {
             return
         }
         
@@ -3685,6 +3700,9 @@ class WindowSession {
             sourcePID: sourcePID,
             selfBundleID: selfBundleID
         ), let app = NSRunningApplication(processIdentifier: targetPID) {
+            if suppressTemporaryActivation {
+                temporaryFocusReturnActivationUntilByPID[targetPID] = Date().addingTimeInterval(0.6)
+            }
             app.activate()
             return
         }
@@ -3696,6 +3714,9 @@ class WindowSession {
             sourcePID: sourcePID,
             selfBundleID: selfBundleID
         ), let app = NSRunningApplication(processIdentifier: targetPID) {
+            if suppressTemporaryActivation {
+                temporaryFocusReturnActivationUntilByPID[targetPID] = Date().addingTimeInterval(0.6)
+            }
             app.activate()
             return
         }
@@ -3709,6 +3730,9 @@ class WindowSession {
         // 5. 极端兜底：如果 Dock 无法接管，再退回 Finder，但忽略这次程序内部触发的激活。
         if let finder = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.finder").first {
             registerProgrammaticActivationIgnore(for: finder.processIdentifier, duration: 0.45)
+            if suppressTemporaryActivation {
+                temporaryFocusReturnActivationUntilByPID[finder.processIdentifier] = Date().addingTimeInterval(0.6)
+            }
             finder.activate()
         }
     }
@@ -3946,10 +3970,10 @@ class WindowSession {
                                                            screens: NSScreen.screens.map { cgBounds(for: $0) })
                 } ?? current.origin
                 // 短暂 cannotComplete 重试一次；失败时保留已有救援记录。
-                var result = axSetPositionAttribute(on: windowElement, position: position,
+                var result = setWindowPositionWithoutSystemAnimation(position: position,
                                                     context: "WindowSession.restoreTemporaryShortcutWindow.position")
                 if result == .cannotComplete {
-                    result = axSetPositionAttribute(on: windowElement, position: position,
+                    result = setWindowPositionWithoutSystemAnimation(position: position,
                                                      context: "WindowSession.restoreTemporaryShortcutWindow.retry")
                 }
                 if result == .success { clearTrackedWindowRecoveryState(frameHint: current) }
@@ -3979,17 +4003,45 @@ class WindowSession {
                                            title: TemporaryStashOrdinals.title(appName: appDisplayName, ordinal: temporaryStashOrdinal))
     }
 
-    func canRevealForTemporaryAppActivation(activatedPID: pid_t) -> Bool {
-        guard isTemporaryShortcutManaged, isSnappedForCoordination,
-              activatedPID == pid, NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else { return false }
+    /// 逐项列出 ⌘Tab/Dock 激活展开的各个门槛，供诊断日志使用。
+    func temporaryActivationDiagnostics(activatedPID: pid_t) -> String {
         Self.cleanupRegistry()
+        let frontmost = NSWorkspace.shared.frontmostApplication?.processIdentifier ?? -1
+        let focused = focusedWindowOfApp()
+        let focusedMatch = focused.map { CFEqual($0, windowElement) ? "self" : "other" } ?? "nil"
+        let suppression = max(0, activationSuppressionUntil.timeIntervalSinceNow)
+        return "\(bundleID) id=\(temporaryStashID.prefix(8)) \(debugStateSummary) frontmost=\(frontmost == pid) "
+            + "targeted=\(Self.targetedActivationByPID[pid] != nil) programmaticIgnore=\(Self.shouldIgnoreProgrammaticActivation(for: pid)) "
+            + "suppression=\(String(format: "%.2f", suppression)) focused=\(focusedMatch) main=\(isMainWindowOfApp()) "
+            + "pinned=\(isTemporarilyPinned) mouse=\(NSEvent.mouseLocation)"
+    }
+
+    func canRevealForTemporaryAppActivation(activatedPID: pid_t, requiresFrontmost: Bool = true) -> Bool {
+        guard isTemporaryShortcutManaged, isSnappedForCoordination,
+              activatedPID == pid else { return false }
+        if requiresFrontmost && NSWorkspace.shared.frontmostApplication?.processIdentifier != pid { return false }
         // SideBar 自己定向展开/归还焦点时不重新选择同软件窗口。
-        guard Self.targetedActivationByPID[pid] == nil,
-              !Self.shouldIgnoreProgrammaticActivation(for: pid),
+        guard !Self.shouldIgnoreTemporaryAppActivation(activatedPID: pid),
               Date() >= activationSuppressionUntil else { return false }
         // focused 优先；只有没有 focused 时才回退 main，不能展开另一个主窗口。
         if let focused = focusedWindowOfApp() { return CFEqual(focused, windowElement) }
         return isMainWindowOfApp()
+    }
+
+    static func shouldIgnoreTemporaryAppActivation(activatedPID: pid_t) -> Bool {
+        cleanupRegistry()
+        return targetedActivationByPID[activatedPID] != nil
+            || shouldIgnoreProgrammaticActivation(for: activatedPID)
+            || temporaryFocusReturnActivationUntilByPID[activatedPID] != nil
+    }
+
+    @discardableResult
+    func hideForTemporaryAppActivation(activatedPID: pid_t) -> Bool {
+        guard isTemporaryShortcutManaged, isExpandedForCoordination,
+              pid != activatedPID, !isTemporarilyPinned else { return false }
+        // 用户已经选定前台应用，既不归还焦点，也不允许旧回调再改变焦点。
+        invalidatePendingFocusRelease()
+        return hideForTemporaryStashTab()
     }
 
     @discardableResult
@@ -4002,7 +4054,11 @@ class WindowSession {
 
     func revealForTemporaryStashTab(isAppActivated: Bool = false) {
         guard isTemporaryShortcutManaged, !isAnimating, isSnappedForCoordination,
-              let frame = getRawWindowFrame(), let geometry = edgeGeometry(for: frame) else { return }
+              let frame = getRawWindowFrame(), let geometry = edgeGeometry(for: frame) else {
+            StashDebugLog.write("reveal skipped \(bundleID) id=\(temporaryStashID.prefix(8)) appActivated=\(isAppActivated) \(debugStateSummary)")
+            return
+        }
+        StashDebugLog.write("reveal \(bundleID) id=\(temporaryStashID.prefix(8)) appActivated=\(isAppActivated)")
         invalidatePendingFocusRelease()
         windowAnimator.stop()
         animationGenerationToken &+= 1
@@ -4010,7 +4066,7 @@ class WindowSession {
         outsideCollapseCandidateSince = nil
         edgeDetachCandidateSince = nil
         rememberFocusReturnTargetBeforeReveal()
-        beginTargetedActivationWindow(for: 0.35)
+        beginTargetedActivationWindow(for: 0.6)
         // ⌘Tab/Dock 激活时鼠标可能仍在窗外，沿用原 Dock 等待首次交互的门禁。
         pendingDockInteraction = isAppActivated
         hasReleasedDockClick = NSEvent.pressedMouseButtons & 1 == 0
@@ -4253,6 +4309,11 @@ class WindowSession {
     
     @discardableResult
     private func collapseWindow(immediate: Bool = false, triggerEffects: Bool = true) -> Bool {
+        if isTemporaryShortcutManaged {
+            let frontmost = NSWorkspace.shared.frontmostApplication?.processIdentifier == pid
+            StashDebugLog.write("collapse \(bundleID) id=\(temporaryStashID.prefix(8)) state=\(debugStateSummary) frontmost=\(frontmost) "
+                                + "pendingDock=\(pendingDockInteraction) mouse=\(NSEvent.mouseLocation) via \(StashDebugLog.callers())")
+        }
         if isTemporarilyPinned { return false }
         if isAnimating { return false } // 正在动画中，拒绝新指令
         queuedForwardedHotkeyToggle = false
@@ -4839,7 +4900,26 @@ class WindowSession {
     }
     
     private func setWindowPosition(position: CGPoint) {
-        axSetPositionAttribute(on: windowElement, position: position, context: "WindowSession.setWindowPosition")
+        setWindowPositionWithoutSystemAnimation(position: position, context: "WindowSession.setWindowPosition")
+    }
+
+    @discardableResult
+    private func setWindowPositionWithoutSystemAnimation(position: CGPoint, context: String) -> AXError {
+        let attribute = "AXEnhancedUserInterface" as CFString
+        var originalValue: CFTypeRef?
+        guard isTemporaryShortcutManaged,
+              AccessibilityRuntimeGuard.copyAttributeValue(of: appElement, attribute: attribute,
+                                                          value: &originalValue, context: context + ".enhancedUI.read") == .success,
+              let enhancedUI = originalValue as? Bool, enhancedUI,
+              axSetBoolAttribute(on: appElement, attribute: attribute, value: false,
+                                 context: context + ".enhancedUI.disable") == .success else {
+            return axSetPositionAttribute(on: windowElement, position: position, context: context)
+        }
+        defer {
+            axSetBoolAttribute(on: appElement, attribute: attribute, value: enhancedUI,
+                               context: context + ".enhancedUI.restore")
+        }
+        return axSetPositionAttribute(on: windowElement, position: position, context: context)
     }
 
     func suspendForAccessibilityLoss() {

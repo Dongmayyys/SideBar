@@ -1,13 +1,22 @@
 import Foundation
 
 enum Clock { static var now: Double = 0 }
-struct Date {
+struct Date: Comparable {
     let value: Double
     init() { value = Clock.now }
     init(_ value: Double) { self.value = value }
     static let distantPast = Date(-1e10)
     var timeIntervalSinceReferenceDate: Double { value }
     func timeIntervalSince(_ other: Date) -> Double { value - other.value }
+    func addingTimeInterval(_ interval: Double) -> Date { Date(value + interval) }
+    static func < (lhs: Date, rhs: Date) -> Bool { lhs.value < rhs.value }
+}
+enum StashDebugLog { static func write(_ message: String) {} }
+struct Application { let processIdentifier: pid_t }
+enum NSApplication { enum ActivationPolicy { case regular, accessory, prohibited } }
+final class NSWorkspace {
+    static let shared = NSWorkspace()
+    var frontmostApplication: Application? = Application(processIdentifier: 123)
 }
 enum NSEvent { static var mouseLocation = CGPoint(x: 500, y: 400); static var pressedMouseButtons = 0 }
 let mainScreen = CGRect(x: 0, y: 0, width: 1000, height: 1000)
@@ -15,6 +24,10 @@ var transitions: [String] = []
 
 // Coordinator uses production geometry/state decisions; only AX/UI endpoints are in-memory.
 final class WindowSession {
+    static var ignoredActivationPIDs: Set<pid_t> = []
+    static func shouldIgnoreTemporaryAppActivation(activatedPID: pid_t) -> Bool {
+        ignoredActivationPIDs.contains(activatedPID)
+    }
     let temporaryStashID: String
     var isManagedByTemporaryShortcut = true
     var isExpandedForCoordination = false
@@ -25,8 +38,11 @@ final class WindowSession {
     var pid: pid_t = 123
     var activationFocused = false
     var programmaticActivation = false
+    var targetedActivation = false
+    var activationSuppressionUntil = Date.distantPast
     var eligible = true
     var canHide = true
+    var canReveal = true
     var hoverLock = false
     var appActivationReveal = false
     init(_ id: String, edge: Int = 1) {
@@ -37,10 +53,17 @@ final class WindowSession {
                                            visibleFrame: visibleFrame,
                                            isOnScreen: eligible, title: temporaryStashID)
     }
-    func canRevealForTemporaryAppActivation(activatedPID: pid_t) -> Bool {
-        isManagedByTemporaryShortcut && !isExpandedForCoordination && activationFocused && !programmaticActivation && activatedPID == pid
+    func temporaryActivationDiagnostics(activatedPID: pid_t) -> String { temporaryStashID }
+    func canRevealForTemporaryAppActivation(activatedPID: pid_t, requiresFrontmost: Bool = true) -> Bool {
+        isManagedByTemporaryShortcut && !isExpandedForCoordination && activationFocused
+            && !programmaticActivation && !targetedActivation && Date() >= activationSuppressionUntil
+            && activatedPID == pid && (!requiresFrontmost || NSWorkspace.shared.frontmostApplication?.processIdentifier == pid)
     }
     func setFusionHoverLock(_ locked: Bool) { hoverLock = locked }
+    func hideForTemporaryAppActivation(activatedPID: pid_t) -> Bool {
+        guard isManagedByTemporaryShortcut, isExpandedForCoordination, pid != activatedPID, !isPinned else { return false }
+        return hideForTemporaryStashTab()
+    }
     func hideForTemporaryStashTab() -> Bool {
         if isPinned { return true }
         guard canHide else { return false }
@@ -49,6 +72,7 @@ final class WindowSession {
         return true
     }
     func revealForTemporaryStashTab(isAppActivated: Bool = false) {
+        guard canReveal else { return }
         appActivationReveal = isAppActivated
         transitions.append("reveal:" + temporaryStashID)
         isExpandedForCoordination = true

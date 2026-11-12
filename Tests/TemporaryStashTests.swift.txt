@@ -208,26 +208,27 @@ pinned.isExpandedForCoordination = true
 pinned.isPinned = true
 otherEdge.isExpandedForCoordination = true
 transitions.removeAll()
-activationCoordinator.handleAppActivation(activatedPID: 123, sessions: activationSessions)
+activationCoordinator.handleAppActivation(activatedPID: 123, activationPolicy: .regular, sessions: activationSessions)
 expect(transitions == ["hide:active1", "reveal:active2"] && active2.isExpandedForCoordination,
        "application activation reveals focused stashed window after hiding same-edge unpinned window")
 expect(active2.appActivationReveal, "application activation uses existing Dock interaction wait mode")
+expect(!Timer.all.contains { $0.valid }, "foreground activation reveals synchronously without waiting for any timer")
 expect(pinned.isExpandedForCoordination && otherEdge.isExpandedForCoordination,
        "application activation leaves pinned and other-edge windows expanded")
 expect(TemporaryStashTabWindow.live.count == 4, "all other labels remain present inside expanded window range")
 active2.isExpandedForCoordination = false
 active2.activationFocused = false
 transitions.removeAll()
-activationCoordinator.handleAppActivation(activatedPID: 123, sessions: activationSessions)
+activationCoordinator.handleAppActivation(activatedPID: 123, activationPolicy: .regular, sessions: activationSessions)
 expect(transitions.isEmpty, "non-stashed focused window does not reveal other windows of app")
 active2.activationFocused = true
 active2.programmaticActivation = true
-activationCoordinator.handleAppActivation(activatedPID: 123, sessions: activationSessions)
+activationCoordinator.handleAppActivation(activatedPID: 123, activationPolicy: .regular, sessions: activationSessions)
 expect(transitions.isEmpty, "programmatic activation cannot reenter reveal")
 active2.programmaticActivation = false
 active1.isExpandedForCoordination = true
 active1.canHide = false
-activationCoordinator.handleAppActivation(activatedPID: 123, sessions: activationSessions)
+activationCoordinator.handleAppActivation(activatedPID: 123, activationPolicy: .regular, sessions: activationSessions)
 expect(!active2.isExpandedForCoordination, "activation waits for previous hide to succeed")
 active1.canHide = true
 activationCoordinator.reconcile(sessions: activationSessions)
@@ -236,13 +237,114 @@ expect(!active1.isExpandedForCoordination && active2.isExpandedForCoordination,
 active2.isExpandedForCoordination = false
 active1.isExpandedForCoordination = true
 active1.canHide = false
-activationCoordinator.handleAppActivation(activatedPID: 123, sessions: activationSessions)
+activationCoordinator.handleAppActivation(activatedPID: 123, activationPolicy: .regular, sessions: activationSessions)
 active2.activationFocused = false
 active1.canHide = true
 activationCoordinator.reconcile(sessions: activationSessions)
 expect(!active2.isExpandedForCoordination && active1.isExpandedForCoordination,
        "pending activation is discarded when focus changes")
 activationCoordinator.tearDownAll()
+
+// Workspace can publish didActivate before updating frontmostApplication.
+let retryCoordinator = TemporaryStashTabCoordinator()
+let retryWindow = WindowSession("retry")
+retryWindow.activationFocused = true
+NSWorkspace.shared.frontmostApplication = Application(processIdentifier: 999)
+transitions.removeAll()
+retryCoordinator.handleAppActivation(activatedPID: 123, activationPolicy: .regular, sessions: [retryWindow])
+expect(transitions.isEmpty && Timer.all.filter { $0.valid }.count == 1,
+       "activation before Workspace update queues one short retry without revealing")
+retryCoordinator.reconcile(sessions: [retryWindow])
+expect(Timer.all.filter { $0.valid }.count == 1, "polling cannot accumulate activation retry timers")
+Clock.now += 0.039
+Timer.fireDue()
+expect(!retryWindow.isExpandedForCoordination, "pending activation does not reveal while another app is foreground")
+NSWorkspace.shared.frontmostApplication = Application(processIdentifier: 123)
+Clock.now += 0.002
+Timer.fireDue()
+expect(retryWindow.isExpandedForCoordination && retryWindow.appActivationReveal,
+       "short one-shot retry reveals after Workspace update without a 120ms poll")
+expect(!Timer.all.contains { $0.valid }, "successful activation clears pending retry timer")
+
+retryWindow.isExpandedForCoordination = false
+NSWorkspace.shared.frontmostApplication = Application(processIdentifier: 999)
+transitions.removeAll()
+retryCoordinator.handleAppActivation(activatedPID: 123, activationPolicy: .regular, sessions: [retryWindow])
+for _ in 0..<14 { Clock.now += 0.04; Timer.fireDue() }
+expect(transitions.isEmpty && Timer.all.contains { $0.valid }, "foreground wait stays pending within 0.6 seconds")
+Clock.now += 0.05
+Timer.fireDue()
+expect(transitions.isEmpty && !Timer.all.contains { $0.valid }, "foreground wait expires and clears pending request")
+NSWorkspace.shared.frontmostApplication = Application(processIdentifier: 123)
+Clock.now += 0.04
+Timer.fireDue()
+retryCoordinator.reconcile(sessions: [retryWindow])
+expect(!retryWindow.isExpandedForCoordination, "late Workspace update cannot revive expired activation")
+
+NSWorkspace.shared.frontmostApplication = Application(processIdentifier: 999)
+retryCoordinator.handleAppActivation(activatedPID: 123, activationPolicy: .regular, sessions: [retryWindow])
+retryCoordinator.handleAppActivation(activatedPID: 999, activationPolicy: .regular, sessions: [retryWindow])
+expect(!Timer.all.contains { $0.valid }, "another app activation cancels pending request and its timer")
+NSWorkspace.shared.frontmostApplication = Application(processIdentifier: 123)
+Clock.now += 0.04
+Timer.fireDue()
+retryCoordinator.reconcile(sessions: [retryWindow])
+expect(!retryWindow.isExpandedForCoordination, "superseded activation cannot reveal after old app becomes foreground")
+
+let invalidateActivation: [(String, (WindowSession) -> Void)] = [
+    ("focus", { $0.activationFocused = false }),
+    ("targeted", { $0.targetedActivation = true }),
+    ("programmatic", { $0.programmaticActivation = true }),
+    ("suppression", { $0.activationSuppressionUntil = Date().addingTimeInterval(10) }),
+    ("snapped state", { $0.isExpandedForCoordination = true }),
+    ("management", { $0.isManagedByTemporaryShortcut = false })
+]
+for (gate, invalidate) in invalidateActivation {
+    NSWorkspace.shared.frontmostApplication = Application(processIdentifier: 999)
+    retryCoordinator.handleAppActivation(activatedPID: 123, activationPolicy: .regular, sessions: [retryWindow])
+    invalidate(retryWindow)
+    Clock.now += 0.04
+    Timer.fireDue()
+    expect(!Timer.all.contains { $0.valid }, "short retry rechecks \(gate) even while waiting for foreground")
+    retryWindow.activationFocused = true
+    retryWindow.targetedActivation = false
+    retryWindow.programmaticActivation = false
+    retryWindow.activationSuppressionUntil = .distantPast
+    retryWindow.isExpandedForCoordination = false
+    retryWindow.isManagedByTemporaryShortcut = true
+    NSWorkspace.shared.frontmostApplication = Application(processIdentifier: 123)
+    retryCoordinator.reconcile(sessions: [retryWindow])
+    expect(!retryWindow.isExpandedForCoordination, "restoring \(gate) cannot revive discarded activation")
+}
+
+// Once foreground is confirmed, retain the existing AX-busy retry behavior beyond the wait deadline.
+retryWindow.canReveal = false
+retryCoordinator.handleAppActivation(activatedPID: 123, activationPolicy: .regular, sessions: [retryWindow])
+Clock.now += 0.65
+Timer.fireDue()
+expect(!retryWindow.isExpandedForCoordination && Timer.all.contains { $0.valid },
+       "foreground-confirmed AX-busy activation is not expired by Workspace wait deadline")
+retryWindow.canReveal = true
+Clock.now += 0.04
+Timer.fireDue()
+expect(retryWindow.isExpandedForCoordination, "one-shot retry reveals when AX recovers without a poll")
+retryWindow.isExpandedForCoordination = false
+retryWindow.canReveal = false
+retryCoordinator.handleAppActivation(activatedPID: 123, activationPolicy: .regular, sessions: [retryWindow])
+NSWorkspace.shared.frontmostApplication = Application(processIdentifier: 999)
+Clock.now += 0.04
+Timer.fireDue()
+expect(!Timer.all.contains { $0.valid }, "losing confirmed foreground discards AX-busy activation immediately")
+retryWindow.canReveal = true
+NSWorkspace.shared.frontmostApplication = Application(processIdentifier: 123)
+retryCoordinator.reconcile(sessions: [retryWindow])
+expect(!retryWindow.isExpandedForCoordination, "AX recovery cannot reclaim foreground after it moved away")
+
+NSWorkspace.shared.frontmostApplication = Application(processIdentifier: 999)
+retryCoordinator.handleAppActivation(activatedPID: 123, activationPolicy: .regular, sessions: [retryWindow])
+retryCoordinator.tearDownAll()
+expect(!Timer.all.contains { $0.valid }, "teardown cancels activation retry timer")
+NSWorkspace.shared.frontmostApplication = Application(processIdentifier: 123)
 
 // Order survives polling, window y changes, Space hiding and drag/drop.
 let dragCoordinator = TemporaryStashTabCoordinator()
@@ -410,6 +512,97 @@ expect(TemporaryStashTabWindow.live["primary"]?.midY == 500 && TemporaryStashTab
        "each screen centers its own independent column")
 AppConfig.shared.hoverDelayMS = 200
 screenCoordinator.tearDownAll()
+
+// Only an actual regular-app activation dismisses expanded shortcut windows.
+let switchCoordinator = TemporaryStashTabCoordinator()
+let source = WindowSession("source")
+source.pid = 101
+let target = WindowSession("target")
+target.pid = 202
+target.activationFocused = true
+let fixed = WindowSession("fixed")
+fixed.pid = 303
+fixed.isPinned = true
+fixed.isExpandedForCoordination = true
+let crossEdge = WindowSession("crossEdge", edge: 2)
+crossEdge.pid = 404
+let untouched = WindowSession("untouched")
+untouched.pid = 505
+untouched.isManagedByTemporaryShortcut = false
+untouched.isExpandedForCoordination = true
+let switchSessions = [source, target, fixed, crossEdge, untouched]
+NSEvent.mouseLocation = CGPoint(x: 500, y: 400)
+switchCoordinator.reconcile(sessions: switchSessions)
+source.isExpandedForCoordination = true
+crossEdge.isExpandedForCoordination = true
+transitions.removeAll()
+// Deliberately leave Workspace stale: the notification PID is authoritative.
+NSWorkspace.shared.frontmostApplication = Application(processIdentifier: 101)
+switchCoordinator.handleAppActivation(activatedPID: 999, activationPolicy: .regular, sessions: switchSessions)
+expect(!source.isExpandedForCoordination && !crossEdge.isExpandedForCoordination
+       && transitions == ["hide:source", "hide:crossEdge"],
+       "regular app notification immediately hides different-PID shortcut windows on both edges without a timer")
+expect(fixed.isExpandedForCoordination && untouched.isExpandedForCoordination,
+       "activation preserves pinned shortcut and configured windows")
+
+source.isExpandedForCoordination = true
+NSEvent.mouseLocation = tabPoint("source")
+switchCoordinator.reconcile(sessions: switchSessions)
+expect(source.hoverLock, "source label holds the ordinary mouse-collapse lock")
+transitions.removeAll()
+switchCoordinator.handleAppActivation(activatedPID: 999, activationPolicy: .regular, sessions: switchSessions)
+expect(!source.isExpandedForCoordination && transitions == ["hide:source"],
+       "regular app notification bypasses label hover lock synchronously")
+Clock.now += 1
+Timer.fireDue()
+switchCoordinator.reconcile(sessions: switchSessions)
+TemporaryStashTabWindow.emit("source", .hover)
+expect(!source.isExpandedForCoordination, "remaining on dismissed label cannot reopen via poll, timer or tracking event")
+AppConfig.shared.hoverDelayMS = 0
+switchCoordinator.reconcile(sessions: switchSessions)
+expect(!source.isExpandedForCoordination, "zero hover delay cannot bypass leave-before-reenter suppression")
+AppConfig.shared.hoverDelayMS = 200
+NSEvent.mouseLocation = CGPoint(x: 500, y: 400)
+TemporaryStashTabWindow.emit("source", .hover)
+NSEvent.mouseLocation = tabPoint("source")
+TemporaryStashTabWindow.emit("source", .hover)
+Clock.now += 0.199
+Timer.fireDue()
+expect(!source.isExpandedForCoordination, "reenter starts a fresh full hover delay")
+Clock.now += 0.002
+Timer.fireDue()
+expect(source.isExpandedForCoordination, "leave then reenter reveals normally after the delay")
+
+NSEvent.mouseLocation = CGPoint(x: 500, y: 400)
+switchCoordinator.reconcile(sessions: switchSessions)
+transitions.removeAll()
+for policy: NSApplication.ActivationPolicy in [.accessory, .prohibited] {
+    switchCoordinator.handleAppActivation(activatedPID: 999, activationPolicy: policy, sessions: switchSessions)
+    expect(source.isExpandedForCoordination && transitions.isEmpty,
+           "non-regular activation does not dismiss shortcut windows policy=\(policy)")
+}
+switchCoordinator.handleAppActivation(activatedPID: ProcessInfo.processInfo.processIdentifier,
+                                     activationPolicy: .regular, sessions: switchSessions)
+expect(source.isExpandedForCoordination && transitions.isEmpty, "SideBar's own activation does not dismiss shortcut windows")
+NSWorkspace.shared.frontmostApplication = Application(processIdentifier: 999)
+switchCoordinator.reconcile(sessions: switchSessions)
+expect(source.isExpandedForCoordination, "polling another foreground PID never takes the immediate notification path")
+WindowSession.ignoredActivationPIDs.insert(999)
+switchCoordinator.handleAppActivation(activatedPID: 999, activationPolicy: .regular, sessions: switchSessions)
+expect(source.isExpandedForCoordination && transitions.isEmpty, "programmatic activation notification cannot dismiss newly expanded window")
+WindowSession.ignoredActivationPIDs.removeAll()
+switchCoordinator.handleAppActivation(activatedPID: 101, activationPolicy: .regular, sessions: switchSessions)
+expect(source.isExpandedForCoordination && transitions.isEmpty, "activation of expanded window's own PID never hides itself")
+
+crossEdge.isExpandedForCoordination = true
+NSWorkspace.shared.frontmostApplication = Application(processIdentifier: 202)
+transitions.removeAll()
+switchCoordinator.handleAppActivation(activatedPID: 202, activationPolicy: .regular, sessions: switchSessions)
+expect(transitions == ["hide:source", "hide:crossEdge", "reveal:target"] && target.isExpandedForCoordination,
+       "switch to stashed app hides different-PID windows first then reveals only its focused window")
+expect(fixed.isExpandedForCoordination && untouched.isExpandedForCoordination,
+       "switch to stashed app still preserves pinned and configured windows")
+switchCoordinator.tearDownAll()
 
 print("RESULT checks=\(total) failures=\(failures)")
 exit(failures == 0 ? 0 : 1)

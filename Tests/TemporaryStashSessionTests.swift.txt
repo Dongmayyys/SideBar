@@ -165,6 +165,28 @@ Session.programmaticPIDs.removeAll()
 expect(!focusedB.canRevealForTemporaryAppActivation(activatedPID: 999), "activation for another app is ignored")
 NSWorkspace.shared.frontmostApplication = NSRunningApplication(processIdentifier: 999)
 expect(!focusedB.canRevealForTemporaryAppActivation(activatedPID: 123), "pending activation cannot steal another foreground app")
+expect(focusedB.canRevealForTemporaryAppActivation(activatedPID: 123, requiresFrontmost: false),
+       "activation notification can select eligible stash before Workspace foreground update")
+Session.programmaticPIDs.insert(123)
+expect(!focusedB.canRevealForTemporaryAppActivation(activatedPID: 123, requiresFrontmost: false),
+       "notification candidate still rejects programmatic activation before foreground update")
+Session.programmaticPIDs.removeAll()
+Session.targetedActivationByPID[123] = (ObjectIdentifier(focusedA), Date().addingTimeInterval(10))
+expect(!focusedB.canRevealForTemporaryAppActivation(activatedPID: 123, requiresFrontmost: false),
+       "notification candidate still rejects targeted activation before foreground update")
+Session.targetedActivationByPID.removeAll()
+focusedB.activationSuppressionUntil = Date().addingTimeInterval(10)
+expect(!focusedB.canRevealForTemporaryAppActivation(activatedPID: 123, requiresFrontmost: false),
+       "notification candidate still respects suppression before foreground update")
+focusedB.activationSuppressionUntil = .distantPast
+Session.focusedElement = focusedA.windowElement
+expect(!focusedB.canRevealForTemporaryAppActivation(activatedPID: 123, requiresFrontmost: false),
+       "notification candidate still requires matching focused window before foreground update")
+Session.focusedElement = nil
+focusedB.state = .expanded
+expect(!focusedB.canRevealForTemporaryAppActivation(activatedPID: 123, requiresFrontmost: false),
+       "notification candidate still requires snapped state before foreground update")
+focusedB.state = .snapped(edge: focusedB.currentEdge, hiddenOrX: 0)
 NSWorkspace.shared.frontmostApplication = NSRunningApplication(processIdentifier: 123)
 focusedB.activationSuppressionUntil = Date().addingTimeInterval(10)
 expect(!focusedB.canRevealForTemporaryAppActivation(activatedPID: 123), "production activation suppression is respected")
@@ -236,6 +258,105 @@ visiblyWide.windowElement.frame = CGRect(x: 0, y: 100, width: 860, height: 300)
 expect(visiblyWide.startTemporaryShortcutStash() && visiblyWide.currentEdge == 2,
        "production stash passes visible width into wide-window preference")
 resetScreens()
+
+// Production notification endpoint ignores geometry/hover locks and never releases focus.
+let dismissed = Session()
+_ = dismissed.startTemporaryShortcutStash()
+dismissed.revealForTemporaryStashTab()
+dismissed.fusionHoverLock = true
+dismissed.focusReleasePending = true
+expect(dismissed.hideForTemporaryAppActivation(activatedPID: 999) && dismissed.isSnappedForCoordination,
+       "production activation dismissal bypasses label hover lock")
+expect(!dismissed.focusReleasePending, "activation dismissal invalidates old focus callbacks and schedules no new release")
+dismissed.revealForTemporaryStashTab()
+expect(!dismissed.hideForTemporaryAppActivation(activatedPID: dismissed.pid) && dismissed.isExpandedForCoordination,
+       "own-PID activation cannot dismiss production session")
+dismissed.isTemporarilyPinned = true
+expect(!dismissed.hideForTemporaryAppActivation(activatedPID: 999) && dismissed.isExpandedForCoordination,
+       "production pinned session cannot be dismissed by app activation")
+dismissed.isTemporarilyPinned = false
+dismissed.isTemporaryShortcutManaged = false
+expect(!dismissed.hideForTemporaryAppActivation(activatedPID: 999) && dismissed.isExpandedForCoordination,
+       "production configured session ignores shortcut activation dismissal")
+
+Session.targetedActivationByPID.removeAll()
+Session.programmaticPIDs.removeAll()
+let protectedReveal = Session()
+_ = protectedReveal.startTemporaryShortcutStash()
+protectedReveal.revealForTemporaryStashTab()
+let protection = Session.targetedActivationByPID[123]!.expiresAt.timeIntervalSinceNow
+expect(protection > 0.55 && protection <= 0.6 && Session.shouldIgnoreTemporaryAppActivation(activatedPID: 123),
+       "hover reveal registers a 0.6-second targeted activation guard")
+Session.targetedActivationByPID[123] = (ObjectIdentifier(protectedReveal), .distantPast)
+expect(!Session.shouldIgnoreTemporaryAppActivation(activatedPID: 123), "expired targeted guard no longer masks user activation")
+Session.programmaticPIDs.insert(999)
+expect(Session.shouldIgnoreTemporaryAppActivation(activatedPID: 999), "focus-return programmatic guard masks dismissal")
+Session.programmaticPIDs.removeAll()
+Session.temporaryFocusReturnActivationUntilByPID[999] = Date().addingTimeInterval(0.6)
+expect(Session.shouldIgnoreTemporaryAppActivation(activatedPID: 999)
+       && !Session.shouldIgnoreProgrammaticActivation(for: 999),
+       "shortcut focus-return guard never changes configured app activation gates")
+Session.temporaryFocusReturnActivationUntilByPID[999] = .distantPast
+expect(!Session.shouldIgnoreTemporaryAppActivation(activatedPID: 999), "expired shortcut focus-return guard permits user activation")
+
+// Enhanced UI suppression wraps the actual production position helper.
+let noAnimation = Session()
+let destination = CGPoint(x: 42, y: 84)
+noAnimation.appElement.enhancedUI = true
+axEvents.removeAll()
+expect(noAnimation.writePosition(position: destination, context: "test") == .success
+       && axEvents == ["read", "disable", "position", "restore"]
+       && noAnimation.appElement.enhancedUI == true && noAnimation.windowElement.frame.origin == destination,
+       "enhanced UI true: read application attribute, disable, position, immediately restore")
+noAnimation.appElement.enhancedUI = false
+axEvents.removeAll()
+_ = noAnimation.writePosition(position: .zero, context: "test")
+expect(axEvents == ["read", "position"] && noAnimation.appElement.enhancedUI == false,
+       "enhanced UI false: position without changing the attribute")
+noAnimation.appElement.enhancedUI = true
+noAnimation.isTemporaryShortcutManaged = false
+axEvents.removeAll()
+_ = noAnimation.writePosition(position: .zero, context: "test")
+expect(axEvents == ["position"] && noAnimation.appElement.enhancedUI == true,
+       "configured position write never reads or changes enhanced UI")
+noAnimation.isTemporaryShortcutManaged = true
+noAnimation.appElement.enhancedUIReadResult = .failure
+axEvents.removeAll()
+_ = noAnimation.writePosition(position: destination, context: "test")
+expect(axEvents == ["read", "position"] && noAnimation.windowElement.frame.origin == destination,
+       "attribute read failure falls through to original position write")
+noAnimation.appElement.enhancedUIReadResult = .success
+noAnimation.appElement.boolResults = [.failure]
+axEvents.removeAll()
+_ = noAnimation.writePosition(position: .zero, context: "test")
+expect(axEvents == ["read", "disable", "position"], "attribute disable failure still writes position directly")
+noAnimation.windowElement.positionResults = [.cannotComplete]
+axEvents.removeAll()
+expect(noAnimation.writePosition(position: destination, context: "test") == .cannotComplete
+       && axEvents == ["read", "disable", "position", "restore"] && noAnimation.appElement.enhancedUI == true,
+       "position failure preserves original error and still restores enhanced UI")
+noAnimation.appElement.boolResults = [.success, .failure]
+axEvents.removeAll()
+expect(noAnimation.writePosition(position: destination, context: "test") == .success
+       && axEvents == ["read", "disable", "position", "restore"],
+       "attribute restore failure does not discard successful position write")
+let animatedReveal = Session()
+_ = animatedReveal.startTemporaryShortcutStash()
+animatedReveal.appElement.enhancedUI = true
+axEvents.removeAll()
+animatedReveal.revealForTemporaryStashTab()
+expect(axEvents == ["read", "disable", "position", "restore"], "production reveal routes through enhanced UI suppression")
+animatedReveal.windowElement.positionResults = [.cannotComplete, .success]
+axEvents.removeAll()
+animatedReveal.cancelTemporaryShortcutStash()
+expect(axEvents == ["read", "disable", "position", "restore", "read", "disable", "position", "restore"],
+       "cancel and retry each restore enhanced UI before returning")
+let dragWithoutWrite = Session()
+_ = dragWithoutWrite.startTemporaryShortcutStash()
+dragWithoutWrite.appElement.enhancedUI = true
+axEvents.removeAll()
+dragWithoutWrite.cancelTemporaryShortcutStash(keepingFrame: dragWithoutWrite.windowElement.frame)
+expect(axEvents.isEmpty, "drag-away cancellation still writes neither position nor enhanced UI")
 
 print("RESULT checks=\(total) failures=\(failures)")
 exit(failures == 0 ? 0 : 1)

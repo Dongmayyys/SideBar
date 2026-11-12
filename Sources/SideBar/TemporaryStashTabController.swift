@@ -45,11 +45,40 @@ final class TemporaryStashTabCoordinator {
     private var hoveredID: ObjectIdentifier?
     private var hoverBeganAt = Date.distantPast
     private var hoverTimer: Timer?
+    private var hoverSuppressedUntilExit: Set<ObjectIdentifier> = []
     private weak var pendingAppActivation: WindowSession?
+    // 只限制等待 Workspace 前台更新的时间；前台到位后的 AX 忙沿用原有重试。
+    private var appActivationDeadline: Date?
+    private var appActivationRetryTimer: Timer?
 
-    func handleAppActivation(activatedPID: pid_t, sessions: [WindowSession]) {
-        pendingAppActivation = sessions.first { $0.canRevealForTemporaryAppActivation(activatedPID: activatedPID) }
+    func handleAppActivation(activatedPID: pid_t, activationPolicy: NSApplication.ActivationPolicy, sessions: [WindowSession]) {
+        resetAppActivation()
+        guard activationPolicy == .regular,
+              activatedPID != ProcessInfo.processInfo.processIdentifier,
+              !WindowSession.shouldIgnoreTemporaryAppActivation(activatedPID: activatedPID) else { return }
+        // 只在 Workspace 激活通知中执行；不依赖可能滞后的 frontmostApplication。
+        for session in sessions where session.isManagedByTemporaryShortcut
+            && session.pid != activatedPID && session.isExpandedForCoordination {
+            if session.hideForTemporaryAppActivation(activatedPID: activatedPID) {
+                let id = ObjectIdentifier(session)
+                if layoutFrames[id]?.contains(NSEvent.mouseLocation) == true {
+                    hoverSuppressedUntilExit.insert(id)
+                }
+                resetHover()
+            }
+        }
+        let candidates = sessions.filter { $0.isManagedByTemporaryShortcut && $0.pid == activatedPID }
+        if !candidates.isEmpty {
+            StashDebugLog.write("activation pid=\(activatedPID)")
+            candidates.forEach { StashDebugLog.write("  candidate \($0.temporaryActivationDiagnostics(activatedPID: activatedPID))") }
+        }
+        // 激活通知先于 frontmostApplication 更新时，仍记录满足其他门槛的目标。
+        pendingAppActivation = sessions.first {
+            $0.canRevealForTemporaryAppActivation(activatedPID: activatedPID, requiresFrontmost: false)
+        }
+        if !candidates.isEmpty { StashDebugLog.write("  pending=\(pendingAppActivation.map { "\($0.temporaryStashID.prefix(8))" } ?? "none")") }
         guard pendingAppActivation != nil else { return }
+        appActivationDeadline = Date().addingTimeInterval(0.6)
         resetHover()
         reconcile(sessions: sessions)
     }
@@ -62,8 +91,25 @@ final class TemporaryStashTabCoordinator {
     func reconcile(sessions: [WindowSession]) {
         guard !isReconciling else { return }
         isReconciling = true
-        defer { isReconciling = false }
+        defer {
+            isReconciling = false
+            scheduleAppActivationRetry()
+        }
         self.sessions = sessions.filter(\.isManagedByTemporaryShortcut)
+        let now = Date()
+        if let pending = pendingAppActivation {
+            let isFrontmost = NSWorkspace.shared.frontmostApplication?.processIdentifier == pending.pid
+            let waitExpired = appActivationDeadline.map { now >= $0 } ?? true
+            if !self.sessions.contains(where: { $0 === pending })
+                || !pending.canRevealForTemporaryAppActivation(activatedPID: pending.pid, requiresFrontmost: false)
+                || (!isFrontmost && waitExpired) {
+                StashDebugLog.write("  pending dropped \(pending.temporaryActivationDiagnostics(activatedPID: pending.pid))")
+                resetAppActivation()
+            } else if isFrontmost {
+                // 此后前台若转走就放弃，不再把它视作 Workspace 更新延迟。
+                appActivationDeadline = nil
+            }
+        }
         // 面板在按住期间离屏/关闭时可能丢失 mouseUp，由轮询补齐松手收尾。
         if let drag, NSEvent.pressedMouseButtons & 1 == 0 {
             handle(.up(NSEvent.mouseLocation), id: drag.id)
@@ -88,7 +134,6 @@ final class TemporaryStashTabCoordinator {
             if !order[key, default: []].contains(id) { order[key, default: []].append(id) }
         }
 
-        let now = Date()
         let visible = descriptors.filter { descriptor in
             let id = ObjectIdentifier(descriptor.session)
             return visibility[id, default: TemporaryStashVisibility()].isVisible(
@@ -121,7 +166,10 @@ final class TemporaryStashTabCoordinator {
                          expanded: descriptor.session.isExpandedForCoordination)
         }
 
-        // 按住任意标签期间锁住全部快捷键会话，既不展开也不收回，包括其他屏幕/边。
+        hoverSuppressedUntilExit = hoverSuppressedUntilExit.filter {
+            layoutFrames[$0]?.contains(NSEvent.mouseLocation) == true
+        }
+        // 按住标签期间锁住全部快捷键会话的悬停展开/鼠标收回；激活通知仍可收回。
         if let drag {
             if !drag.cancelled { panels[drag.id]?.orderFrontRegardless() }
             self.sessions.forEach { $0.setFusionHoverLock(true) }
@@ -136,16 +184,16 @@ final class TemporaryStashTabCoordinator {
             hoverBeganAt = now
         }
         if let pending = pendingAppActivation {
-            // AX 忙时保留请求；重试前核实焦点，避免抢回已经转移的焦点。
-            if !self.sessions.contains(where: { $0 === pending }) || !pending.canRevealForTemporaryAppActivation(activatedPID: pending.pid) {
-                pendingAppActivation = nil
-            } else {
-                if let target = visible.first(where: { $0.session === pending }),
-                   activate(target, among: visible, isAppActivated: true) { pendingAppActivation = nil }
-                return
+            // 尚未成为前台时只等待；AX 忙/同边收回失败也保留请求供下一次重查。
+            if pending.canRevealForTemporaryAppActivation(activatedPID: pending.pid) {
+                let target = visible.first(where: { $0.session === pending })
+                let activated = target.map { activate($0, among: visible, isAppActivated: true) } ?? false
+                StashDebugLog.write("  pending activate visible=\(target != nil) result=\(activated)")
+                if activated { resetAppActivation() }
             }
+            return
         }
-        guard let hovered else { return }
+        guard let hovered, !hoverSuppressedUntilExit.contains(ObjectIdentifier(hovered.session)) else { return }
         let remaining = Double(AppConfig.shared.hoverDelayMS) / 1000 - now.timeIntervalSince(hoverBeganAt)
         if remaining <= 0 {
             hoverTimer?.invalidate()
@@ -221,11 +269,35 @@ final class TemporaryStashTabCoordinator {
         hoverBeganAt = .distantPast
     }
 
+    private func resetAppActivation() {
+        appActivationRetryTimer?.invalidate()
+        appActivationRetryTimer = nil
+        pendingAppActivation = nil
+        appActivationDeadline = nil
+    }
+
+    private func scheduleAppActivationRetry() {
+        guard pendingAppActivation != nil else {
+            resetAppActivation()
+            return
+        }
+        guard appActivationRetryTimer == nil else { return }
+        let timer = Timer(timeInterval: 0.04, repeats: false) { [weak self] _ in
+            guard let self else { return }
+            self.appActivationRetryTimer = nil
+            self.reconcile(sessions: self.sessions)
+        }
+        appActivationRetryTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
     private func activate(_ target: TemporaryStashTabDescriptor, among descriptors: [TemporaryStashTabDescriptor], isAppActivated: Bool = false) -> Bool {
         let siblings = descriptors.filter { EdgeKey($0) == EdgeKey(target) && $0.session !== target.session }
         for sibling in siblings where sibling.session.isExpandedForCoordination {
             if !sibling.session.hideForTemporaryStashTab() { return false }
         }
+        // 同边窗口收回可能经过 AX 调用；真正展开前再次确认前台及其余门槛。
+        if isAppActivated && !target.session.canRevealForTemporaryAppActivation(activatedPID: target.session.pid) { return false }
         if !target.session.isExpandedForCoordination { target.session.revealForTemporaryStashTab(isAppActivated: isAppActivated) }
         return target.session.isExpandedForCoordination
     }
@@ -236,10 +308,11 @@ final class TemporaryStashTabCoordinator {
         order.removeAll()
         visibility.removeAll()
         layoutFrames.removeAll()
+        hoverSuppressedUntilExit.removeAll()
         sessions.removeAll()
         drag = nil
         resetHover()
-        pendingAppActivation = nil
+        resetAppActivation()
     }
 }
 

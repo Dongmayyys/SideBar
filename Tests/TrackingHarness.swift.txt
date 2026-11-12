@@ -1,6 +1,11 @@
 import Foundation
 import ApplicationServices
 
+enum StashDebugLog {
+    static func write(_ message: String) {}
+    static func callers() -> String { "" }
+}
+
 // 全部平台操作只作用于内存；不创建 NSApplication、真实 AX element 或 display link。
 enum Clock { static var time = 0.0 }
 struct Date: Comparable {
@@ -85,6 +90,8 @@ struct Pins { let safeRect: CGRect }
 __SNAP_STATE__
 
 final class Session {
+    let temporaryStashID = "test-session"
+    var debugStateSummary: String { String(describing: state) }
     var state: SnapState = .expanded
     var isAnimating = false { didSet { if isAnimating && !oldValue { animationGenerationToken += 1 } } }
     var animationGenerationToken = 0

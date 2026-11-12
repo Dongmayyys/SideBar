@@ -34,8 +34,10 @@ for name in ['startTemporaryShortcutStash', 'cancelTemporaryShortcutStash', 'res
              'finishTemporaryShortcutSession', 'hideForTemporaryStashTab', 'revealForTemporaryStashTab',
              'restoreAndDestroy', 'handleDestroyed', 'handleMouseUp', 'isDetachedFromManagedEdge',
              'canRevealForTemporaryAppActivation', 'beginTargetedActivationWindow',
+             'shouldIgnoreTemporaryAppActivation', 'hideForTemporaryAppActivation',
+             'setWindowPosition', 'setWindowPositionWithoutSystemAnimation',
              'temporaryStashTabDescriptor', 'isWindowOnScreen', 'animateWindowPositionFast']:
-    matches = list(re.finditer(r'(?:    @discardableResult\n)?    (?:private )?func ' + name + r'\(.*?\n    }', session_source, re.S))
+    matches = list(re.finditer(r'(?:    @discardableResult\n)?    (?:private )?(?:static )?func ' + name + r'\(.*?\n    }', session_source, re.S))
     if len(matches) != 1:
         sys.exit(f'Expected exactly one production method: {name}')
     methods.append(matches[0].group())

@@ -78,7 +78,7 @@ class AXWindowManager {
     
     @objc private func appDidLaunch(_ notification: Notification) {
         if let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication {
-            handleAppActivation(app: app)
+            handleAppActivation(app: app, isActivationNotification: false)
         }
     }
     
@@ -153,7 +153,7 @@ class AXWindowManager {
     
     @objc private func appDidActivate(_ notification: Notification) {
         if let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication {
-            handleAppActivation(app: app)
+            handleAppActivation(app: app, isActivationNotification: true)
         }
     }
 
@@ -198,7 +198,11 @@ class AXWindowManager {
         }
     }
     
-    private func handleAppActivation(app: NSRunningApplication) {
+    private func handleAppActivation(app: NSRunningApplication, isActivationNotification: Bool) {
+        if isActivationNotification {
+            temporaryTabCoordinator.handleAppActivation(activatedPID: app.processIdentifier,
+                                                       activationPolicy: app.activationPolicy, sessions: sessions)
+        }
         guard let bundleID = app.bundleIdentifier else { return }
         
         // 检查用户是否在面板里勾选了它
@@ -206,7 +210,6 @@ class AXWindowManager {
             monitorApp(pid: app.processIdentifier, bundleID: bundleID, maxRetries: 5)
             prepareDockActivationRoutingIfNeeded(bundleID: bundleID)
         }
-        temporaryTabCoordinator.handleAppActivation(activatedPID: app.processIdentifier, sessions: sessions)
     }
     
     func cleanup() {

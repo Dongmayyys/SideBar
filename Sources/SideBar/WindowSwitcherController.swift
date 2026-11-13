@@ -228,7 +228,7 @@ final class WindowSwitcherController: NSObject, NSTextFieldDelegate, NSTableView
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask).subtracting([.capsLock, .numericPad, .function])
         switch event.keyCode {
         case 53: close(); return true
-        case 36, 76: confirm(); return true
+        case 36, 76, 49: confirm(); return true  // 空格与回车相同：搜索靠拼音与不连续匹配，不需要输入空格
         case 126: moveSelection(-1); return true
         case 125: moveSelection(1); return true
         case 51:

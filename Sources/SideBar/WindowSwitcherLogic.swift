@@ -285,7 +285,7 @@ enum WindowSwitcherPanelLayout {
 
     static func frame(visibleFrame: CGRect, rowCount: Int) -> CGRect {
         let width = min(640, max(0, visibleFrame.width - 32))
-        let height = min(480, visibleFrame.height * 0.65, 64 + CGFloat(max(1, rowCount)) * rowHeight)
+        let height = min(480, visibleFrame.height * 0.65, 74 + CGFloat(max(1, rowCount)) * rowHeight)
         return CGRect(x: visibleFrame.midX - width / 2,
                       y: visibleFrame.maxY - visibleFrame.height * 0.18 - height,
                       width: width, height: height)

@@ -128,14 +128,21 @@ final class WindowSwitcherController: NSObject, NSTextFieldDelegate, NSTableView
         panel.isOpaque = false
         panel.backgroundColor = .clear
         panel.hasShadow = true
-        let background = NSVisualEffectView()
-        background.material = .hudWindow
-        background.state = .active
+        // 白底黑字，接近 Spotlight：固定浅色外观，纯白圆角底，输入区与列表之间一条细分隔线。
+        panel.appearance = NSAppearance(named: .aqua)
+        let background = NSView()
         background.wantsLayer = true
+        background.layer?.backgroundColor = NSColor.white.cgColor
         background.layer?.cornerRadius = 14
+        background.layer?.masksToBounds = true
         panel.contentView = background
+        let separator = NSBox()
+        separator.boxType = .custom
+        separator.borderWidth = 0
+        separator.fillColor = NSColor(white: 0, alpha: 0.08)
         input.placeholderString = "软件名或窗口标题".localized
-        input.font = .systemFont(ofSize: 18)
+        input.font = .systemFont(ofSize: 22)
+        input.textColor = .black
         input.usesSingleLineMode = true
         input.isBezeled = false
         input.drawsBackground = false
@@ -171,16 +178,20 @@ final class WindowSwitcherController: NSObject, NSTextFieldDelegate, NSTableView
         scroll.drawsBackground = false
         status.textColor = .secondaryLabelColor
         status.font = .systemFont(ofSize: 13)
-        for view in [input, scroll, status] {
+        for view in [input, separator, scroll, status] {
             view.translatesAutoresizingMaskIntoConstraints = false
             background.addSubview(view)
         }
         NSLayoutConstraint.activate([
             input.leadingAnchor.constraint(equalTo: background.leadingAnchor, constant: 20),
             input.trailingAnchor.constraint(equalTo: background.trailingAnchor, constant: -20),
-            input.topAnchor.constraint(equalTo: background.topAnchor, constant: 16),
-            input.heightAnchor.constraint(equalToConstant: 28),
-            scroll.topAnchor.constraint(equalTo: input.bottomAnchor, constant: 10),
+            input.topAnchor.constraint(equalTo: background.topAnchor, constant: 14),
+            input.heightAnchor.constraint(equalToConstant: 32),
+            separator.topAnchor.constraint(equalTo: input.bottomAnchor, constant: 10),
+            separator.leadingAnchor.constraint(equalTo: background.leadingAnchor),
+            separator.trailingAnchor.constraint(equalTo: background.trailingAnchor),
+            separator.heightAnchor.constraint(equalToConstant: 1),
+            scroll.topAnchor.constraint(equalTo: separator.bottomAnchor, constant: 6),
             scroll.leadingAnchor.constraint(equalTo: background.leadingAnchor, constant: 10),
             scroll.trailingAnchor.constraint(equalTo: background.trailingAnchor, constant: -10),
             scroll.bottomAnchor.constraint(equalTo: background.bottomAnchor, constant: -10),
@@ -372,8 +383,8 @@ private final class WindowSwitcherRowView: NSTableRowView {
     }
 
     override func drawSelection(in dirtyRect: NSRect) {
-        NSColor.controlAccentColor.setFill()
-        NSBezierPath(roundedRect: bounds.insetBy(dx: 2, dy: 1), xRadius: 5, yRadius: 5).fill()
+        NSColor.controlAccentColor.withAlphaComponent(0.18).setFill()
+        NSBezierPath(roundedRect: bounds.insetBy(dx: 2, dy: 1), xRadius: 6, yRadius: 6).fill()
     }
 }
 
@@ -419,7 +430,7 @@ private final class WindowSwitcherCellView: NSTableCellView {
     override var backgroundStyle: NSView.BackgroundStyle { didSet { updateColors() } }
 
     private func updateColors() {
-        title.textColor = backgroundStyle == .emphasized ? .alternateSelectedControlTextColor : .labelColor
+        title.textColor = .black
     }
 
     private static func highlight(_ text: String, ranges: [NSRange], font: NSFont) -> NSAttributedString {

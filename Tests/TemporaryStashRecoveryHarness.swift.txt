@@ -26,7 +26,6 @@ final class TemporaryStashTabCoordinator {
 final class RecoveryManager {
     var sessions: [Session] = []
     let temporaryTabCoordinator = TemporaryStashTabCoordinator()
-    let temporaryAppVisibility = TemporaryStashAppVisibility()
     var temporaryOrdinals = TemporaryStashOrdinals()
     let temporaryRecoveryStore: TemporaryStashRecoveryStore
     var temporaryRecovery: TemporaryStashRecoverySnapshot
@@ -46,14 +45,12 @@ final class RecoveryManager {
         temporaryTabCoordinator.restoreSlots(temporaryRecovery.assignments)
     }
     func attachSessionLifecycle(to session: Session) {
-        session.temporaryAppVisibility = temporaryAppVisibility
         session.onTemporaryShortcutSessionEnded = { [weak self] session, exclude, remove in
             self?.handleTemporaryShortcutSessionEnded(session, excludeWindow: exclude, removeSession: remove)
         }
     }
     func reconcileIndicators() {
         persistTemporaryRecovery()
-        temporaryAppVisibility.reconcile(sessions: sessions)
     }
     func monitorApp(pid: pid_t, bundleID: String) {}
     var focusedTarget: (appElement: Element, windowElement: Element, pid: pid_t, bundleID: String)?
@@ -80,7 +77,6 @@ final class RecoveryManager {
     func stop() {
         stopTemporaryRecovery()
         sessions.forEach { $0.restoreAndDestroy() }
-        temporaryAppVisibility.restoreAll(reason: "cleanup")
         sessions.removeAll()
     }
 

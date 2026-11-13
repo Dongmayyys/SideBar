@@ -590,20 +590,19 @@ expect(conflictUnknown.sessions.first?.temporaryStashSlot == 1,
        "unknown recovery membership keeps waiting shared reservation and uses topmost free slot on conflict")
 conflictUnknown.stop()
 
-// Normal shutdown must freeze intent before session teardown, including apps
-// hidden by SideBar and records left waiting by earlier versions.
+// Normal shutdown freezes intent before session teardown and does not change application visibility.
 for wasHidden in [false, true] {
     resetBackend()
     let exiting = RecoveryManager([saved])
     exiting.run()
-    if !wasHidden { _ = exiting.temporaryAppVisibility.restore(pid: 123, reason: "test-visible") }
+    if wasHidden { NSRunningApplication.hidden.insert(123) }
     expect(NSRunningApplication.hidden.contains(123) == wasHidden, "shutdown fixture has expected app visibility: \(wasHidden)")
     let beforeExit = exiting.temporaryRecoveryStore.load()
     exiting.stop()
     expect(exiting.temporaryRecoveryStore.load() == beforeExit
            && !beforeExit.windows[0].awaitingRelaunch && beforeExit.windows[0].closedAt == nil,
            "normal shutdown does not classify a live process as closed or awaiting relaunch: \(wasHidden)")
-    expect(!NSRunningApplication.hidden.contains(123), "normal shutdown confirms owned app visible: \(wasHidden)")
+    expect(NSRunningApplication.hidden.contains(123) == wasHidden, "normal shutdown preserves user-controlled app visibility: \(wasHidden)")
     let nextLaunch = RecoveryManager(exiting.temporaryRecoveryStore.load().windows)
     nextLaunch.run()
     expect(nextLaunch.sessions.first?.windowElement === applicationElements[123]!.windows![0]

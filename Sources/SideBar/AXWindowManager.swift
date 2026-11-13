@@ -5,7 +5,6 @@ class AXWindowManager {
     private var sessions: [WindowSession] = []
     private let fusionCoordinator = FusionStripCoordinator()
     private let temporaryTabCoordinator = TemporaryStashTabCoordinator()
-    private let temporaryAppVisibility = TemporaryStashAppVisibility()
     private var temporaryOrdinals = TemporaryStashOrdinals()
     private let temporaryRecoveryStore = TemporaryStashRecoveryStore()
     private var temporaryRecovery = TemporaryStashRecoverySnapshot()
@@ -59,8 +58,6 @@ class AXWindowManager {
         // 监听新应用启动
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(appDidLaunch), name: NSWorkspace.didLaunchApplicationNotification, object: nil)
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(appDidTerminate), name: NSWorkspace.didTerminateApplicationNotification, object: nil)
-        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(appDidUnhide), name: NSWorkspace.didUnhideApplicationNotification, object: nil)
-        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(appDidHide), name: NSWorkspace.didHideApplicationNotification, object: nil)
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(handleActiveSpaceDidChange), name: NSWorkspace.activeSpaceDidChangeNotification, object: nil)
         for name in [NSWorkspace.didWakeNotification, NSWorkspace.screensDidWakeNotification, NSWorkspace.sessionDidBecomeActiveNotification] {
             NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(handleSystemResume), name: name, object: nil)
@@ -123,16 +120,6 @@ class AXWindowManager {
         retainTemporaryRecoveryAfterTermination(pid: app.processIdentifier)
         synchronizeSessions()
         restoreTemporaryShortcuts(attemptsRemaining: 20)
-    }
-
-    @objc private func appDidUnhide(_ notification: Notification) {
-        guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
-        temporaryAppVisibility.applicationWasUnhidden(pid: app.processIdentifier)
-    }
-
-    @objc private func appDidHide(_ notification: Notification) {
-        guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
-        temporaryAppVisibility.applicationWasHidden(pid: app.processIdentifier)
     }
 
     private func retainTemporaryRecoveryAfterTermination(pid: pid_t) {
@@ -227,7 +214,6 @@ class AXWindowManager {
 
     @objc private func handleActiveSpaceDidChange() {
         revalidateTemporaryWindows(reason: "space-change")
-        temporaryAppVisibility.spaceDidChange()
         temporaryTabCoordinator.reconcileAfterSpaceChange(sessions: sessions)
         fusionCoordinator.resetForSpaceChange(sessions: sessions.filter { !$0.isManagedByTemporaryShortcut })
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { [weak self] in
@@ -245,7 +231,6 @@ class AXWindowManager {
     @objc private func handleScreenParametersChanged() {
         TemporaryStashWindowIdentity.deferValidationAfterSystemChange()
         revalidateTemporaryWindows(reason: "display-topology")
-        temporaryAppVisibility.spaceDidChange(topologyChanged: true)
         let activeScreens = NSScreen.screens
         var reseated = 0
         var recovered = 0
@@ -265,7 +250,6 @@ class AXWindowManager {
                 recovered += 1
             }
         }
-        for session in sessions { session.temporaryStashPresence = nil }
         if reseated + recovered > 0 {
             print("🖥️ 检测到屏幕配置变化: reseat=\(reseated), recover=\(recovered)")
         }
@@ -313,7 +297,6 @@ class AXWindowManager {
             for session in sessions where session.isManagedByTemporaryShortcut && session.pid == app.processIdentifier {
                 _ = session.reconcileTemporaryWindow(reason: "application-activation", forceRebind: true)
             }
-            temporaryAppVisibility.applicationWasActivated(pid: app.processIdentifier)
             recordMainInterfaceActivation(app)
             temporaryTabCoordinator.handleAppActivation(activatedPID: app.processIdentifier,
                                                        activationPolicy: app.activationPolicy, sessions: sessions)
@@ -334,7 +317,6 @@ class AXWindowManager {
         for session in sessions {
             session.restoreAndDestroy()
         }
-        temporaryAppVisibility.restoreAll(reason: "cleanup")
         sessions.removeAll()
         mainInterfaceHistory.removeAll()
         bundleControlOwnerOverrides.removeAll()
@@ -390,7 +372,6 @@ class AXWindowManager {
         for session in sessions {
             session.suspendForAccessibilityLoss()
         }
-        temporaryAppVisibility.restoreAll(reason: "accessibility-loss")
         sessions.removeAll()
         bundleControlOwnerOverrides.removeAll()
         bundlePreferredClaimSessionIDs.removeAll()
@@ -732,16 +713,14 @@ class AXWindowManager {
         let fusionEnd = Date()
         persistTemporaryRecovery()
         let persistenceEnd = Date()
-        temporaryAppVisibility.reconcile(sessions: sessions, activatingPID: temporaryTabCoordinator.pendingActivationPID)
-        let appEnd = Date()
         temporaryTabCoordinator.reconcile(sessions: sessions)
         let end = Date()
         lastReconcileAt = end
         if end.timeIntervalSince(start) > 0.1 {
-            StashDebugLog.write("reconcile slow totalMS=\(end.timeIntervalSince(start) * 1000) fusionMS=\(fusionEnd.timeIntervalSince(start) * 1000) persistenceMS=\(persistenceEnd.timeIntervalSince(fusionEnd) * 1000) appMS=\(appEnd.timeIntervalSince(persistenceEnd) * 1000) panelsMS=\(end.timeIntervalSince(appEnd) * 1000)")
+            StashDebugLog.write("reconcile slow totalMS=\(end.timeIntervalSince(start) * 1000) fusionMS=\(fusionEnd.timeIntervalSince(start) * 1000) persistenceMS=\(persistenceEnd.timeIntervalSince(fusionEnd) * 1000) panelsMS=\(end.timeIntervalSince(persistenceEnd) * 1000)")
         }
         if end.timeIntervalSince(lastHeartbeatAt) >= 10 {
-            StashDebugLog.write("heartbeat sessions=\(sessions.count) \(temporaryAppVisibility.diagnosticSummary) visible-panels=\(temporaryTabCoordinator.visiblePanelCount) last-reconcile=\(end) gapMS=\(gap * 1000)")
+            StashDebugLog.write("heartbeat sessions=\(sessions.count) visible-panels=\(temporaryTabCoordinator.visiblePanelCount) last-reconcile=\(end) gapMS=\(gap * 1000)")
             lastHeartbeatAt = end
         }
     }
@@ -1012,7 +991,6 @@ class AXWindowManager {
     }
 
     private func attachSessionLifecycle(to session: WindowSession) {
-        session.temporaryAppVisibility = temporaryAppVisibility
         session.onHotkeyRuntimeStateChanged = { [weak self] _ in
             self?.handleSessionRuntimeStateChanged()
         }

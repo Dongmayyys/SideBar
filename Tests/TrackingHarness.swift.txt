@@ -94,11 +94,6 @@ final class NSWorkspace { static let shared = NSWorkspace(); var frontmostApplic
 @discardableResult func axSetSizeAttribute(on element: AXUIElement, size: CGSize, context: String) -> Bool { element.size = size; return true }
 @discardableResult func axSetBoolAttribute(on element: AXUIElement, attribute: CFString, value: Bool, context: String) -> Bool { true }
 struct Pins { let safeRect: CGRect }
-final class TemporaryStashAppVisibility {
-    func beginReveal(pid: pid_t, sessionID: String, screenID: UInt32, edge: Int) -> Bool { true }
-    func completeReveal(pid: pid_t, sessionID: String) {}
-    func prepareToReveal(pid: pid_t, sessionID: String, onReady: @escaping () -> Void) -> Bool { true }
-}
 
 __SNAP_STATE__
 
@@ -121,7 +116,6 @@ final class Session {
     var expandAnimations = 0
     var alpha: CGFloat = 1
     var temporaryLastExpandedFrame: CGRect?
-    var temporaryAppVisibility: TemporaryStashAppVisibility?
     var isSnappedForCoordination: Bool { snapped }
     var isExpandedForCoordination: Bool { state == .expanded }
     var pendingDockInteraction = false

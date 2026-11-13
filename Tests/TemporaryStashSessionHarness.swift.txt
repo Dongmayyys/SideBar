@@ -8,7 +8,6 @@ final class TestHiddenDefaults {
     func synchronize() {}
 }
 import ApplicationServices
-let testHiddenDefaults = TestHiddenDefaults()
 
 enum StashDebugLog {
     static var messages: [String] = []
@@ -51,7 +50,6 @@ __SPACE_PARSER__
     static var active: Set<UInt64>? = [1]
     static var memberships: [CGWindowID: Set<UInt64>] = [:]
     static var available = true
-    static func spaceQueryCategory(for windowID: CGWindowID) -> String { available ? "valid" : "nil" }
     static var displays: [String: UInt64]?
     static func displayUUID(for screenID: UInt32) -> String? { "display-\(screenID)" }
     static func activeSpacesByDisplay() -> [String: UInt64]? {
@@ -61,7 +59,7 @@ __SPACE_PARSER__
     }
     static func spaceIDs(for windowID: CGWindowID) -> Set<UInt64>? { available ? (memberships[windowID] ?? [1]) : nil }
 }
-var appVisibilityEvents: [String] = []
+var platformEvents: [String] = []
 final class RuntimeTrust {
     var trusted = true
     func evaluateTrustState(source: String) -> Bool { trusted }
@@ -146,13 +144,8 @@ final class NSRunningApplication {
     static var bundles: [Int32: String] = [:]
     static var terminated: Set<Int32> = []
     static var hidden: Set<Int32> = []
-    static var hideSucceeds = true
     static var unhideSucceeds = true
-    static var unhideIsImmediate = true
     static var onUnhide: ((Int32) -> Void)?
-    static var pendingUnhides: Set<Int32> = []
-    static var hideIsImmediate = true
-    static var pendingHides: Set<Int32> = []
     static var launches: [Int32: Date] = [:]
     var launchDate: Date? { Self.launches[processIdentifier] ?? Date(timeIntervalSince1970: 100) }
     var processStartDate: Date? { launchDate }
@@ -167,22 +160,9 @@ final class NSRunningApplication {
         Self.hidden.remove(processIdentifier)
         NSWorkspace.shared.frontmostApplication = self
     }
-    func hide() -> Bool {
-        appVisibilityEvents.append("hide:\(processIdentifier)")
-        if Self.hideSucceeds {
-            if Self.hideIsImmediate { Self.hidden.insert(processIdentifier) }
-            else { Self.pendingHides.insert(processIdentifier) }
-        }
-        return Self.hideSucceeds
-    }
     func unhide() -> Bool {
-        appVisibilityEvents.append("unhide:\(processIdentifier)")
-        if Self.unhideSucceeds {
-            if Self.unhideIsImmediate {
-                Self.hidden.remove(processIdentifier)
-                Self.pendingHides.remove(processIdentifier)
-            } else { Self.pendingUnhides.insert(processIdentifier) }
-        }
+        platformEvents.append("unhide:\(processIdentifier)")
+        if Self.unhideSucceeds { Self.hidden.remove(processIdentifier) }
         Self.onUnhide?(processIdentifier)
         return Self.unhideSucceeds
     }
@@ -197,7 +177,7 @@ final class NSWorkspace {
 }
 @discardableResult
 func axSetPositionAttribute(on element: Element, position: CGPoint, context: String) -> AXResult {
-    appVisibilityEvents.append("position")
+    platformEvents.append("position")
     element.writes += 1
     element.events.append("position")
     axEvents.append("position")
@@ -207,7 +187,7 @@ func axSetPositionAttribute(on element: Element, position: CGPoint, context: Str
 }
 @discardableResult
 func axSetSizeAttribute(on element: Element, size: CGSize, context: String) -> AXResult {
-    appVisibilityEvents.append("size")
+    platformEvents.append("size")
     element.events.append("size")
     axEvents.append("size")
     let result = element.sizeResults.isEmpty ? .success : element.sizeResults.removeFirst()
@@ -267,9 +247,8 @@ final class Session {
     var temporaryOriginalFrame: CGRect?
     var temporaryOriginalSize: CGSize?
     var temporaryStashSpaceIDs: Set<UInt64>?
-    var temporaryStashPresence: TemporaryStashAppVisibility.Presence?
+    var temporaryStashSpaceVisible = true
     var lastTemporaryDescriptorDiagnostic = ""
-    weak var temporaryAppVisibility: TemporaryStashAppVisibility?
     var temporaryLastExpandedFrame: CGRect?
     var lockedWidth: CGFloat = 0
     var initialFrameCaptured = false
@@ -331,8 +310,6 @@ final class Session {
     var isFloatingForCoordination: Bool { state == .floating }
     var appDisplayName = "test"
     var temporaryStashOrdinal = 1
-    var fullscreen = false
-    func isInFullscreenSpace(screen: NSScreen) -> Bool { fullscreen }
     var isExpandedForCoordination: Bool { state == .expanded }
     var isSnappedForCoordination: Bool { if case .snapped = state { return true }; return false }
     func getRawWindowFrame() -> CGRect? { (rawUnavailable || windowElement.frameUnavailable) ? nil : windowElement.frame }
@@ -354,7 +331,7 @@ final class Session {
         return true
     }
     func setWindowAlpha(_ value: CGFloat, isHidden: Bool, frameHint: CGRect? = nil, preserveRecoveryRecord: Bool = false) {
-        appVisibilityEvents.append("alpha:\(value)")
+        platformEvents.append("alpha:\(value)")
         alpha = value; windowElement.events.append("alpha")
     }
     func clearTrackedWindowRecoveryState(frameHint: CGRect) { clearedRecovery = true }

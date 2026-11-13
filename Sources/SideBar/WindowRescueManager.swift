@@ -5,46 +5,6 @@ final class WindowRescueManager {
     static let shared = WindowRescueManager()
 
     private init() {}
-    private let hiddenAppStore = TemporaryStashHiddenAppStore()
-
-    /// Validate both process identity and an associated AX window before any
-    /// unhide. An unconfirmed transaction remains durable for the next attempt.
-    func recoverOwnedApplications(reason: String) {
-        let records = hiddenAppStore.load()
-        StashDebugLog.write("rescue apps begin reason=\(reason) records=\(records.count)")
-        guard AccessibilityRuntimeGuard.shared.evaluateTrustState(source: "app-rescue-\(reason)") else { return }
-        for record in records {
-            guard let app = NSRunningApplication(processIdentifier: record.pid), !app.isTerminated,
-                  let windows = standardWindows(in: AXUIElementCreateApplication(record.pid)) else { continue }
-            let ids = Set(windows.compactMap { WindowAlphaManager.shared.findWindowID(for: $0, pid: record.pid) })
-            guard record.matches(pid: app.processIdentifier, bundleID: app.bundleIdentifier,
-                                 launchDate: app.processStartDate, windowIDs: ids) else {
-                StashDebugLog.write("rescue app rejected pid=\(record.pid) reason=identity-or-window-mismatch")
-                continue
-            }
-            let pendingHide = record.phase == "hideRequested"
-            var transaction = record
-            transaction.phase = "revealRequested"
-            hiddenAppStore.upsert(transaction)
-            let start = Date()
-            let settle = start.addingTimeInterval(pendingHide ? 0.8 : 0)
-            let deadline = start.addingTimeInterval(1.2)
-            repeat {
-                let before = app.isHidden
-                let accepted = app.unhide()
-                StashDebugLog.write("rescue unhide pid=\(record.pid) identity=\(record.launchDate) ownership=\(record.phase) accepted=\(accepted) before=\(before) after=\(app.isHidden)")
-                if !app.isHidden && Date() >= settle { break }
-                RunLoop.current.run(until: Date().addingTimeInterval(0.1))
-            } while Date() < deadline
-            if !app.isHidden && Date() >= settle {
-                hiddenAppStore.remove(pid: record.pid)
-                StashDebugLog.write("rescue app confirmed pid=\(record.pid) delete=visible-and-identity-matched")
-            } else {
-                StashDebugLog.write("rescue app pending pid=\(record.pid) reason=confirmation-timeout ownership-retained=true")
-            }
-        }
-    }
-
     func revealPendingWindowsWithoutAccessibility(reason: String) {
         let structuredWindowIDs = AppConfig.shared.windowRescueRecords.map(\.windowID)
         let legacyWindowIDs = AppConfig.shared.hiddenWindowRecords.compactMap(Self.parseLegacyRecord).map(\.windowID)

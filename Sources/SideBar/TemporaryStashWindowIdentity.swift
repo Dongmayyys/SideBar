@@ -18,7 +18,7 @@ enum TemporaryStashWindowIdentity {
         validationNotBefore = Date().addingTimeInterval(1)
     }
 
-    static var canValidate: Bool { suspensions.isEmpty && Date() >= validationNotBefore }
+    private static var canValidate: Bool { suspensions.isEmpty && Date() >= validationNotBefore }
 
     static func exists(pid: pid_t, windowID: CGWindowID) -> Bool? {
         guard canValidate else { return nil }

@@ -1,12 +1,4 @@
 import Foundation
-final class TestHiddenDefaults {
-    static let standard = TestHiddenDefaults()
-    private var values: [String: Data] = [:]
-    func data(forKey key: String) -> Data? { values[key] }
-    func set(_ value: Data, forKey key: String) { values[key] = value }
-    func removeObject(forKey key: String) { values[key] = nil }
-    func synchronize() {}
-}
 
 enum Clock { static var now: Double = 0 }
 struct Date: Comparable, Codable {
@@ -98,7 +90,6 @@ final class WindowSession {
                                            isOnScreen: eligible, title: temporaryStashID, spaceID: spaceID, activeSpaceID: activeSpaceID)
     }
     func temporaryActivationDiagnostics(activatedPID: pid_t) -> String { temporaryStashID }
-    func cancelTemporaryActivationReveal() {}
     var focusOutside = false
     func temporaryActivationFocusIsOutside(_ managed: [WindowSession]) -> Bool {
         focusOutside || !isManagedByTemporaryShortcut || !managed.contains { $0.pid == pid && !$0.isExpandedForCoordination } || programmaticActivation || targetedActivation || Date() < activationSuppressionUntil
@@ -120,7 +111,6 @@ final class WindowSession {
         isExpandedForCoordination = false
         return true
     }
-    func beginTemporaryStashReveal() -> Bool { true }
     func revealForTemporaryStashTab(isAppActivated: Bool = false) {
         guard canReveal else { return }
         appActivationReveal = isAppActivated
@@ -212,7 +202,6 @@ final class SideBarBridge {
 final class MainInterfaceManager {
     var sessions: [WindowSession] = []
     let temporaryTabCoordinator = TemporaryStashTabCoordinator()
-    let temporaryAppVisibility = MainAppVisibility()
     private var mainInterfaceHistory: [(app: NSRunningApplication, window: AXUIElement)] = []
     var stashCalls = 0
     func handleTemporaryShortcut() -> Bool { stashCalls += 1; return true }
@@ -226,7 +215,4 @@ final class MainInterfaceManager {
         handleGlobalKeyDown(event: NSEvent(keyCode: keyCode, modifierFlags: .init(rawValue: modifiers)))
     }
 __MAIN_INTERFACE_METHODS__
-}
-final class MainAppVisibility {
-    func applicationWasActivated(pid: pid_t) {}
 }

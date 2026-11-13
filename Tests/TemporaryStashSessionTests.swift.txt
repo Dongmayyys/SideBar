@@ -333,30 +333,52 @@ let onscreenWindow: [String: Any] = [
     kCGWindowOwnerPID as String: sensing.pid,
     kCGWindowBounds as String: ["X": CGFloat(800), "Y": CGFloat(700), "Width": CGFloat(400), "Height": CGFloat(300)]
 ]
-cgWindows = [onscreenWindow]
+cgWindows = [] // Logical Space membership does not depend on the app or CG on-screen list.
 sensing.rawUnavailable = true
+NSRunningApplication.hidden.insert(sensing.pid)
 expect(sensing.temporaryStashTabDescriptor()?.isOnScreen == true,
-       "stable CG window ID tolerates AX read failure and lagging CG coordinates")
-cgWindows = []
+       "logical Space keeps label visible for user-hidden app with unavailable AX and CG geometry")
+TemporaryStashWindowSpaces.active = [2]
 expect(sensing.temporaryStashTabDescriptor()?.isOnScreen == false,
-       "off-Space retains descriptor with negative visibility sample")
+       "switching away from logical Space hides label without destroying descriptor")
+TemporaryStashWindowSpaces.available = false
+expect(sensing.temporaryStashTabDescriptor()?.isOnScreen == false,
+       "unknown membership retains last trusted off-Space visibility")
+TemporaryStashWindowSpaces.available = true
+TemporaryStashWindowSpaces.memberships[42] = [1, 2]
+expect(sensing.temporaryStashTabDescriptor()?.isOnScreen == true,
+       "multi-Space window appears on each of its logical desktops")
+sensing.temporaryStashSlot = 4
+TemporaryStashWindowSpaces.memberships[42] = [3]
+TemporaryStashWindowSpaces.active = [3]
+expect(sensing.temporaryStashTabDescriptor()?.isOnScreen == true && sensing.temporaryStashSlot == 4,
+       "desktop migration updates label membership without moving slot")
+TemporaryStashWindowSpaces.displays = ["display-1": 4, "display-2": 3]
+NSScreen.screens.append(NSScreen(frame: CGRect(x: 1000, y: 0, width: 1000, height: 1000), displayID: 2))
+sensing.snappedScreen = NSScreen.screens[1]
+expect(sensing.temporaryStashTabDescriptor()?.isOnScreen == true,
+       "label uses its own physical display's active Space")
+NSScreen.screens.removeLast()
+expect(sensing.temporaryStashTabDescriptor()?.isOnScreen == false,
+       "missing physical display cannot leave an interactive label on a ghost screen")
+sensing.snappedScreen = NSScreen.screens[0]
+TemporaryStashWindowSpaces.memberships = [:]
+TemporaryStashWindowSpaces.displays = nil
+TemporaryStashWindowSpaces.active = [1]
+NSRunningApplication.hidden.remove(sensing.pid)
 sensing.rawUnavailable = false
-sensing.fullscreen = true
-cgWindows = [onscreenWindow]
-expect(sensing.temporaryStashTabDescriptor()?.isOnScreen == false, "fullscreen Space hides temporary label")
-sensing.fullscreen = false
 sensing.isTemporaryShortcutManaged = false
 expect(sensing.temporaryStashTabDescriptor() == nil, "configured session never creates shortcut descriptor")
-// Configured windows still use the existing geometry test, not the temporary ID path.
+// Configured windows still use the existing geometry test, not the temporary Space path.
+cgWindows = [onscreenWindow]
 WindowAlphaManager.shared.windowID = 42
 expect(!sensing.sensedOnScreen(), "configured on-screen logic remains geometry-based")
 WindowAlphaManager.shared.windowID = nil
 sensing.isTemporaryShortcutManaged = true
+sensing.temporaryStashSpaceIDs = [1]
 sensing.temporaryStashWindowID = nil
-let matching: [String: Any] = [kCGWindowOwnerPID as String: sensing.pid,
-    kCGWindowBounds as String: ["X": sensing.windowElement.frame.minX, "Y": sensing.windowElement.frame.minY, "Width": sensing.windowElement.frame.width]]
-cgWindows = [matching]
-expect(sensing.temporaryStashTabDescriptor()?.isOnScreen == true, "temporary sensing falls back to geometry when window ID unavailable")
+expect(sensing.temporaryStashTabDescriptor()?.isOnScreen == true,
+       "temporarily unavailable window ID retains last trusted logical visibility")
 WindowAlphaManager.shared.windowID = 42
 
 for edge in [1, 2] {
@@ -507,6 +529,53 @@ NSScreen.screens.append(NSScreen(frame: CGRect(x: 1000, y: 0, width: 1000, heigh
 let rightBlocked = Session()
 expect(rightBlocked.startTemporaryShortcutStash() && rightBlocked.currentEdge == 1,
        "new production stash uses left only when right is blocked")
+
+let managedDisplays: [[String: Any]] = [
+    ["Display Identifier": "display-1", "Current Space": ["ManagedSpaceID": NSNumber(value: 1)]],
+    ["Display Identifier": "display-2", "Current Space": ["ManagedSpaceID": NSNumber(value: 2)]]
+]
+expect(TemporaryStashWindowSpaces.activeSpaces(in: managedDisplays, screenUUIDs: []) == ["display-1": 1, "display-2": 2],
+       "production Space parser keeps display UUID and current Space mapping")
+let partialDisplays = [managedDisplays[0], ["Display Identifier": "display-2"]]
+expect(TemporaryStashWindowSpaces.activeSpaces(in: partialDisplays, screenUUIDs: []) == ["display-1": 1],
+       "missing fields on one display leave that display unknown without downgrading another")
+expect(TemporaryStashWindowSpaces.activeSpaces(in: [], screenUUIDs: []) == nil
+       && TemporaryStashWindowSpaces.activeSpaces(in: [["Display Identifier": "display-1", "Current Space": [:]]], screenUUIDs: []) == nil,
+       "empty and malformed managed display samples are unknown, never an empty trusted active set")
+expect(TemporaryStashWindowSpaces.activeSpaces(in: [["Display Identifier": "Main", "Current Space": ["ManagedSpaceID": NSNumber(value: 4)]]],
+    screenUUIDs: ["display-1", "display-2"]) == ["display-1": 4, "display-2": 4],
+       "shared desktop group maps to physical displays when separate Spaces are disabled")
+
+
+// Preserve actual coordinator/session switching without application-hide transactions.
+resetScreens()
+TemporaryStashWindowSpaces.memberships = [:]
+TemporaryStashWindowSpaces.active = [1]
+TemporaryStashWindowSpaces.available = true
+let firstSwitch = Session(temporaryStashID: "switch-a")
+let secondSwitch = Session(pid: 456, bundleID: "other.app", temporaryStashID: "switch-b")
+_ = firstSwitch.startTemporaryShortcutStash()
+_ = secondSwitch.startTemporaryShortcutStash()
+firstSwitch.revealForTemporaryStashTab()
+let switcher = LiveSwitchCoordinator()
+func switchDescriptors() -> [TemporaryStashTabDescriptor] {
+    [firstSwitch, secondSwitch].compactMap { $0.temporaryStashTabDescriptor() }
+}
+expect(switcher.activate(secondSwitch.temporaryStashTabDescriptor()!, among: switchDescriptors())
+       && firstSwitch.isSnappedForCoordination && firstSwitch.alpha == 0 && secondSwitch.isExpandedForCoordination,
+       "real same-edge switch collapses previous window before revealing target without app hiding")
+secondSwitch.rawUnavailable = true
+expect(!switcher.activate(firstSwitch.temporaryStashTabDescriptor()!, among: switchDescriptors())
+       && firstSwitch.isSnappedForCoordination && secondSwitch.isExpandedForCoordination,
+       "AX failure collapsing previous window leaves target collapsed for retry")
+secondSwitch.rawUnavailable = false
+expect(switcher.activate(firstSwitch.temporaryStashTabDescriptor()!, among: switchDescriptors())
+       && firstSwitch.isExpandedForCoordination && secondSwitch.isSnappedForCoordination,
+       "same-edge switch resumes when previous window geometry becomes readable")
+firstSwitch.isTemporarilyPinned = true
+expect(switcher.activate(secondSwitch.temporaryStashTabDescriptor()!, among: switchDescriptors())
+       && firstSwitch.isExpandedForCoordination && secondSwitch.isExpandedForCoordination,
+       "real switch preserves pinned expanded sibling")
 
 print("RESULT checks=\(total) failures=\(failures)")
 exit(failures == 0 ? 0 : 1)

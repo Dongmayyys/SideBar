@@ -40,13 +40,13 @@ if result.returncode:
 session_source = (source / 'WindowSession.swift').read_text()
 methods = []
 for name in ['snappedScreenIsStale', 'reseatTemporaryShortcutGeometry', 'recoverFromScreenParametersChange', 'reconcileTemporaryWindow', 'noteTemporaryIdentityUnknown', 'rebindTemporaryWindow', 'startTemporaryShortcutStash', 'cancelTemporaryShortcutStash', 'restoreTemporaryShortcutWindow',
-             'finishTemporaryShortcutSession', 'beginTemporaryStashReveal', 'hideForTemporaryStashTab', 'revealForTemporaryStashTab', 'focusForTemporaryStashTab',
+             'finishTemporaryShortcutSession', 'hideForTemporaryStashTab', 'revealForTemporaryStashTab', 'focusForTemporaryStashTab',
              'restoreAndDestroy', 'handleDestroyed', 'handleMouseUp', 'suspendForAccessibilityLoss', 'isDetachedFromManagedEdge',
              'relinquishToDockMinimizeIfDetachedFromEdge', 'prepareTemporaryShortcutFrame', 'edgeGeometry', 'getWindowFrame',
-             'canRevealForTemporaryAppActivation', 'temporaryActivationFocusIsOutside', 'cancelTemporaryActivationReveal', 'beginTargetedActivationWindow',
+             'canRevealForTemporaryAppActivation', 'temporaryActivationFocusIsOutside', 'beginTargetedActivationWindow',
              'shouldIgnoreTemporaryAppActivation', 'hideForTemporaryAppActivation',
              'setWindowPosition', 'setWindowPositionWithoutSystemAnimation',
-             'refreshTemporaryStashSpaces', 'temporaryStashTabDescriptor', 'temporaryStashRecoveryRecord', 'clampFrameYToBounds', 'isWindowOnScreen', 'animateWindowPositionFast']:
+             'temporaryStashIsOnCurrentSpace', 'refreshTemporaryStashSpaces', 'temporaryStashTabDescriptor', 'temporaryStashRecoveryRecord', 'clampFrameYToBounds', 'isWindowOnScreen', 'animateWindowPositionFast']:
     matches = list(re.finditer(r'(?:    @discardableResult\n)?    (?:private )?(?:static )?func ' + name + r'\(.*?\n    }', session_source, re.S))
     if len(matches) != 1:
         sys.exit(f'Expected exactly one production method: {name}')
@@ -54,7 +54,7 @@ for name in ['snappedScreenIsStale', 'reseatTemporaryShortcutGeometry', 'recover
 state = re.search(r'enum SnapState:.*?\n}', session_source, re.S).group()
 session_fixture = (repo / 'Tests/TemporaryStashSessionHarness.swift.txt').read_text()
 session_fixture = session_fixture.replace('__SNAP_STATE__', state).replace('__METHODS__', '\n\n'.join(methods))
-space_source = (source / 'TemporaryStashAppVisibility.swift').read_text()
+space_source = (source / 'TemporaryStashWindowSpaces.swift').read_text()
 space_parser = re.search(r'    static func activeSpaces\(in .*?\n    }', space_source, re.S).group()
 session_fixture = session_fixture.replace('__SPACE_PARSER__', space_parser)
 descriptor = coordinator[coordinator.index('struct TemporaryStashTabDescriptor'):coordinator.index('enum TemporaryStashTabEvent')]
@@ -64,9 +64,11 @@ session_fixture += '\n' + (source / 'TemporaryStashLogic.swift').read_text()
 identity_source = (source / 'TemporaryStashWindowIdentity.swift').read_text()
 identity_source = identity_source.replace('import AppKit', 'import Foundation').replace('AXUIElementCreateApplication', 'testIdentityApplicationElement').replace('CGWindowListCopyWindowInfo', 'testCGWindowListCopyWindowInfo')
 session_fixture += '\n' + identity_source
-visibility_source = (source / 'TemporaryStashAppVisibility.swift').read_text()
-visibility_class = visibility_source[visibility_source.index('final class TemporaryStashAppVisibility'):]
-session_fixture += '\n' + visibility_class.replace('WindowSession', 'Session').replace('CGWindowListCopyWindowInfo', 'testCGWindowListCopyWindowInfo').replace('TemporaryStashHiddenAppStore()', 'TemporaryStashHiddenAppStore(defaults: testHiddenDefaults)')
+# Keep the real same-edge switch entry point paired with real session methods.
+switch_method = re.search(r'    private func activate\(.*?\n    }', coordinator, re.S).group()
+session_fixture += '\nfinal class LiveSwitchCoordinator {\n'
+session_fixture += '    func rememberExpansion(of session: Session) {}\n'
+session_fixture += switch_method.replace('private func activate', 'func activate') + '\n}\n'
 session_base = session_fixture
 session_fixture += '\n' + (repo / 'Tests/TemporaryStashSessionTests.swift.txt').read_text()
 # Top-level Swift statements require a main.swift when compiling an executable.
@@ -122,36 +124,24 @@ print(result.stderr, end='', file=sys.stderr)
 if result.returncode:
     sys.exit(result.returncode)
 
-# Exercise the production visibility coordinator and session/recovery entry points.
-visibility_fixture = session_base + '\n' + recovery_harness
-rescue_source = (source / 'WindowRescueManager.swift').read_text()
-rescue_methods = []
-for name in ['recoverOwnedApplications', 'candidatePIDs']:
-    match = re.search(r'    (?:private )?func ' + name + r'\(.*?\n    }', rescue_source, re.S)
-    if match is None:
-        sys.exit(f'Missing production rescue method: {name}')
-    rescue_methods.append(match.group().replace('AXUIElementCreateApplication', 'testApplicationElement'))
-rescue_fixture = (repo / 'Tests/TemporaryStashRescueHarness.swift.txt').read_text()
-rescue_fixture = rescue_fixture.replace('__RESCUE_METHODS__', '\n\n'.join(rescue_methods))
-visibility_fixture += '\n' + rescue_fixture
-# Exercise the real hide-before-reveal switch transaction with real session and
-# visibility logic, including reentrant state notifications from the old window.
-switch_method = re.search(r'    private func activate\(.*?\n    }', coordinator, re.S).group()
-switch_method = switch_method.replace('private func activate', 'func activate')
-visibility_fixture += '\nfinal class LiveSwitchCoordinator {\n'
-visibility_fixture += '    func rememberExpansion(of session: Session) {}\n' + switch_method + '\n}\n'
-visibility_fixture += '\n' + (repo / 'Tests/TemporaryStashAppVisibilityTests.swift.txt').read_text()
-visibility_output = output / 'app-visibility'
-visibility_output.mkdir(exist_ok=True)
-(visibility_output / 'main.swift').write_text(visibility_fixture)
-compiled = subprocess.run(['swiftc', str(visibility_output / 'main.swift'), '-framework', 'ApplicationServices',
-                           '-o', str(visibility_output / 'tests')], capture_output=True, text=True)
-(visibility_output / 'compile.log').write_text(compiled.stdout + compiled.stderr)
+# Compile the production one-time legacy ownership migration without real apps/defaults.
+migration_source = (source / 'LegacyHiddenApplicationMigration.swift').read_text()
+migration_source = migration_source.replace('import AppKit', 'import Foundation').replace('Foundation.UserDefaults', 'TestHiddenDefaults')
+migration_fixture = session_base + '\n' + migration_source
+candidate_method = re.search(r'    private func candidatePIDs\(.*?\n    }', (source / 'WindowRescueManager.swift').read_text(), re.S).group()
+migration_tests = (repo / 'Tests/LegacyHiddenApplicationMigrationTests.swift.txt').read_text()
+migration_fixture += '\n' + migration_tests.replace('__CANDIDATE_PID_METHOD__', candidate_method)
+migration_output = output / 'legacy-app-migration'
+migration_output.mkdir(exist_ok=True)
+(migration_output / 'main.swift').write_text(migration_fixture)
+compiled = subprocess.run(['swiftc', str(migration_output / 'main.swift'), '-framework', 'ApplicationServices',
+                           '-o', str(migration_output / 'tests')], capture_output=True, text=True)
+(migration_output / 'compile.log').write_text(compiled.stdout + compiled.stderr)
 if compiled.returncode:
     print(compiled.stdout + compiled.stderr, file=sys.stderr)
     sys.exit(compiled.returncode)
-result = subprocess.run([str(visibility_output / 'tests')], capture_output=True, text=True)
-(visibility_output / 'tests.log').write_text(result.stdout + result.stderr)
+result = subprocess.run([str(migration_output / 'tests')], capture_output=True, text=True)
+(migration_output / 'tests.log').write_text(result.stdout + result.stderr)
 print(result.stdout, end='')
 print(result.stderr, end='', file=sys.stderr)
 if result.returncode:

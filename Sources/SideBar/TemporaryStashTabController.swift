@@ -174,7 +174,6 @@ final class TemporaryStashTabCoordinator {
                 let selected = candidates.first {
                     $0.canRevealForTemporaryAppActivation(activatedPID: pid, requiresFrontmost: false)
                 }
-                if pendingAppActivation !== selected { pendingAppActivation?.cancelTemporaryActivationReveal() }
                 pendingAppActivation = selected
             }
         }
@@ -374,7 +373,6 @@ final class TemporaryStashTabCoordinator {
     }
 
     private func resetAppActivation() {
-        pendingAppActivation?.cancelTemporaryActivationReveal()
         appActivationRetryTimer?.invalidate()
         appActivationRetryTimer = nil
         pendingAppActivation = nil
@@ -401,8 +399,6 @@ final class TemporaryStashTabCoordinator {
 
     private func activate(_ target: TemporaryStashTabDescriptor, among descriptors: [TemporaryStashTabDescriptor], isAppActivated: Bool = false, waitForInteraction: Bool = false) -> Bool {
         let siblings = descriptors.filter { $0.screenID == target.screenID && $0.edge == target.edge && $0.session !== target.session }
-        for sibling in siblings { sibling.session.cancelTemporaryActivationReveal() }
-        if !target.session.isExpandedForCoordination && !target.session.beginTemporaryStashReveal() { return false }
         for sibling in siblings where sibling.session.isExpandedForCoordination {
             if !sibling.session.hideForTemporaryStashTab() { return false }
         }

@@ -234,8 +234,10 @@ final class TemporaryStashAppVisibility {
     }
 
     private func observeExternalUnhide(pid: pid_t, reason: String) {
+        // The stored NSRunningApplication can still report the pre-hide value
+        // right after our own hide; only a fresh lookup is authoritative.
         guard let current = applications[pid], current.phase == .hiddenOwned,
-              !current.app.isHidden else { return }
+              let live = NSRunningApplication(processIdentifier: pid), !live.isHidden else { return }
         tripAutoHideCircuitBreaker(pid: pid, sessionIDs: Set(current.windows.keys), reason: reason)
         release(pid: pid, reason: reason, remove: false)
         applications[pid]?.activationUntil = now().addingTimeInterval(0.8)

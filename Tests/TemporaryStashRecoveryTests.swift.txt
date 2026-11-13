@@ -14,6 +14,7 @@ func record(_ id: String = "saved", pid: Int32 = 123, bundle: String = "same.app
                                  originalSize: original.size, slot: slot, windowFrame: frame)
 }
 func resetBackend() {
+    cgAllWindows = nil
     TemporaryStashWindowSpaces.available = true
     TemporaryStashWindowSpaces.memberships = [:]
     TemporaryStashWindowSpaces.active = [1]
@@ -141,6 +142,7 @@ expect(applicationElements[123]!.windows![0].frame == original,
 let reopen = RecoveryManager(shutdown.temporaryRecoveryStore.load().windows)
 reopen.run()
 expect(reopen.sessions.count == 1 && !reopen.sessions[0].isTemporarilyPinned, "manual exit and reopen resets pin state")
+cgAllWindows = [[kCGWindowOwnerPID as String: 1, kCGWindowNumber as String: 1]]
 reopen.sessions[0].closed()
 let closedAt = reopen.pendingTemporaryRecovery.first!.closedAt!
 expect(reopen.temporaryRecoveryStore.load().windows.first?.closedAt != nil, "window destruction temporarily reserves slot pending process check")
@@ -266,6 +268,7 @@ expect(bothBlocked.sessions.isEmpty && bothBlocked.temporaryRecoveryStore.load()
 resetBackend()
 let quitting = RecoveryManager([saved])
 quitting.run()
+cgAllWindows = [[kCGWindowOwnerPID as String: 1, kCGWindowNumber as String: 1]]
 quitting.sessions[0].closed()
 expect(quitting.pendingTemporaryRecovery.first?.closedAt != nil, "AX close reserves its slot during two-second process check")
 NSRunningApplication.terminated.insert(123)
@@ -461,6 +464,7 @@ expect(bootSingle.sessions.count == 1 && bootSingle.sessions[0].temporaryStashOr
 resetBackend()
 let closeWithoutNotification = RecoveryManager([record(slot: 6)])
 closeWithoutNotification.run()
+cgAllWindows = [[kCGWindowOwnerPID as String: 1, kCGWindowNumber as String: 1]]
 closeWithoutNotification.sessions[0].closed()
 closeWithoutNotification.sessions.removeAll()
 let timestamp = closeWithoutNotification.pendingTemporaryRecovery[0].closedAt!
@@ -721,6 +725,109 @@ exportedAgain.run()
 expect(exportedAgain.sessions.map(\.temporaryStashSlot) == [4, 5, 3, 1],
        "second restart preserves migrated slots instead of compacting or moving them")
 exportedAgain.stop()
+
+// A live WindowServer identity outlives any individual AX handle.
+resetBackend()
+let rebinding = RecoveryManager([saved])
+rebinding.run()
+let rebindingSession = rebinding.sessions[0]
+let beforeRebind = rebinding.temporaryRecoveryStore.load().windows
+let obsolete = rebindingSession.windowElement
+obsolete.roleResult = .invalidUIElement
+obsolete.frameUnavailable = true
+cgAllWindows = [[kCGWindowOwnerPID as String: 123, kCGWindowNumber as String: 42,
+                 kCGWindowBounds as String: ["X": 1599, "Y": 200, "Width": 400, "Height": 300]]]
+cgWindows = [[kCGWindowNumber as String: 42]]
+applicationElements[123]!.windows = []
+for _ in 0..<20 { _ = rebindingSession.reconcileTemporaryWindow(reason: "test-sync") }
+rebindingSession.recoverFromScreenParametersChange()
+rebinding.persist()
+expect(rebindingSession.isManagedByTemporaryShortcut && !rebindingSession.destroyed
+       && rebinding.temporaryRecoveryStore.load().windows == beforeRebind,
+       "more than twelve invalid AX reads retain live session, slot and archive")
+expect(rebindingSession.isSnappedForCoordination && rebindingSession.temporaryOriginalFrame == original,
+       "topology recovery with unreadable AX cannot fall through to floating or cancel stash")
+expect(rebindingSession.temporaryStashTabDescriptor()?.isOnScreen == true,
+       "label remains usable with cached CG identity while AX handle is invalid")
+cgAllWindows = nil
+rebindingSession.closed()
+cgAllWindows = []
+rebindingSession.closed()
+expect(rebindingSession.isManagedByTemporaryShortcut && rebinding.pendingTemporaryRecovery.isEmpty,
+       "unavailable and empty WindowServer lists are unknown, even after AX destroyed notification")
+let replacementHandle = Element()
+replacementHandle.systemWindowID = 42
+replacementHandle.frame = obsolete.frame
+applicationElements[123]!.windows = [replacementHandle]
+cgAllWindows = [[kCGWindowOwnerPID as String: 123, kCGWindowNumber as String: 42]]
+rebindingSession.closed()
+rebinding.persist()
+expect(rebindingSession.windowElement === replacementHandle && rebindingSession.observerBindings.last === replacementHandle
+       && rebindingSession.isSnappedForCoordination && !rebindingSession.destroyed,
+       "AX destroyed for surviving CG identity rebinds handle and observer without ending session")
+expect(rebinding.temporaryRecoveryStore.load().windows == beforeRebind && rebinding.pendingTemporaryRecovery.isEmpty,
+       "rebind preserves original frame, stable ID, slot, edge and ordinal exactly")
+for reason in ["space-change", "wake-or-unlock", "display-topology"] {
+    rebinding.revalidate(reason: reason)
+}
+expect(rebindingSession.observerBindings.count == 4 && rebindingSession.isSnappedForCoordination,
+       "Space, wake/unlock and topology revalidation reattach observer without changing stash state")
+rebindingSession.temporaryAXObserverNeedsRetry = true
+_ = rebindingSession.reconcileTemporaryWindow(reason: "test-observer-retry")
+expect(rebindingSession.observerBindings.count == 5 && !rebindingSession.temporaryAXObserverNeedsRetry,
+       "failed observer registration retries on synchronization even when AX role is valid")
+expect(StashDebugLog.messages.contains { $0.contains("session rebind") && $0.contains("AX-destroyed-notification") }
+       && StashDebugLog.messages.contains { $0.contains("session unknown") && $0.contains("retained=true") },
+       "unknown and rebind paths log reasons")
+
+// Final restoration must use the replacement, not the obsolete AX object.
+replacementHandle.roleResult = .invalidUIElement
+let finalHandle = Element()
+finalHandle.systemWindowID = 42
+finalHandle.frame = replacementHandle.frame
+applicationElements[123]!.windows = [finalHandle]
+finalHandle.positionResults = [.cannotComplete, .cannotComplete]
+rebindingSession.cancelTemporaryShortcutStash()
+rebinding.persist()
+expect(!rebindingSession.destroyed && rebindingSession.isManagedByTemporaryShortcut
+       && !rebinding.temporaryRecoveryStore.load().windows.isEmpty,
+       "failed final restoration retains live session and record for retry")
+_ = rebindingSession.reconcileTemporaryWindow(reason: "wake-or-unlock")
+expect(rebindingSession.destroyed && finalHandle.frame == original
+       && rebinding.temporaryRecoveryStore.load().windows.isEmpty,
+       "later synchronization retries cancel on exact replacement and returns offscreen window home")
+
+resetBackend()
+let definiteClose = RecoveryManager([saved])
+definiteClose.run()
+cgAllWindows = [[kCGWindowOwnerPID as String: 1, kCGWindowNumber as String: 1]]
+expect(definiteClose.sessions[0].reconcileTemporaryWindow(reason: "test-sync"),
+       "CG disappearance closes session even when AX role still reads successfully")
+definiteClose.sessions.removeAll()
+definiteClose.resolveCloses(now: Date().addingTimeInterval(3))
+expect(definiteClose.pendingTemporaryRecovery.isEmpty && definiteClose.temporaryRecoveryStore.load().windows.isEmpty,
+       "confirmed CG disappearance with running app deletes recovery and frees slot")
+
+resetBackend()
+var legacyClosing = saved
+legacyClosing.closedAt = Date().addingTimeInterval(-60)
+let survivingClose = RecoveryManager([legacyClosing])
+cgAllWindows = [[kCGWindowOwnerPID as String: 123, kCGWindowNumber as String: 42]]
+survivingClose.run()
+expect(survivingClose.sessions.count == 1 && survivingClose.pendingTemporaryRecovery.isEmpty,
+       "old closedAt is not proof of closure: surviving CG identity recovers normally")
+
+for reason in ["system-sleep", "display-sleep", "inactive-session", "screen-lock"] {
+    cgAllWindows = [[kCGWindowOwnerPID as String: 1, kCGWindowNumber as String: 1]]
+    TemporaryStashWindowIdentity.setSuspended(true, reason: reason)
+    survivingClose.sessions[0].closed()
+    expect(survivingClose.sessions[0].isManagedByTemporaryShortcut && survivingClose.pendingTemporaryRecovery.isEmpty,
+           "system suspension prevents false disappearance and keeps recovery: \(reason)")
+    TemporaryStashWindowIdentity.setSuspended(false, reason: reason)
+}
+TemporaryStashWindowIdentity.deferValidationAfterSystemChange()
+expect(TemporaryStashWindowIdentity.exists(pid: 123, windowID: 42) == nil,
+       "resume and topology quiet period treats intermediate WindowServer snapshot as unknown")
 
 print("RESULT checks=\(total) failures=\(failures)")
 exit(failures == 0 ? 0 : 1)

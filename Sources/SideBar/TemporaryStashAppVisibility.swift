@@ -61,7 +61,7 @@ enum TemporaryStashWindowSpaces {
 /// live process can confirm a request or inherit its recovery transaction.
 final class TemporaryStashAppVisibility {
     struct Presence {
-        let displayUUID: String
+        var displayUUID: String
         var spaces: Set<UInt64>
         var lastVisible: Bool
         let generation: Int
@@ -232,6 +232,13 @@ final class TemporaryStashAppVisibility {
         skipHiding(pid: pid, reason: reason)
     }
 
+    private func keepUnknownEligibility(pid: pid_t, reason: String) {
+        if notHiddenReasons[pid] != reason {
+            StashDebugLog.write("app eligibility unknown pid=\(pid) reason=\(reason) hidden-state-preserved=true")
+            notHiddenReasons[pid] = reason
+        }
+    }
+
     private func reconcileAutoHideCircuitBreakers(groups: [pid_t: [WindowSession]]) {
         for (pid, breaker) in autoHideCircuitBreakers {
             let app = NSRunningApplication(processIdentifier: pid)
@@ -287,17 +294,26 @@ final class TemporaryStashAppVisibility {
                 && (applications[pid] == nil || applications[pid]?.phase == .released) {
                 skipHiding(pid: pid, reason: "same-edge-reveal-pending"); continue
             }
+            guard TemporaryStashWindowIdentity.canValidate else {
+                keepUnknownEligibility(pid: pid, reason: "system-transition"); continue
+            }
             var value: CFTypeRef?
             guard AccessibilityRuntimeGuard.copyAttributeValue(of: first.appElement, attribute: kAXWindowsAttribute as CFString,
                       value: &value, context: "TemporaryStashAppVisibility.windows") == .success,
                   let windows = value as? [AXUIElement] else {
-                restoreForInvalidAXEligibility(pid: pid, sessionIDs: Set(group.map(\.temporaryStashID)), reason: "unknown-windows"); continue
+                keepUnknownEligibility(pid: pid, reason: "unknown-windows"); continue
             }
             let elements = windows.map { element -> (window: AXUIElement, role: String?) in
                 var role: CFTypeRef?
-                _ = AccessibilityRuntimeGuard.copyAttributeValue(of: element, attribute: kAXRoleAttribute as CFString,
+                let result = AccessibilityRuntimeGuard.copyAttributeValue(of: element, attribute: kAXRoleAttribute as CFString,
                     value: &role, context: "TemporaryStashAppVisibility.role")
-                return (element, role as? String)
+                return (element, result == .success ? role as? String : nil)
+            }
+            let managedIDs = Set(group.compactMap(\.temporaryStashWindowID))
+            let listedIDs = Set(windows.compactMap { WindowAlphaManager.shared.findWindowID(for: $0, pid: pid) })
+            guard managedIDs.count == group.count, !windows.isEmpty,
+                  managedIDs.isSubset(of: listedIDs), elements.allSatisfy({ $0.role != nil }) else {
+                keepUnknownEligibility(pid: pid, reason: "missing-session-window-or-role"); continue
             }
             // Finder includes its desktop AXScrollArea in AXWindows. Only real
             // AXWindow elements can veto hiding; desktop icons are OS-managed.
@@ -307,10 +323,14 @@ final class TemporaryStashAppVisibility {
                     context: "TemporaryStashAppVisibility.standard"))
             }
             guard profiled.allSatisfy({ $0.profile.subrole != nil }) else {
-                restoreForInvalidAXEligibility(pid: pid, sessionIDs: Set(group.map(\.temporaryStashID)), reason: "unknown-window-subrole"); continue
+                keepUnknownEligibility(pid: pid, reason: "unknown-window-subrole"); continue
             }
             let standard = profiled.filter { $0.profile.isStandardWindow }.map { $0.window }
-            guard !standard.isEmpty, standard.allSatisfy({ window in group.contains { CFEqual($0.windowElement, window) } }) else {
+            let standardIDs = standard.compactMap { WindowAlphaManager.shared.findWindowID(for: $0, pid: pid) }
+            guard !standardIDs.isEmpty, standardIDs.count == standard.count else {
+                keepUnknownEligibility(pid: pid, reason: "unknown-standard-window-identity"); continue
+            }
+            guard standardIDs.allSatisfy({ managedIDs.contains($0) }) else {
                 restoreForInvalidAXEligibility(pid: pid, sessionIDs: Set(group.map(\.temporaryStashID)), reason: "unmanaged-standard-window"); continue
             }
             if let current = applications[pid], current.phase == .released,
@@ -355,10 +375,13 @@ final class TemporaryStashAppVisibility {
         }
     }
 
-    func isOnScreen(sessionID: String, pid: pid_t, spaces: Set<UInt64>? = nil) -> Bool? {
+    func isOnScreen(sessionID: String, pid: pid_t, spaces: Set<UInt64>? = nil, screenID: UInt32? = nil) -> Bool? {
         guard let current = applications[pid], !current.app.isTerminated,
               current.phase != .released || (!current.app.isHidden && (now() < current.activationUntil || pendingActivationPID == pid || pendingReveals[pid] != nil)),
               var presence = current.windows[sessionID] else { return nil }
+        if let screenID, let display = TemporaryStashWindowSpaces.displayUUID(for: screenID) {
+            presence.displayUUID = display
+        }
         if let spaces, !spaces.isEmpty { presence.spaces = spaces }
         let active = TemporaryStashWindowSpaces.activeSpacesByDisplay()?[presence.displayUUID]
         if let active { presence.lastVisible = presence.spaces.contains(active) }
@@ -410,9 +433,8 @@ final class TemporaryStashAppVisibility {
     func spaceDidChange(topologyChanged: Bool = false) {
         spaceGeneration &+= 1
         StashDebugLog.write("space notification generation=\(spaceGeneration - 1)->\(spaceGeneration) topology=\(topologyChanged) active=\(String(describing: TemporaryStashWindowSpaces.activeSpacesByDisplay())) screens=\(NSScreen.screens.map { "\($0.displayID):\($0.visibleFrame)" }) resample=\(topologyChanged)")
-        if topologyChanged {
-            for pid in Array(applications.keys) { _ = restore(pid: pid, reason: "display-topology-resample") }
-        }
+        // A topology change invalidates geometry, not hide ownership. Resample
+        // membership without exposing offscreen windows or rearming the breaker.
     }
 
     /// Registered before collapsing the previous label, including its reentrant

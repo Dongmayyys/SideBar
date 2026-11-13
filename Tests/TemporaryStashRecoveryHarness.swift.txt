@@ -6,7 +6,10 @@ final class UserDefaults {
     func data(forKey key: String) -> Data? { values[key] }
     func set(_ data: Data, forKey key: String) { values[key] = data; writes += 1 }
 }
-var applicationElements: [Int32: Element] = [:]
+var applicationElements: [Int32: Element] {
+    get { identityApplications }
+    set { identityApplications = newValue }
+}
 func testApplicationElement(_ pid: Int32) -> Element { applicationElements[pid] ?? Element() }
 final class AppConfig {
     static let shared = AppConfig()
@@ -61,6 +64,7 @@ final class RecoveryManager {
         return handleTemporaryShortcut()
     }
     func terminated(pid: pid_t) { retainTemporaryRecoveryAfterTermination(pid: pid) }
+    func revalidate(reason: String) { revalidateTemporaryWindows(reason: reason) }
     func refreshSideBarHotkeyRuntime() {}
     func windowKey(for window: Element, pid: Int32) -> String? { "\(pid):\(window.systemWindowID ?? 42)" }
     func refreshTemporaryDockExclusion(bundleID: String) {

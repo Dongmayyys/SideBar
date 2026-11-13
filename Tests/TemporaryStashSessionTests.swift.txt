@@ -352,6 +352,7 @@ WindowAlphaManager.shared.windowID = 42
 expect(!sensing.sensedOnScreen(), "configured on-screen logic remains geometry-based")
 WindowAlphaManager.shared.windowID = nil
 sensing.isTemporaryShortcutManaged = true
+sensing.temporaryStashWindowID = nil
 let matching: [String: Any] = [kCGWindowOwnerPID as String: sensing.pid,
     kCGWindowBounds as String: ["X": sensing.windowElement.frame.minX, "Y": sensing.windowElement.frame.minY, "Width": sensing.windowElement.frame.width]]
 cgWindows = [matching]

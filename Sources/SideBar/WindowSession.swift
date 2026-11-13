@@ -113,7 +113,10 @@ private func axSetSizeAttribute(
 
 class WindowSession {
     let appElement: AXUIElement
-    let windowElement: AXUIElement
+    private(set) var windowElement: AXUIElement
+    private var lastTemporaryIdentityDiagnostic = ""
+    private var pendingTemporaryRestoreExclusion: Bool?
+    private var temporaryAXObserverNeedsRetry = false
     let pid: pid_t
     let bundleID: String
     private let appDisplayName: String
@@ -431,6 +434,11 @@ class WindowSession {
     /// 当锁定的屏幕已消失时调用：把窗口安全复位到主屏可见区域中心，并把状态机降级为 .floating，
     /// 让用户重新拖拽即可恢复吸附。绝不强行帮用户决定窗口应该出现在哪一块新屏幕。
     func recoverFromScreenParametersChange() {
+        if isTemporaryShortcutManaged {
+            _ = reseatTemporaryShortcutGeometry(in: NSScreen.screens)
+            noteTemporaryIdentityUnknown(reason: "topology-retry-retains-session")
+            return
+        }
         print("🖥️ \(bundleID) 锁定屏幕已消失，复位窗口到 floating 态")
         // 复位前停掉所有可能基于 stale 几何的动画/定时器。
         windowAnimator.stop()
@@ -460,8 +468,6 @@ class WindowSession {
                 context: "WindowSession.recoverFromScreenParametersChange.position"
             )
         }
-
-        if isTemporaryShortcutManaged { temporaryLastExpandedFrame = getRawWindowFrame() }
 
         // 降级到 floating：清空 snappedScreen/snappedDisplayBounds 等锁定状态，
         // 让用户重新拖拽窗口靠近边缘即可重新吸附。
@@ -617,7 +623,7 @@ class WindowSession {
     weak var temporaryAppVisibility: TemporaryStashAppVisibility?
     private var temporaryLastExpandedFrame: CGRect?
     let temporaryStashID: String
-    private var temporaryStashWindowID: CGWindowID?
+    private(set) var temporaryStashWindowID: CGWindowID?
     var temporaryStashOrdinal = 1
     private var isTemporarilyPinned = false
     /// 置顶能力是否处于激活状态：源窗口被钉住后，面板显示实时采集画面。
@@ -934,6 +940,65 @@ class WindowSession {
     func noteAXRoleCheckSucceeded() {
         transientAXRoleFailureCount = 0
         lastTransientAXRoleFailureAt = nil
+    }
+
+    /// Returns true only after WindowServer confirms that this identity disappeared.
+    @discardableResult
+    func reconcileTemporaryWindow(reason: String, forceRebind: Bool = false) -> Bool {
+        guard isTemporaryShortcutManaged else { return false }
+        guard let id = temporaryStashWindowID else {
+            noteTemporaryIdentityUnknown(reason: reason + ":missing-windowID")
+            return false
+        }
+        let exists = TemporaryStashWindowIdentity.exists(pid: pid, windowID: id)
+        if exists == false {
+            StashDebugLog.write("session end id=\(temporaryStashID) pid=\(pid) window=\(id) reason=windowserver-window-gone source=\(reason)")
+            state = .floating
+            finishTemporaryShortcutSession(excludeWindow: false, removeSession: true)
+            destroy()
+            return true
+        }
+        var role: CFTypeRef?
+        let result = AccessibilityRuntimeGuard.copyAttributeValue(of: windowElement,
+            attribute: kAXRoleAttribute as CFString, value: &role, context: "WindowSession.reconcileTemporaryWindow.role")
+        if forceRebind || result != .success || role as? String != kAXWindowRole || temporaryAXObserverNeedsRetry {
+            if !rebindTemporaryWindow(reason: reason) {
+                noteTemporaryIdentityUnknown(reason: reason + ":AX-unavailable-\(result.rawValue)")
+            }
+        }
+        if exists == nil { noteTemporaryIdentityUnknown(reason: reason + ":windowserver-unavailable") }
+        if let excludeWindow = pendingTemporaryRestoreExclusion {
+            if restoreTemporaryShortcutWindow(excludeWindow: excludeWindow) { destroy() }
+        }
+        return false
+    }
+
+    private func noteTemporaryIdentityUnknown(reason: String) {
+        guard lastTemporaryIdentityDiagnostic != reason else { return }
+        lastTemporaryIdentityDiagnostic = reason
+        StashDebugLog.write("session unknown id=\(temporaryStashID) pid=\(pid) window=\(temporaryStashWindowID ?? 0) reason=\(reason) retained=true")
+    }
+
+    @discardableResult
+    private func rebindTemporaryWindow(reason: String) -> Bool {
+        guard isTemporaryShortcutManaged, let id = temporaryStashWindowID,
+              let replacement = TemporaryStashWindowIdentity.window(pid: pid, windowID: id) else { return false }
+        if let source = observerRunLoopSource {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .defaultMode)
+            observerRunLoopSource = nil
+        }
+        axObserver = nil
+        AccessibilityRuntimeGuard.shared.discardMessagingTimeoutCache(for: windowElement)
+        windowElement = replacement
+        setupAXObserver()
+        noteAXRoleCheckSucceeded()
+        observedGeometryChangeToken &+= 1
+        cachedInteractionHitFrame = nil
+        lastCheckedMouseLocation = nil
+        lastCheckedIsOutside = nil
+        lastTemporaryIdentityDiagnostic = ""
+        StashDebugLog.write("session rebind id=\(temporaryStashID) pid=\(pid) window=\(id) reason=\(reason)")
+        return true
     }
 
     func shouldDeferRemovalAfterAXRoleFailure(_ result: AXError) -> Bool {
@@ -3031,6 +3096,7 @@ class WindowSession {
     }
 
     private func trackedWindowIDsForAlpha(frameHint: CGRect? = nil) -> [CGWindowID] {
+        if isTemporaryShortcutManaged, let id = temporaryStashWindowID { return [id] }
         if let windowID = WindowAlphaManager.shared.findWindowID(for: windowElement, pid: pid) {
             return [windowID]
         }
@@ -3123,7 +3189,7 @@ class WindowSession {
 
     func restoreAndDestroy() {
         if isTemporaryShortcutManaged {
-            restoreTemporaryShortcutWindow(excludeWindow: false)
+            guard restoreTemporaryShortcutWindow(excludeWindow: false) else { return }
             destroy()
             return
         }
@@ -3817,9 +3883,12 @@ class WindowSession {
     }
     
     private func setupAXObserver() {
+        if isTemporaryShortcutManaged { temporaryAXObserverNeedsRetry = true }
         var newObserver: AXObserver?
         let callback: AXObserverCallback = { (observer: AXObserver, element: AXUIElement, notification: CFString, context: UnsafeMutableRawPointer?) in
             let session = Unmanaged<WindowSession>.fromOpaque(context!).takeUnretainedValue()
+            // Ignore notifications queued by a detached observer for an old handle.
+            if session.isTemporaryShortcutManaged && !CFEqual(element, session.windowElement) { return }
             if notification == kAXWindowMovedNotification as CFString {
                 if session.shouldTreatObservedMoveAsUserDrag() {
                     session.isDragging = true
@@ -3845,6 +3914,7 @@ class WindowSession {
             context: "WindowSession.setupAXObserver.createObserver"
         ) == .success, let observer = newObserver {
             self.axObserver = observer
+            if isTemporaryShortcutManaged { temporaryAXObserverNeedsRetry = false }
             let selfPtr = Unmanaged.passUnretained(self).toOpaque()
             
             let notifications: [(CFString, String)] = [
@@ -3862,7 +3932,9 @@ class WindowSession {
                     refcon: selfPtr
                 )
                 if result != .success {
-                    return
+                    if !isTemporaryShortcutManaged { return }
+                    temporaryAXObserverNeedsRetry = true
+                    StashDebugLog.write("session observer id=\(temporaryStashID) reason=\(context) error=\(result.rawValue) retry-on-rebind=true")
                 }
             }
             
@@ -3939,13 +4011,11 @@ class WindowSession {
     }
     
     private func handleDestroyed() {
-        print("❌ 窗口被关闭，销毁 SideBar Session")
         if isTemporaryShortcutManaged {
-            state = .floating
-            finishTemporaryShortcutSession(excludeWindow: false, removeSession: true)
-            destroy()
+            reconcileTemporaryWindow(reason: "AX-destroyed-notification", forceRebind: true)
             return
         }
+        print("❌ 窗口被关闭，销毁 SideBar Session")
         finishTemporaryShortcutSession(excludeWindow: false, removeSession: true)
         restoreAndDestroy()
     }
@@ -4029,11 +4099,14 @@ class WindowSession {
 
     func cancelTemporaryShortcutStash() {
         guard isTemporaryShortcutManaged else { return }
-        restoreTemporaryShortcutWindow(excludeWindow: true)
+        guard restoreTemporaryShortcutWindow(excludeWindow: true) else { return }
         destroy()
     }
 
-    private func restoreTemporaryShortcutWindow(excludeWindow: Bool) {
+    private func restoreTemporaryShortcutWindow(excludeWindow: Bool) -> Bool {
+        // Always reacquire by identity before a final write; the old handle may
+        // still answer some attributes while rejecting geometry operations.
+        rebindTemporaryWindow(reason: excludeWindow ? "cancel-restore" : "session-end-restore")
         // 先终止所有位置写入，再恢复。防止退出后仍有动画/焦点回调把窗口拉回边缘。
         invalidatePendingFocusRelease()
         queuedForwardedHotkeyToggle = false
@@ -4076,6 +4149,15 @@ class WindowSession {
         if restoredGeometry, let current, temporaryAppVisibility?.restorationIsConfirmed(pid: pid) != false {
             clearTrackedWindowRecoveryState(frameHint: current)
         }
+        if !restoredGeometry, let id = temporaryStashWindowID,
+           TemporaryStashWindowIdentity.exists(pid: pid, windowID: id) != false {
+            pendingTemporaryRestoreExclusion = excludeWindow
+            noteTemporaryIdentityUnknown(reason: "restore-position-failed")
+            if isExpandedForCoordination { startMouseTrackingTimer() }
+            return false
+        }
+        pendingTemporaryRestoreExclusion = nil
+        StashDebugLog.write("session end id=\(temporaryStashID) pid=\(pid) window=\(temporaryStashWindowID ?? 0) reason=\(excludeWindow ? "cancel-restored" : "cleanup-restored") geometry=\(restoredGeometry)")
         state = .floating
         indicatorWindow.orderOut(nil)
         pinControlWindow.orderOut(nil)
@@ -4085,6 +4167,7 @@ class WindowSession {
         temporaryOriginalSize = nil
         temporaryLastExpandedFrame = nil
         finishTemporaryShortcutSession(excludeWindow: excludeWindow, removeSession: true)
+        return true
     }
 
     func refreshTemporaryStashSpaces() {
@@ -4104,7 +4187,8 @@ class WindowSession {
         }
         refreshTemporaryStashSpaces()
         let fullscreen = isInFullscreenSpace(screen: screen)
-        let cached = temporaryAppVisibility?.isOnScreen(sessionID: temporaryStashID, pid: pid, spaces: temporaryStashSpaceIDs)
+        let cached = temporaryAppVisibility?.isOnScreen(sessionID: temporaryStashID, pid: pid,
+                                                       spaces: temporaryStashSpaceIDs, screenID: screen.displayID)
         let spaceID = TemporaryStashSlotAssignment.singleSpace(in: temporaryStashSpaceIDs)
         let activeSpaceID = TemporaryStashWindowSpaces.displayUUID(for: screen.displayID).flatMap {
             TemporaryStashWindowSpaces.activeSpacesByDisplay()?[$0]
@@ -5048,9 +5132,9 @@ class WindowSession {
     /// [Space Sensing] 基于 PID 与边界坐标的比准
     private func isWindowOnScreen() -> Bool {
         // 快捷键窗口移动时 CG 的 bounds 可能落后于 AX；用窗口 ID 判断 Space，
-        // 不把坐标瞬时不匹配当成离屏。ID 暂时不可读时仍由标签协调器去抖兜底。
+        // 不把坐标瞬时不匹配当成离屏。AX 暂时不可读时沿用会话保存的窗口 ID。
         if isTemporaryShortcutManaged,
-           let windowID = WindowAlphaManager.shared.findWindowID(for: windowElement, pid: pid) {
+           let windowID = temporaryStashWindowID ?? WindowAlphaManager.shared.findWindowID(for: windowElement, pid: pid) {
             let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
             return windows.contains { ($0[kCGWindowNumber as String] as? CGWindowID) == windowID }
         }

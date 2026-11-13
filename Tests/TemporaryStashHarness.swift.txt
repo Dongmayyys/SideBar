@@ -57,6 +57,7 @@ var transitions: [String] = []
 
 // Coordinator uses production geometry/state decisions; only AX/UI endpoints are in-memory.
 final class WindowSession {
+    func reconcileTemporaryWindow(reason: String, forceRebind: Bool = false) -> Bool { false }
     static var ignoredActivationPIDs: Set<pid_t> = []
     static func shouldIgnoreTemporaryAppActivation(activatedPID: pid_t) -> Bool {
         ignoredActivationPIDs.contains(activatedPID)

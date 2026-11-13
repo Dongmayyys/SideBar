@@ -62,6 +62,16 @@ class AXWindowManager {
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(appDidUnhide), name: NSWorkspace.didUnhideApplicationNotification, object: nil)
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(appDidHide), name: NSWorkspace.didHideApplicationNotification, object: nil)
         NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(handleActiveSpaceDidChange), name: NSWorkspace.activeSpaceDidChangeNotification, object: nil)
+        for name in [NSWorkspace.didWakeNotification, NSWorkspace.screensDidWakeNotification, NSWorkspace.sessionDidBecomeActiveNotification] {
+            NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(handleSystemResume), name: name, object: nil)
+        }
+        DistributedNotificationCenter.default().addObserver(self, selector: #selector(handleSystemResume),
+            name: NSNotification.Name("com.apple.screenIsUnlocked"), object: nil)
+        for name in [NSWorkspace.willSleepNotification, NSWorkspace.screensDidSleepNotification, NSWorkspace.sessionDidResignActiveNotification] {
+            NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(handleSystemSuspend), name: name, object: nil)
+        }
+        DistributedNotificationCenter.default().addObserver(self, selector: #selector(handleSystemSuspend),
+            name: NSNotification.Name("com.apple.screenIsLocked"), object: nil)
 
         // 关键修复：监听屏幕配置变化（外接显示器热插拔、分辨率切换、显示器排列调整）。
         // 缺少此监听时，WindowSession 的 snappedScreen/snappedDisplayBounds 会指向已失效的
@@ -141,6 +151,13 @@ class AXWindowManager {
         
         // 1. 下线不再被允许的会话及过期的应用级监听
         sessions.removeAll { session in
+            if session.isManagedByTemporaryShortcut {
+                if session.reconcileTemporaryWindow(reason: "synchronize") || !session.isManagedByTemporaryShortcut { return true }
+                if session.snappedScreenIsStale(in: NSScreen.screens) {
+                    _ = session.reseatSnappedGeometryIfPossible(in: NSScreen.screens)
+                }
+                return false
+            }
             if !AppConfig.shared.isAppEnabled(bundleID: session.bundleID) && !session.isManagedByTemporaryShortcut {
                 print("🗑️ 配置变更，移除已停用会话: \(session.bundleID)")
                 session.restoreAndDestroy()
@@ -175,10 +192,6 @@ class AXWindowManager {
                     session.restoreAndDestroy()
                     return true
                 }
-                if result == .invalidUIElement && session.isManagedByTemporaryShortcut {
-                    session.restoreAndDestroy()
-                    return true
-                }
                 // 进程还在，信任 session 的内部容错计数
                 return false
             }
@@ -203,6 +216,7 @@ class AXWindowManager {
 
         reconcileIndicators()
         refreshSideBarHotkeyRuntime()
+        if !pendingTemporaryRecovery.isEmpty { restoreTemporaryShortcuts(attemptsRemaining: 0) }
     }
     
     @objc private func appDidActivate(_ notification: Notification) {
@@ -212,6 +226,7 @@ class AXWindowManager {
     }
 
     @objc private func handleActiveSpaceDidChange() {
+        revalidateTemporaryWindows(reason: "space-change")
         temporaryAppVisibility.spaceDidChange()
         temporaryTabCoordinator.reconcileAfterSpaceChange(sessions: sessions)
         fusionCoordinator.resetForSpaceChange(sessions: sessions.filter { !$0.isManagedByTemporaryShortcut })
@@ -228,6 +243,8 @@ class AXWindowManager {
     /// 找不到对应新屏时才退化为"复位到主屏可见区域 + 状态机降级为 floating"的安全兜底。
     /// 同时让融合条按新的屏幕几何重新组装，避免快照条出现在"幽灵屏幕"的坐标上。
     @objc private func handleScreenParametersChanged() {
+        TemporaryStashWindowIdentity.deferValidationAfterSystemChange()
+        revalidateTemporaryWindows(reason: "display-topology")
         temporaryAppVisibility.spaceDidChange(topologyChanged: true)
         let activeScreens = NSScreen.screens
         var reseated = 0
@@ -239,6 +256,10 @@ class AXWindowManager {
             if session.reseatSnappedGeometryIfPossible(in: activeScreens) {
                 reseated += 1
             } else {
+                if session.isManagedByTemporaryShortcut {
+                    StashDebugLog.write("session unknown id=\(session.temporaryStashID) pid=\(session.pid) reason=topology-reseat-unavailable retained=true")
+                    continue
+                }
                 // 找不到对应新屏（真的拔了外接屏），走安全兜底。
                 session.recoverFromScreenParametersChange()
                 recovered += 1
@@ -256,9 +277,42 @@ class AXWindowManager {
             self.reconcileIndicators()
         }
     }
+
+    private func revalidateTemporaryWindows(reason: String) {
+        // Lifecycle callbacks defer array removal, so iterate a stable snapshot.
+        for session in sessions where session.isManagedByTemporaryShortcut {
+            _ = session.reconcileTemporaryWindow(reason: reason, forceRebind: true)
+        }
+    }
+
+    @objc private func handleSystemSuspend(_ notification: Notification) {
+        TemporaryStashWindowIdentity.setSuspended(true, reason: systemAvailabilityReason(notification.name))
+    }
+
+    private func systemAvailabilityReason(_ name: Notification.Name) -> String {
+        switch name {
+        case NSWorkspace.willSleepNotification, NSWorkspace.didWakeNotification: return "system-sleep"
+        case NSWorkspace.screensDidSleepNotification, NSWorkspace.screensDidWakeNotification: return "display-sleep"
+        case NSWorkspace.sessionDidResignActiveNotification, NSWorkspace.sessionDidBecomeActiveNotification: return "inactive-session"
+        default: return "screen-lock"
+        }
+    }
+
+    @objc private func handleSystemResume(_ notification: Notification) {
+        guard !hasCleanedUp else { return }
+        TemporaryStashWindowIdentity.setSuspended(false, reason: systemAvailabilityReason(notification.name))
+        TemporaryStashWindowIdentity.deferValidationAfterSystemChange()
+        StashDebugLog.write("system resume reason=\(notification.name.rawValue) revalidate=true")
+        revalidateTemporaryWindows(reason: "wake-or-unlock")
+        synchronizeSessions()
+        restoreTemporaryShortcuts(attemptsRemaining: 20)
+    }
     
     private func handleAppActivation(app: NSRunningApplication, isActivationNotification: Bool) {
         if isActivationNotification {
+            for session in sessions where session.isManagedByTemporaryShortcut && session.pid == app.processIdentifier {
+                _ = session.reconcileTemporaryWindow(reason: "application-activation", forceRebind: true)
+            }
             temporaryAppVisibility.applicationWasActivated(pid: app.processIdentifier)
             recordMainInterfaceActivation(app)
             temporaryTabCoordinator.handleAppActivation(activatedPID: app.processIdentifier,
@@ -326,6 +380,7 @@ class AXWindowManager {
 
         NotificationCenter.default.removeObserver(self)
         NSWorkspace.shared.notificationCenter.removeObserver(self)
+        DistributedNotificationCenter.default().removeObserver(self)
     }
 
     func suspendForAccessibilityLoss() {
@@ -380,6 +435,7 @@ class AXWindowManager {
 
         NotificationCenter.default.removeObserver(self)
         NSWorkspace.shared.notificationCenter.removeObserver(self)
+        DistributedNotificationCenter.default().removeObserver(self)
     }
     
     // 允许通过 AX 通知自己回调
@@ -487,6 +543,9 @@ class AXWindowManager {
         
         // 清理由于关闭等原因已经失效的旧会话（垃圾回收）
         sessions.removeAll { session in
+            if session.isManagedByTemporaryShortcut {
+                return session.reconcileTemporaryWindow(reason: "monitor-app") || !session.isManagedByTemporaryShortcut
+            }
             var roleValue: CFTypeRef?
             let result = AccessibilityRuntimeGuard.copyAttributeValue(
                 of: session.windowElement,
@@ -624,7 +683,12 @@ class AXWindowManager {
 
     private func handleTemporaryShortcut() -> Bool {
         guard let target = currentFocusedStandardWindow() else { return false }
-        let existing = sessions.first { CFEqual($0.windowElement, target.windowElement) }
+        let targetID = WindowAlphaManager.shared.findWindowID(for: target.windowElement, pid: target.pid)
+        let existing = sessions.first {
+            CFEqual($0.windowElement, target.windowElement)
+                || ($0.isManagedByTemporaryShortcut && $0.pid == target.pid
+                    && targetID != nil && $0.temporaryStashWindowID == targetID)
+        }
         let action = TemporaryStashShortcutAction.resolve(
             isConfiguredApp: AppConfig.shared.isAppEnabled(bundleID: target.bundleID),
             isManaged: existing?.isManagedByTemporaryShortcut == true,
@@ -766,6 +830,14 @@ class AXWindowManager {
                 relaunchedRecords.append(record.waitingForRelaunch())
                 continue
             }
+            if TemporaryStashWindowIdentity.exists(pid: record.pid, windowID: record.windowID) == false {
+                var closing = record
+                closing.closedAt = Date()
+                if let index = pendingTemporaryRecovery.firstIndex(where: { $0.id == record.id }) {
+                    pendingTemporaryRecovery[index] = closing
+                }
+                continue
+            }
             guard let windows = temporaryRecoveryWindows(pid: record.pid) else { continue }
             if let window = windows.first(where: {
                 WindowAlphaManager.shared.findWindowID(for: $0, pid: record.pid) == record.windowID
@@ -827,7 +899,11 @@ class AXWindowManager {
 
     private func isTemporaryRecoveryCandidate(_ window: AXUIElement, pid: pid_t, bundleID: String) -> Bool {
         if let key = windowKey(for: window, pid: pid), temporarilyExcludedWindowKeys.contains(key) { return false }
-        return !sessions.contains(where: { CFEqual($0.windowElement, window) })
+        let id = WindowAlphaManager.shared.findWindowID(for: window, pid: pid)
+        return !sessions.contains(where: {
+            CFEqual($0.windowElement, window)
+                || ($0.isManagedByTemporaryShortcut && $0.pid == pid && id != nil && $0.temporaryStashWindowID == id)
+        })
             && WindowCapabilityProfiler.profile(of: window, bundleID: bundleID,
                        context: "AXWindowManager.isTemporaryRecoveryCandidate").isStandardWindow
     }
@@ -1005,7 +1081,22 @@ class AXWindowManager {
             let app = NSRunningApplication(processIdentifier: record.pid)
             let stillRunning = app?.isTerminated == false && app?.bundleIdentifier == record.bundleID
             if !stillRunning { markTemporaryRecoveryWaiting(record) }
-            else if now.timeIntervalSince(closedAt) >= 2 { discardPendingTemporaryRecovery(record) }
+            else {
+                switch TemporaryStashWindowIdentity.exists(pid: record.pid, windowID: record.windowID) {
+                case false?:
+                    if now.timeIntervalSince(closedAt) >= 2 {
+                        StashDebugLog.write("shortcut recovery removed id=\(record.id) pid=\(record.pid) window=\(record.windowID) reason=windowserver-window-gone process-alive=true")
+                        discardPendingTemporaryRecovery(record)
+                    }
+                case true?:
+                    if let index = pendingTemporaryRecovery.firstIndex(where: { $0.id == record.id }) {
+                        pendingTemporaryRecovery[index].closedAt = nil
+                    }
+                    StashDebugLog.write("shortcut recovery retained id=\(record.id) reason=windowserver-window-alive")
+                case nil:
+                    StashDebugLog.write("shortcut recovery unknown id=\(record.id) reason=windowserver-unavailable retained=true")
+                }
+            }
         }
     }
 

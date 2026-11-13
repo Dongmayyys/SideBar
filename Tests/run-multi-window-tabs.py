@@ -39,7 +39,7 @@ if result.returncode:
 
 session_source = (source / 'WindowSession.swift').read_text()
 methods = []
-for name in ['snappedScreenIsStale', 'reseatTemporaryShortcutGeometry', 'startTemporaryShortcutStash', 'cancelTemporaryShortcutStash', 'restoreTemporaryShortcutWindow',
+for name in ['snappedScreenIsStale', 'reseatTemporaryShortcutGeometry', 'recoverFromScreenParametersChange', 'reconcileTemporaryWindow', 'noteTemporaryIdentityUnknown', 'rebindTemporaryWindow', 'startTemporaryShortcutStash', 'cancelTemporaryShortcutStash', 'restoreTemporaryShortcutWindow',
              'finishTemporaryShortcutSession', 'beginTemporaryStashReveal', 'hideForTemporaryStashTab', 'revealForTemporaryStashTab', 'focusForTemporaryStashTab',
              'restoreAndDestroy', 'handleDestroyed', 'handleMouseUp', 'suspendForAccessibilityLoss', 'isDetachedFromManagedEdge',
              'relinquishToDockMinimizeIfDetachedFromEdge', 'prepareTemporaryShortcutFrame', 'edgeGeometry', 'getWindowFrame',
@@ -61,6 +61,9 @@ descriptor = coordinator[coordinator.index('struct TemporaryStashTabDescriptor')
 session_fixture += '\n' + descriptor.replace('WindowSession', 'Session')
 session_fixture += '\n' + (source / 'TemporaryStashRecovery.swift').read_text().replace('Foundation.UserDefaults', 'TestHiddenDefaults')
 session_fixture += '\n' + (source / 'TemporaryStashLogic.swift').read_text()
+identity_source = (source / 'TemporaryStashWindowIdentity.swift').read_text()
+identity_source = identity_source.replace('import AppKit', 'import Foundation').replace('AXUIElementCreateApplication', 'testIdentityApplicationElement').replace('CGWindowListCopyWindowInfo', 'testCGWindowListCopyWindowInfo')
+session_fixture += '\n' + identity_source
 visibility_source = (source / 'TemporaryStashAppVisibility.swift').read_text()
 visibility_class = visibility_source[visibility_source.index('final class TemporaryStashAppVisibility'):]
 session_fixture += '\n' + visibility_class.replace('WindowSession', 'Session').replace('CGWindowListCopyWindowInfo', 'testCGWindowListCopyWindowInfo').replace('TemporaryStashHiddenAppStore()', 'TemporaryStashHiddenAppStore(defaults: testHiddenDefaults)')
@@ -86,6 +89,7 @@ if result.returncode:
 manager_source = (source / 'AXWindowManager.swift').read_text()
 manager_methods = []
 for name in ['persistTemporaryRecovery', 'stopTemporaryRecovery', 'discardPendingTemporaryRecovery',
+             'revalidateTemporaryWindows',
              'restoreTemporaryShortcuts', 'temporaryRecoveryWindows', 'isTemporaryRecoveryCandidate',
              'restoreTemporaryShortcut', 'primaryTemporaryRecoveryCandidate', 'temporaryRecoveryFrame',
              'pendingTemporaryReplacement', 'markTemporaryRecoveryWaiting', 'resolveClosedTemporaryRecovery', 'claimTemporarySlot', 'handleTemporarySlotsChanged',

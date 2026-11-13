@@ -7,6 +7,7 @@ func expect(_ condition: Bool, _ name: String) {
 }
 
 func resetVisibilityBackend() {
+    cgAllWindows = nil
     AccessibilityRuntimeGuard.shared.trusted = true
     NSRunningApplication.knownAppsOnly = false
     NSRunningApplication.hidden = []
@@ -117,6 +118,7 @@ resetVisibilityBackend()
 let unmatched = TemporaryStashAppVisibility()
 let unmatchedSessions = collapsedSessions(visibility: unmatched)
 let ordinary = Element()
+ordinary.systemWindowID = 999
 unmatchedSessions[0].appElement.windows?.append(ordinary)
 appVisibilityEvents.removeAll()
 unmatched.reconcile(sessions: unmatchedSessions)
@@ -144,11 +146,11 @@ unknownSessions[0].appElement.windows = [unknownSessions[0].windowElement]
 unknownWindows.reconcile(sessions: unknownSessions)
 unknownSessions[0].windowElement.subroleUnavailable = true
 unknownWindows.reconcile(sessions: unknownSessions)
-expect(!NSRunningApplication.hidden.contains(123), "unknown subrole restores owned app rather than assuming an unreadable window is nonstandard")
+expect(NSRunningApplication.hidden.contains(123), "unknown subrole preserves an owned hidden app")
 
 // Finder regression: AX eligibility can change solely because the app is hidden.
 // Neither a fresh AX snapshot nor ordinary visibility transitions may rearm hide.
-for failure in ["unknown-windows", "unknown-window-subrole", "unmanaged-standard-window"] {
+for failure in ["unmanaged-standard-window"] {
     for immediateHide in [false, true] {
         resetVisibilityBackend()
         var moment = Date()
@@ -159,7 +161,7 @@ for failure in ["unknown-windows", "unknown-window-subrole", "unmanaged-standard
         let appElement = applicationElements[123]!
         if failure == "unknown-windows" { appElement.windows = nil }
         else if failure == "unknown-window-subrole" { sessions[0].windowElement.subroleUnavailable = true }
-        else { appElement.windows!.append(Element()) }
+        else { let ordinary = Element(); ordinary.systemWindowID = 999; appElement.windows!.append(ordinary) }
         visibility.reconcile(sessions: sessions)
         visibility.reconcile(sessions: sessions)
         let context = "\(failure) immediateHide=\(immediateHide)"
@@ -213,7 +215,8 @@ for reset in ["replace-session", "process-restart", "sidebar-restart"] {
     let visibility = TemporaryStashAppVisibility(now: { moment })
     var sessions = collapsedSessions(visibility: visibility)
     visibility.reconcile(sessions: sessions)
-    applicationElements[123]!.windows = nil
+    let ordinary = Element(); ordinary.systemWindowID = 999
+    applicationElements[123]!.windows!.append(ordinary)
     visibility.reconcile(sessions: sessions)
     applicationElements[123]!.windows = sessions.map(\.windowElement)
     moment = moment.addingTimeInterval(2)
@@ -253,7 +256,8 @@ for finish in ["reveal", "cancel", "cleanup"] {
     let session = collapsedSessions(visibility: visibility)[0]
     visibility.reconcile(sessions: [session])
     NSRunningApplication.unhideSucceeds = false
-    applicationElements[123]!.windows = nil
+    let ordinary = Element(); ordinary.systemWindowID = 999
+    applicationElements[123]!.windows!.append(ordinary)
     visibility.reconcile(sessions: [session])
     applicationElements[123]!.windows = [session.windowElement]
     appVisibilityEvents.removeAll()
@@ -590,11 +594,16 @@ let topologySessions = collapsedSessions(visibility: topology)
 topology.reconcile(sessions: topologySessions)
 TemporaryStashWindowSpaces.displays = ["display-2": 2]
 topology.spaceDidChange(topologyChanged: true)
-expect(!NSRunningApplication.hidden.contains(123), "topology invalidation restores owned app before Space rebinding")
+expect(NSRunningApplication.hidden.contains(123), "topology invalidation preserves owned hidden app during Space rebinding")
 // Mirrors AXWindowManager's invalidation after reseating geometry on the new screen.
 topologySessions[0].temporaryStashPresence = TemporaryStashAppVisibility.capturePresence(
     window: topologySessions[0].windowElement, pid: 123, screenID: 2)
 expect(topologySessions[0].temporaryStashPresence?.displayUUID == "display-2", "topology resample binds the new display UUID rather than a merged active set")
+expect(topology.isOnScreen(sessionID: topologySessions[0].temporaryStashID, pid: 123, spaces: [2], screenID: 2) == true,
+       "owned hidden app rebinds cached membership to reseated display without unhide")
+TemporaryStashWindowSpaces.displays = ["display-2": 3]
+expect(topology.isOnScreen(sessionID: topologySessions[0].temporaryStashID, pid: 123, spaces: [2], screenID: 2) == false,
+       "reseated hidden label follows new display's active Space rather than stale display cache")
 
 resetVisibilityBackend()
 let identityStore = TemporaryStashHiddenAppStore(defaults: testHiddenDefaults, bootSessionID: "test-boot")
@@ -694,11 +703,12 @@ resetVisibilityBackend()
 let reasonVisibility = TemporaryStashAppVisibility()
 let reasonSessions = collapsedSessions(visibility: reasonVisibility)
 let unownedWindow = Element()
+unownedWindow.systemWindowID = 999
 applicationElements[123]!.windows!.append(unownedWindow)
 reasonVisibility.reconcile(sessions: reasonSessions)
 reasonVisibility.reconcile(sessions: reasonSessions)
 func skipMessages(_ reason: String) -> [String] {
-    StashDebugLog.messages.filter { $0.contains("app not-hidden") && $0.contains("reason=\(reason)") }
+    StashDebugLog.messages.filter { ($0.contains("app not-hidden") || $0.contains("app eligibility unknown")) && $0.contains("reason=\(reason)") }
 }
 expect(skipMessages("unmanaged-standard-window").count == 1
        && skipMessages("unmanaged-standard-window")[0].contains("phase=unowned"),
@@ -930,6 +940,61 @@ expect(stillHidden.sessions.first?.windowElement === hiddenSurvivor.windowElemen
 expect(NSRunningApplication.hidden.contains(123) && !appVisibilityEvents.contains("unhide:123"),
        "exact shortcut restoration does not require or bypass geometry rescue unhide ownership")
 stillHidden.stop()
+
+// Unknown AX snapshots must never turn a hidden app into an unmanaged-window veto.
+resetVisibilityBackend()
+let sleepingVisibility = TemporaryStashAppVisibility()
+let sleepingSessions = collapsedSessions(visibility: sleepingVisibility)
+sleepingVisibility.reconcile(sessions: sleepingSessions)
+let intermediateWindow = Element()
+intermediateWindow.systemWindowID = 999
+sleepingSessions[0].appElement.windows!.append(intermediateWindow)
+TemporaryStashWindowIdentity.setSuspended(true, reason: "screen-lock")
+appVisibilityEvents.removeAll()
+sleepingVisibility.reconcile(sessions: sleepingSessions)
+expect(NSRunningApplication.hidden.contains(123) && appVisibilityEvents.isEmpty
+       && !StashDebugLog.messages.contains { $0.contains("circuit-breaker triggered") },
+       "lock/sleep intermediate AX snapshot cannot expose hidden windows or trip breaker")
+TemporaryStashWindowIdentity.setSuspended(false, reason: "screen-lock")
+
+for snapshot in ["nil", "empty", "missing-self", "role", "subrole", "identity", "replacement"] {
+    for immediate in [false, true] {
+        resetVisibilityBackend()
+        let visibility = TemporaryStashAppVisibility()
+        let sessions = collapsedSessions(visibility: visibility, count: 2)
+        NSRunningApplication.hideIsImmediate = immediate
+        visibility.reconcile(sessions: sessions)
+        let app = sessions[0].appElement
+        switch snapshot {
+        case "nil": app.windows = nil
+        case "empty": app.windows = []
+        case "missing-self": app.windows = [sessions[0].windowElement]
+        case "role": sessions[0].windowElement.roleResult = .invalidUIElement
+        case "subrole": sessions[0].windowElement.subroleUnavailable = true
+        case "identity": sessions[0].windowElement.systemWindowID = nil
+        default:
+            app.windows = sessions.map { session in
+                let replacement = Element()
+                replacement.systemWindowID = session.temporaryStashWindowID
+                return replacement
+            }
+        }
+        appVisibilityEvents.removeAll()
+        for _ in 0..<20 { visibility.reconcile(sessions: sessions) }
+        expect(!appVisibilityEvents.contains("unhide:123") && !appVisibilityEvents.contains("hide:123")
+               && !StashDebugLog.messages.contains { $0.contains("circuit-breaker triggered") },
+               "AX snapshot preserves hidden/pending state without breaker: \(snapshot) immediate=\(immediate)")
+        expect(immediate ? NSRunningApplication.hidden.contains(123) : NSRunningApplication.pendingHides.contains(123),
+               "unknown or replacement snapshot retains hide ownership: \(snapshot) immediate=\(immediate)")
+        app.windows = sessions.map(\.windowElement)
+        sessions[0].windowElement.roleResult = .success
+        sessions[0].windowElement.subroleUnavailable = false
+        sessions[0].windowElement.systemWindowID = sessions[0].temporaryStashWindowID
+        visibility.reconcile(sessions: sessions)
+        expect(!StashDebugLog.messages.contains { $0.contains("circuit-breaker triggered") },
+               "return to trusted AX list never rearms a false breaker: \(snapshot) immediate=\(immediate)")
+    }
+}
 
 print("RESULT app-visibility checks=\(total) failures=\(failures)")
 exit(failures == 0 ? 0 : 1)

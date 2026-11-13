@@ -27,6 +27,7 @@ final class Element: NSObject {
     var mainWindow: Element?
     var focusedWindow: Element?
     var role: String? = "AXWindow"
+    var roleResult: AXError = .success
     var standard = true
     var subroleUnavailable = false
     var writes = 0
@@ -64,11 +65,13 @@ var appVisibilityEvents: [String] = []
 final class RuntimeTrust {
     var trusted = true
     func evaluateTrustState(source: String) -> Bool { trusted }
+    func discardMessagingTimeoutCache(for element: Element) {}
 }
 enum AccessibilityRuntimeGuard {
     static let shared = RuntimeTrust()
     static func copyAttributeValue(of element: Element, attribute: CFString, value: inout CFTypeRef?, context: String) -> AXError {
         if attribute as String == "AXRole" {
+            if element.roleResult != .success { return element.roleResult }
             value = element.role as CFTypeRef?
             return value == nil ? .noValue : .success
         }
@@ -114,7 +117,12 @@ final class WindowAlphaManager {
     func findWindowID(for element: Element, pid: pid_t) -> CGWindowID? { element.systemWindowID ?? windowID }
 }
 var cgWindows: [[String: Any]] = []
-func testCGWindowListCopyWindowInfo(_ options: CGWindowListOption, _ relative: CGWindowID) -> Any? { cgWindows }
+var cgAllWindows: [[String: Any]]? = [[kCGWindowOwnerPID as String: 1, kCGWindowNumber as String: 1]]
+var identityApplications: [Int32: Element] = [:]
+func testIdentityApplicationElement(_ pid: Int32) -> Element { identityApplications[pid] ?? Element() }
+func testCGWindowListCopyWindowInfo(_ options: CGWindowListOption, _ relative: CGWindowID) -> Any? {
+    options == .optionAll ? cgAllWindows : cgWindows
+}
 final class Effect { func stopExpandEffect(closeWindow: Bool, immediate: Bool = false) {} }
 final class Panel { func orderOut(_ sender: Any?) {} }
 struct NSScreen {
@@ -126,6 +134,7 @@ struct NSScreen {
         usableFrame ?? CGRect(x: frame.minX, y: 1000 - frame.maxY, width: frame.width, height: frame.height)
     }
     static var screens = [NSScreen(frame: CGRect(x: 0, y: 0, width: 1000, height: 1000))]
+    static var main: NSScreen? { screens.first }
 }
 struct ActivateOptions: OptionSet {
     let rawValue: Int
@@ -224,7 +233,18 @@ __SNAP_STATE__
 final class Session {
     let temporaryStashID: String
     var debugStateSummary: String { String(describing: state) }
-    let windowElement: Element
+    var windowElement: Element
+    var lastTemporaryIdentityDiagnostic = ""
+    var pendingTemporaryRestoreExclusion: Bool?
+    var temporaryAXObserverNeedsRetry = false
+    var observerRunLoopSource: CFRunLoopSource?
+    var axObserver: AXObserver?
+    var observerBindings: [Element] = []
+    func setupAXObserver() {
+        observerBindings.append(windowElement)
+        temporaryAXObserverNeedsRetry = false
+    }
+    func noteAXRoleCheckSucceeded() {}
     let appElement: Element
     init(appElement: Element = Element(), windowElement: Element = Element(), pid: Int32 = 123,
          bundleID: String = "same.app", temporaryShortcut: Bool = true, temporaryStashID: String = "test-session") {
@@ -300,6 +320,7 @@ final class Session {
     var hoverDelayTimer: Timer? = Timer()
     var hoverInterruptTimer: Timer? = Timer()
     var pinnedRaiseTimer: Timer? = Timer()
+    var mirrorGeometryTimer: Timer?
     let windowAnimator = Animator()
     let effectWindow = Effect()
     let indicatorWindow = Panel()
@@ -351,7 +372,7 @@ final class Session {
     func hasAdjacentScreen(at edge: Int, bounds: CGRect) -> Bool { false }
     func edgePriority(_ edge: Int) -> Int { edge }
     func snapToEdge(edgeConfig: Int, frame: CGRect, displayBounds: CGRect) {}
-    func transitionToFloatingFromManagedState() {
+    func transitionToFloatingFromManagedState(notifyOwnerChange: Bool = true, restoreVisiblePositionIfNeeded: Bool = false) {
         if isTemporaryShortcutManaged {
             cancelTemporaryShortcutStash()
         } else {

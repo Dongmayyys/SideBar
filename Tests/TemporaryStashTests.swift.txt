@@ -1022,5 +1022,12 @@ do {
     sharedOnly.tearDownAll()
 }
 
+let switcherRoute = MainInterfaceManager()
+var switcherCalls = 0
+switcherRoute.onWindowSwitcherShortcut = { switcherCalls += 1 }
+expect(switcherRoute.key(3), "switcher global shortcut is handled through production dispatcher")
+expect(switcherCalls == 1 && switcherRoute.stashCalls == 0, "switcher dispatch does not invoke stash action")
+expect(!switcherRoute.key(3, modifiers: 0), "switcher requires configured modifiers")
+expect(switcherRoute.key(3, repeating: true) && switcherCalls == 1, "holding switcher shortcut does not toggle panel repeatedly")
 print("RESULT checks=\(total) failures=\(failures)")
 exit(failures == 0 ? 0 : 1)

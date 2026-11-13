@@ -5,6 +5,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     let permissionsManager = PermissionsManager()
     var axManager: AXWindowManager?
+    private var windowSwitcher: WindowSwitcherController?
     var settingsWindow: NSWindow?
     private var axRuntimePausedByPermissionLoss = false
     
@@ -57,6 +58,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     
     func applicationWillTerminate(_ notification: Notification) {
         print("💡 SideBar 正在退出，恢复所有隐藏或被控制的窗口...")
+        windowSwitcher?.stop()
         axManager?.cleanup()
         SideBarBridge.shared.stop()
         AccessibilityRuntimeGuard.shared.stopWatchdog()
@@ -206,13 +208,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         axRuntimePausedByPermissionLoss = false
-        axManager = AXWindowManager()
+        let manager = AXWindowManager()
+        axManager = manager
+        let switcher = WindowSwitcherController(excludedWindowIDs: { [weak manager] in
+            manager?.stashedWindowIDs ?? []
+        })
+        windowSwitcher = switcher
+        manager.onWindowSwitcherShortcut = { [weak switcher] in switcher?.toggle() }
         AppConfig.shared.refreshDockMinimizeBridgeExports()
     }
 
     private func suspendAXManagerForPermissionLoss() {
         guard let axManager else { return }
         print("🛑 检测到辅助功能权限失效，暂停 AX 运行时，避免继续高频打系统。")
+        windowSwitcher?.stop()
+        windowSwitcher = nil
         axManager.suspendForAccessibilityLoss()
         self.axManager = nil
         axRuntimePausedByPermissionLoss = true

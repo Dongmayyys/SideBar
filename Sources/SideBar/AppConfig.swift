@@ -96,6 +96,9 @@ class AppConfig: ObservableObject {
     private let mainInterfaceShortcutModifiersKey = "SideBarMainInterfaceShortcutModifiers"
     private let mainInterfaceShortcutKeyCodeKey = "SideBarMainInterfaceShortcutKeyCode"
     private let mainInterfaceShortcutConfiguredKey = "SideBarMainInterfaceShortcutConfigured"
+    private let windowSwitcherShortcutModifiersKey = "SideBarWindowSwitcherShortcutModifiers"
+    private let windowSwitcherShortcutKeyCodeKey = "SideBarWindowSwitcherShortcutKeyCode"
+    private let windowSwitcherShortcutConfiguredKey = "SideBarWindowSwitcherShortcutConfigured"
     private let dockAvoidanceModeKey = "SideBarDockAvoidanceMode"
     
     // 格式: "PID:WindowID"
@@ -191,6 +194,30 @@ class AppConfig: ObservableObject {
                 UserDefaults.standard.removeObject(forKey: mainInterfaceShortcutKeyCodeKey)
             }
             UserDefaults.standard.set(true, forKey: mainInterfaceShortcutConfiguredKey)
+            NotificationCenter.default.post(name: NSNotification.Name("AppConfigDidChange"), object: nil)
+        }
+    }
+
+    @Published var windowSwitcherShortcutModifiers: UInt? {
+        didSet {
+            if let windowSwitcherShortcutModifiers {
+                UserDefaults.standard.set(windowSwitcherShortcutModifiers, forKey: windowSwitcherShortcutModifiersKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: windowSwitcherShortcutModifiersKey)
+            }
+            UserDefaults.standard.set(true, forKey: windowSwitcherShortcutConfiguredKey)
+            NotificationCenter.default.post(name: NSNotification.Name("AppConfigDidChange"), object: nil)
+        }
+    }
+
+    @Published var windowSwitcherShortcutKeyCode: UInt16? {
+        didSet {
+            if let windowSwitcherShortcutKeyCode {
+                UserDefaults.standard.set(Int(windowSwitcherShortcutKeyCode), forKey: windowSwitcherShortcutKeyCodeKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: windowSwitcherShortcutKeyCodeKey)
+            }
+            UserDefaults.standard.set(true, forKey: windowSwitcherShortcutConfiguredKey)
             NotificationCenter.default.post(name: NSNotification.Name("AppConfigDidChange"), object: nil)
         }
     }
@@ -307,6 +334,16 @@ class AppConfig: ObservableObject {
             self.mainInterfaceShortcutKeyCode = 4
         }
 
+        if UserDefaults.standard.bool(forKey: windowSwitcherShortcutConfiguredKey)
+            || UserDefaults.standard.object(forKey: windowSwitcherShortcutModifiersKey) != nil
+            || UserDefaults.standard.object(forKey: windowSwitcherShortcutKeyCodeKey) != nil {
+            self.windowSwitcherShortcutModifiers = (UserDefaults.standard.object(forKey: windowSwitcherShortcutModifiersKey) as? NSNumber)?.uintValue
+            self.windowSwitcherShortcutKeyCode = (UserDefaults.standard.object(forKey: windowSwitcherShortcutKeyCodeKey) as? NSNumber).flatMap { UInt16(exactly: $0.intValue) }
+        } else {
+            self.windowSwitcherShortcutModifiers = NSEvent.ModifierFlags([.control, .option, .command]).rawValue
+            self.windowSwitcherShortcutKeyCode = 3
+        }
+
         if UserDefaults.standard.object(forKey: "SideBarLaunchAtLogin") == nil {
             self.launchAtLogin = true
             UserDefaults.standard.set(true, forKey: "SideBarLaunchAtLogin")
@@ -390,6 +427,14 @@ class AppConfig: ObservableObject {
            mainInterfaceShortcutKeyCode == temporaryShortcutKeyCode {
             self.mainInterfaceShortcutModifiers = nil
             self.mainInterfaceShortcutKeyCode = nil
+        }
+
+        // Preserve older custom bindings when the new F default is already in use.
+        if (windowSwitcherShortcutModifiers == temporaryShortcutModifiers && windowSwitcherShortcutKeyCode == temporaryShortcutKeyCode)
+            || (windowSwitcherShortcutModifiers == mainInterfaceShortcutModifiers && windowSwitcherShortcutKeyCode == mainInterfaceShortcutKeyCode)
+            || appSettings.values.contains(where: { $0.shortcutModifiers == windowSwitcherShortcutModifiers && $0.shortcutKeyCode == windowSwitcherShortcutKeyCode }) {
+            self.windowSwitcherShortcutModifiers = nil
+            self.windowSwitcherShortcutKeyCode = nil
         }
 
         // 监听系统外观切换，驱动所有 WindowSession 刷新快照条颜色
@@ -558,6 +603,7 @@ class AppConfig: ObservableObject {
     }
 
     func setTemporaryShortcut(modifiers: UInt, keyCode: UInt16) {
+        guard windowSwitcherShortcutModifiers != modifiers || windowSwitcherShortcutKeyCode != keyCode else { return }
         guard mainInterfaceShortcutModifiers != modifiers || mainInterfaceShortcutKeyCode != keyCode else { return }
         temporaryShortcutModifiers = modifiers
         temporaryShortcutKeyCode = keyCode
@@ -569,6 +615,7 @@ class AppConfig: ObservableObject {
     }
 
     func setMainInterfaceShortcut(modifiers: UInt, keyCode: UInt16) {
+        guard windowSwitcherShortcutModifiers != modifiers || windowSwitcherShortcutKeyCode != keyCode else { return }
         guard temporaryShortcutModifiers != modifiers || temporaryShortcutKeyCode != keyCode else { return }
         mainInterfaceShortcutModifiers = modifiers
         mainInterfaceShortcutKeyCode = keyCode
@@ -577,6 +624,19 @@ class AppConfig: ObservableObject {
     func clearMainInterfaceShortcut() {
         mainInterfaceShortcutModifiers = nil
         mainInterfaceShortcutKeyCode = nil
+    }
+
+    func setWindowSwitcherShortcut(modifiers: UInt, keyCode: UInt16) {
+        guard temporaryShortcutModifiers != modifiers || temporaryShortcutKeyCode != keyCode,
+              mainInterfaceShortcutModifiers != modifiers || mainInterfaceShortcutKeyCode != keyCode,
+              !appSettings.values.contains(where: { $0.shortcutModifiers == modifiers && $0.shortcutKeyCode == keyCode }) else { return }
+        windowSwitcherShortcutModifiers = modifiers
+        windowSwitcherShortcutKeyCode = keyCode
+    }
+
+    func clearWindowSwitcherShortcut() {
+        windowSwitcherShortcutModifiers = nil
+        windowSwitcherShortcutKeyCode = nil
     }
 
     func setTemporaryDockMinimizeExclusion(bundleID: String, excluded: Bool) {

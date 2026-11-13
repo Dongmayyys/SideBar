@@ -3451,7 +3451,10 @@ struct ShortcutsSettingsView: View {
             List {
                 TemporaryShortcutRowView(config: config, appInfos: appListManager.apps)
                     .padding(.vertical, 6)
-                TemporaryShortcutRowView(config: config, appInfos: appListManager.apps, isMainInterface: true)
+                TemporaryShortcutRowView(config: config, appInfos: appListManager.apps, kind: .mainInterface)
+                    .padding(.vertical, 6)
+
+                TemporaryShortcutRowView(config: config, appInfos: appListManager.apps, kind: .windowSwitcher)
                     .padding(.vertical, 6)
 
                 if enabledApps.isEmpty {
@@ -3508,6 +3511,7 @@ private let systemShortcuts: [(UInt, UInt16, String)] = {
 
 private let temporaryShortcutRecorderID = "__temporaryShortcut__"
 private let mainInterfaceShortcutRecorderID = "__mainInterfaceShortcut__"
+private let windowSwitcherShortcutRecorderID = "__windowSwitcherShortcut__"
 
 private func shortcutConflictName(
     modifiers: UInt,
@@ -3516,7 +3520,7 @@ private func shortcutConflictName(
     config: AppConfig,
     appInfos: [AppInfo]
 ) -> String? {
-    let mirroredExclusion = (excludingID == temporaryShortcutRecorderID || excludingID == mainInterfaceShortcutRecorderID) ? nil : excludingID
+    let mirroredExclusion = ([temporaryShortcutRecorderID, mainInterfaceShortcutRecorderID, windowSwitcherShortcutRecorderID].contains(excludingID ?? "")) ? nil : excludingID
     if let mirrored = SideBarBridge.shared.mirroredHotkeyConflict(
         modifiers: modifiers,
         keyCode: keyCode,
@@ -3535,6 +3539,12 @@ private func shortcutConflictName(
        config.mainInterfaceShortcutModifiers == modifiers,
        config.mainInterfaceShortcutKeyCode == keyCode {
         return "回到主界面".localized
+    }
+
+    if excludingID != windowSwitcherShortcutRecorderID,
+       config.windowSwitcherShortcutModifiers == modifiers,
+       config.windowSwitcherShortcutKeyCode == keyCode {
+        return "按名字切换窗口".localized
     }
 
     for (otherID, otherSettings) in config.appSettings {
@@ -3556,9 +3566,44 @@ private func shortcutDisplayName(for bundleID: String, appInfos: [AppInfo]) -> S
 struct TemporaryShortcutRowView: View {
     @ObservedObject var config: AppConfig
     let appInfos: [AppInfo]
-    var isMainInterface = false
+    enum Kind { case temporary, mainInterface, windowSwitcher }
+    var kind: Kind = .temporary
 
-    private var recorderID: String { isMainInterface ? mainInterfaceShortcutRecorderID : temporaryShortcutRecorderID }
+    private var recorderID: String {
+        switch kind {
+        case .temporary: return temporaryShortcutRecorderID
+        case .mainInterface: return mainInterfaceShortcutRecorderID
+        case .windowSwitcher: return windowSwitcherShortcutRecorderID
+        }
+    }
+    private var title: String {
+        switch kind {
+        case .temporary: return "临时折叠当前活跃窗口".localized
+        case .mainInterface: return "回到主界面".localized
+        case .windowSwitcher: return "按名字切换窗口".localized
+        }
+    }
+    private var subtitle: String {
+        switch kind {
+        case .temporary: return "仅对当前活跃窗口临时贴边折叠，并自动选择最近边缘。再次按下会立刻展开；手动拖离边缘后，本次临时折叠自动失效。".localized
+        case .mainInterface: return "收起未固定的收纳窗口并回到主界面；再次按下展开最近使用的收纳窗口。".localized
+        case .windowSwitcher: return "按软件名、窗口标题或拼音查找其他桌面和显示器上的未收纳窗口。".localized
+        }
+    }
+    private var modifiers: UInt? {
+        switch kind {
+        case .temporary: return config.temporaryShortcutModifiers
+        case .mainInterface: return config.mainInterfaceShortcutModifiers
+        case .windowSwitcher: return config.windowSwitcherShortcutModifiers
+        }
+    }
+    private var keyCode: UInt16? {
+        switch kind {
+        case .temporary: return config.temporaryShortcutKeyCode
+        case .mainInterface: return config.mainInterfaceShortcutKeyCode
+        case .windowSwitcher: return config.windowSwitcherShortcutKeyCode
+        }
+    }
     @ObservedObject var recorder: ShortcutRecorderManager = .shared
 
     @State private var conflictMessage: String? = nil
@@ -3576,11 +3621,9 @@ struct TemporaryShortcutRowView: View {
                     .frame(width: 24, height: 24)
 
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(isMainInterface ? "回到主界面".localized : "临时折叠当前活跃窗口".localized)
+                    Text(title)
                         .font(.body)
-                    Text(isMainInterface
-                         ? "收起未固定的收纳窗口并回到主界面；再次按下展开最近使用的收纳窗口。".localized
-                         : "仅对当前活跃窗口临时贴边折叠，并自动选择最近边缘。再次按下会立刻展开；手动拖离边缘后，本次临时折叠自动失效。".localized)
+                    Text(subtitle)
                         .font(.caption)
                         .foregroundColor(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -3589,8 +3632,8 @@ struct TemporaryShortcutRowView: View {
                 Spacer(minLength: 16)
 
                 ShortcutDisplayView(
-                    modifiers: isMainInterface ? config.mainInterfaceShortcutModifiers : config.temporaryShortcutModifiers,
-                    keyCode: isMainInterface ? config.mainInterfaceShortcutKeyCode : config.temporaryShortcutKeyCode,
+                    modifiers: modifiers,
+                    keyCode: keyCode,
                     isRecording: isThisRecording,
                     onTap: {
                         ShortcutRecorderManager.shared.startRecording(
@@ -3616,19 +3659,19 @@ struct TemporaryShortcutRowView: View {
                                 }
 
                                 conflictMessage = nil
-                                if isMainInterface {
-                                    config.setMainInterfaceShortcut(modifiers: modifiers, keyCode: keyCode)
-                                } else {
-                                    config.setTemporaryShortcut(modifiers: modifiers, keyCode: keyCode)
+                                switch kind {
+                                case .temporary: config.setTemporaryShortcut(modifiers: modifiers, keyCode: keyCode)
+                                case .mainInterface: config.setMainInterfaceShortcut(modifiers: modifiers, keyCode: keyCode)
+                                case .windowSwitcher: config.setWindowSwitcherShortcut(modifiers: modifiers, keyCode: keyCode)
                                 }
                             }
                         )
                     },
                     onClear: {
-                        if isMainInterface {
-                            config.clearMainInterfaceShortcut()
-                        } else {
-                            config.clearTemporaryShortcut()
+                        switch kind {
+                        case .temporary: config.clearTemporaryShortcut()
+                        case .mainInterface: config.clearMainInterfaceShortcut()
+                        case .windowSwitcher: config.clearWindowSwitcherShortcut()
                         }
                         conflictMessage = nil
                         warningMessage = nil

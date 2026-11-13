@@ -3,6 +3,12 @@ import ApplicationServices
 
 class AXWindowManager {
     private var sessions: [WindowSession] = []
+    var onWindowSwitcherShortcut: (() -> Void)?
+
+    /// Only live shortcut sessions; pending recovery records are deliberately not exclusions.
+    var stashedWindowIDs: Set<CGWindowID> {
+        Set(sessions.filter { $0.isManagedByTemporaryShortcut }.compactMap(\.temporaryStashWindowID))
+    }
     private let fusionCoordinator = FusionStripCoordinator()
     private let temporaryTabCoordinator = TemporaryStashTabCoordinator()
     private var temporaryOrdinals = TemporaryStashOrdinals()
@@ -599,6 +605,14 @@ class AXWindowManager {
         let keyCode = event.keyCode
         // 只关心修饰键中的四大标志位
         let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask).rawValue
+
+        if let switcherModifiers = AppConfig.shared.windowSwitcherShortcutModifiers,
+           let switcherKeyCode = AppConfig.shared.windowSwitcherShortcutKeyCode,
+           keyCode == switcherKeyCode, modifiers == switcherModifiers,
+           let onWindowSwitcherShortcut {
+            if !event.isARepeat { onWindowSwitcherShortcut() }
+            return true
+        }
 
         if let mainModifiers = AppConfig.shared.mainInterfaceShortcutModifiers,
            let mainKeyCode = AppConfig.shared.mainInterfaceShortcutKeyCode,

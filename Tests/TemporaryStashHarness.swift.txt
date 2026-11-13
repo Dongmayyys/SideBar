@@ -35,6 +35,7 @@ final class NSWorkspace {
     var frontmostApplication: Application? = Application(processIdentifier: 123)
 }
 struct NSEvent {
+    var isARepeat = false
     static var mouseLocation = CGPoint(x: 500, y: 400)
     static var pressedMouseButtons = 0
     struct ModifierFlags: OptionSet {
@@ -124,6 +125,8 @@ final class AppConfig {
     var hoverDelayMS = AppConfig.defaultHoverDelayMS
     var mainInterfaceShortcutModifiers: UInt? = 0x1c0000
     var mainInterfaceShortcutKeyCode: UInt16? = 4
+    var windowSwitcherShortcutModifiers: UInt? = 0x1c0000
+    var windowSwitcherShortcutKeyCode: UInt16? = 3
     var temporaryShortcutModifiers: UInt? = 0x1c0000
     var temporaryShortcutKeyCode: UInt16? = 1
     struct Settings { var isEnabled = true; var shortcutModifiers: UInt?; var shortcutKeyCode: UInt16? }
@@ -200,6 +203,7 @@ final class SideBarBridge {
     func hotkeyBinding(for bundleID: String) -> Int? { nil }
 }
 final class MainInterfaceManager {
+    var onWindowSwitcherShortcut: (() -> Void)?
     var sessions: [WindowSession] = []
     let temporaryTabCoordinator = TemporaryStashTabCoordinator()
     private var mainInterfaceHistory: [(app: NSRunningApplication, window: AXUIElement)] = []
@@ -211,8 +215,8 @@ final class MainInterfaceManager {
     func preferredControlSession(for bundleID: String) -> WindowSession? { nil }
     func activated(_ app: NSRunningApplication) { handleAppActivation(app: app, isActivationNotification: true) }
     @discardableResult
-    func key(_ keyCode: UInt16 = 4, modifiers: UInt = 0x1c0000) -> Bool {
-        handleGlobalKeyDown(event: NSEvent(keyCode: keyCode, modifierFlags: .init(rawValue: modifiers)))
+    func key(_ keyCode: UInt16 = 4, modifiers: UInt = 0x1c0000, repeating: Bool = false) -> Bool {
+        handleGlobalKeyDown(event: NSEvent(isARepeat: repeating, keyCode: keyCode, modifierFlags: .init(rawValue: modifiers)))
     }
 __MAIN_INTERFACE_METHODS__
 }

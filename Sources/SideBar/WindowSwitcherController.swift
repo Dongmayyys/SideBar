@@ -1,19 +1,19 @@
 import AppKit
 import ApplicationServices
-import Carbon
 
 final class WindowSwitcherController: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NSTableViewDelegate, NSWindowDelegate {
     private let excludedWindowIDs: () -> Set<CGWindowID>
     private let system = WindowSwitcherSystem()
     private let panel = WindowSwitcherPanel()
     private let input = NSTextField()
-    private var savedInputSource: TISInputSource?
     private let table = WindowSwitcherTable()
     private let status = NSTextField(labelWithString: "")
     private var inventory = WindowSwitcherInventory()
     private var recency = WindowSwitcherRecency()
     private var focusedID: CGWindowID?
-    private var visibleIDs: [CGWindowID] = []
+    private var rows: [WindowSwitcherRow] = []
+    private var selection = WindowSwitcherSelection()
+    private var screenFrame: CGRect?
     private var appObservers: [pid_t: AXObserver] = [:]
     private var notifications: [NSObjectProtocol] = []
     private var globalMouseMonitor: Any?
@@ -50,25 +50,14 @@ final class WindowSwitcherController: NSObject, NSTextFieldDelegate, NSTableView
         focusedID = nil
         if let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier { recordFocus(pid) }
         input.stringValue = ""
+        // Keep the same screen/top anchor while typing or receiving incremental inventory updates.
+        screenFrame = (NSScreen.screens.first { $0.frame.contains(NSEvent.mouseLocation) } ?? NSScreen.main)?.visibleFrame
         // Do not offer stale windows from a previous invocation while this snapshot is being refreshed.
         inventory = WindowSwitcherInventory()
-        updateResults()
+        updateResults(preservingSelection: false)
         status.stringValue = "正在读取窗口…".localized
-        let screen = NSScreen.screens.first { $0.frame.contains(NSEvent.mouseLocation) } ?? NSScreen.main
-        if let screen {
-            let frame = screen.visibleFrame
-            let size = NSSize(width: min(640, frame.width - 32), height: min(440, frame.height - 32))
-            panel.setFrame(NSRect(x: frame.midX - size.width / 2, y: frame.midY - size.height / 2,
-                                  width: size.width, height: size.height), display: false, animate: false)
-        }
         panel.makeKeyAndOrderFront(nil)
         panel.makeFirstResponder(input)
-        // 搜索按拼音字母匹配：面板打开期间切到英文输入源，避免中文输入法把字母组成汉字候选；关闭时切回。
-        if savedInputSource == nil, let current = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue(),
-           let ascii = TISCopyCurrentASCIICapableKeyboardInputSource()?.takeRetainedValue() {
-            savedInputSource = current
-            if !CFEqual(current, ascii) { TISSelectInputSource(ascii) }
-        }
         installMouseMonitors()
         system.enumerate { [weak self] snapshot in
             guard let self, self.panel.isVisible else { return }
@@ -81,10 +70,6 @@ final class WindowSwitcherController: NSObject, NSTextFieldDelegate, NSTableView
     func close() {
         system.cancel()
         panel.orderOut(nil)
-        if let saved = savedInputSource {
-            savedInputSource = nil
-            TISSelectInputSource(saved)
-        }
         if let globalMouseMonitor { NSEvent.removeMonitor(globalMouseMonitor); self.globalMouseMonitor = nil }
         if let localMouseMonitor { NSEvent.removeMonitor(localMouseMonitor); self.localMouseMonitor = nil }
     }
@@ -132,11 +117,13 @@ final class WindowSwitcherController: NSObject, NSTextFieldDelegate, NSTableView
 
     private func configurePanel() {
         panel.delegate = self
+        panel.onKeyDown = { [weak self] event in self?.handleKey(event) ?? false }
         panel.level = .floating
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient, .ignoresCycle]
         panel.isReleasedWhenClosed = false
         panel.hidesOnDeactivate = false
         panel.becomesKeyOnlyIfNeeded = false
+        panel.acceptsMouseMovedEvents = true
         panel.animationBehavior = .none
         panel.isOpaque = false
         panel.backgroundColor = .clear
@@ -148,7 +135,7 @@ final class WindowSwitcherController: NSObject, NSTextFieldDelegate, NSTableView
         background.layer?.cornerRadius = 14
         panel.contentView = background
         input.placeholderString = "软件名或窗口标题".localized
-        input.font = .systemFont(ofSize: 20)
+        input.font = .systemFont(ofSize: 18)
         input.usesSingleLineMode = true
         input.isBezeled = false
         input.drawsBackground = false
@@ -160,18 +147,27 @@ final class WindowSwitcherController: NSObject, NSTextFieldDelegate, NSTableView
         table.addTableColumn(column)
         table.autoresizingMask = [.width]
         table.headerView = nil
-        table.rowHeight = 52
+        table.rowHeight = WindowSwitcherPanelLayout.rowHeight
+        table.intercellSpacing = .zero
+        table.selectionHighlightStyle = .regular
         table.backgroundColor = .clear
         table.style = .plain
         table.dataSource = self
         table.delegate = self
         table.target = self
-        table.doubleAction = #selector(confirm)
+        table.action = #selector(clickedRow)
+        table.onHover = { [weak self] row in
+            guard let self else { return }
+            let id = row.flatMap { self.rows.indices.contains($0) ? self.rows[$0].id : nil }
+            self.selection.hover(id)
+            self.applySelection(scroll: false)
+        }
         table.columnAutoresizingStyle = .firstColumnOnlyAutoresizingStyle
         table.setAccessibilityLabel("窗口".localized)
         let scroll = NSScrollView()
         scroll.documentView = table
         scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
         scroll.drawsBackground = false
         status.textColor = .secondaryLabelColor
         status.font = .systemFont(ofSize: 13)
@@ -182,12 +178,12 @@ final class WindowSwitcherController: NSObject, NSTextFieldDelegate, NSTableView
         NSLayoutConstraint.activate([
             input.leadingAnchor.constraint(equalTo: background.leadingAnchor, constant: 20),
             input.trailingAnchor.constraint(equalTo: background.trailingAnchor, constant: -20),
-            input.topAnchor.constraint(equalTo: background.topAnchor, constant: 18),
-            input.heightAnchor.constraint(equalToConstant: 30),
-            scroll.topAnchor.constraint(equalTo: input.bottomAnchor, constant: 14),
+            input.topAnchor.constraint(equalTo: background.topAnchor, constant: 16),
+            input.heightAnchor.constraint(equalToConstant: 28),
+            scroll.topAnchor.constraint(equalTo: input.bottomAnchor, constant: 10),
             scroll.leadingAnchor.constraint(equalTo: background.leadingAnchor, constant: 10),
             scroll.trailingAnchor.constraint(equalTo: background.trailingAnchor, constant: -10),
-            scroll.bottomAnchor.constraint(equalTo: background.bottomAnchor, constant: -12),
+            scroll.bottomAnchor.constraint(equalTo: background.bottomAnchor, constant: -10),
             status.centerXAnchor.constraint(equalTo: scroll.centerXAnchor),
             status.centerYAnchor.constraint(equalTo: scroll.centerYAnchor)
         ])
@@ -202,21 +198,72 @@ final class WindowSwitcherController: NSObject, NSTextFieldDelegate, NSTableView
     }
 
     private func updateResults(preservingSelection: Bool = true) {
-        let selected = preservingSelection && visibleIDs.indices.contains(table.selectedRow) ? visibleIDs[table.selectedRow] : nil
-        visibleIDs = WindowSwitcherSearch.sortedIDs(query: input.stringValue, candidates: inventory.candidates,
+        rows = WindowSwitcherList.rows(query: input.stringValue, candidates: inventory.candidates,
             fields: inventory.fields, recency: recency, ownPID: ProcessInfo.processInfo.processIdentifier,
             focusedID: focusedID, stashedIDs: excludedWindowIDs())
-        table.reloadData()
-        status.isHidden = !visibleIDs.isEmpty
-        status.stringValue = "没有匹配的窗口".localized
-        if !visibleIDs.isEmpty {
-            let row = selected.flatMap { visibleIDs.firstIndex(of: $0) } ?? 0
-            table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
-            table.scrollRowToVisible(row)
+        selection.reconcile(rows.map(\.id), preservingSelection: preservingSelection)
+        // Resize before laying out rows; the top stays fixed and overflow remains inside the scroll view.
+        if let screenFrame {
+            panel.setFrame(WindowSwitcherPanelLayout.frame(visibleFrame: screenFrame, rowCount: rows.count),
+                           display: panel.isVisible, animate: false)
         }
+        table.reloadData()
+        status.isHidden = !rows.isEmpty
+        status.stringValue = "没有匹配的窗口".localized
+        applySelection(scroll: true)
     }
 
-    func controlTextDidChange(_ obj: Notification) { updateResults(preservingSelection: false) }
+    private func applySelection(scroll: Bool) {
+        guard let index = rows.firstIndex(where: { $0.id == selection.selectedID }) else {
+            table.deselectAll(nil)
+            return
+        }
+        table.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
+        if scroll { table.scrollRowToVisible(index) }
+    }
+
+    /// 按键在到达输入框（和输入法）之前由面板直接处理：搜索只按字母和拼音匹配，
+    /// 不经过输入法组字，当前是中文输入法时也能直接打字母。
+    private func handleKey(_ event: NSEvent) -> Bool {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask).subtracting([.capsLock, .numericPad, .function])
+        switch event.keyCode {
+        case 53: close(); return true
+        case 36, 76: confirm(); return true
+        case 126: moveSelection(-1); return true
+        case 125: moveSelection(1); return true
+        case 51:
+            var text = input.stringValue
+            if flags.contains(.command) { text = "" }
+            else if flags.contains(.option) {
+                while text.last == " " { text.removeLast() }
+                while let last = text.last, last != " " { text.removeLast() }
+            } else if !text.isEmpty { text.removeLast() }
+            setQuery(text); return true
+        default: break
+        }
+        if flags.contains(.control) { return false }
+        if flags.contains(.command) {
+            guard event.charactersIgnoringModifiers?.lowercased() == "v",
+                  let pasted = NSPasteboard.general.string(forType: .string) else { return false }
+            setQuery(input.stringValue + pasted.replacingOccurrences(of: "\n", with: " ")); return true
+        }
+        guard let chars = event.characters, !chars.isEmpty,
+              chars.unicodeScalars.allSatisfy({ $0.value >= 0x20 && $0.value < 0x7F }) else { return false }
+        setQuery(input.stringValue + chars)
+        return true
+    }
+
+    private func setQuery(_ text: String) {
+        input.stringValue = text
+        if let editor = input.currentEditor() { editor.selectedRange = NSRange(location: (text as NSString).length, length: 0) }
+        table.preferKeyboardSelection()
+        updateResults(preservingSelection: false)
+    }
+
+    func controlTextDidChange(_ obj: Notification) {
+        table.preferKeyboardSelection()
+        updateResults(preservingSelection: false)
+    }
 
     func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
         switch commandSelector {
@@ -230,15 +277,24 @@ final class WindowSwitcherController: NSObject, NSTextFieldDelegate, NSTableView
     }
 
     private func moveSelection(_ delta: Int) {
-        guard !visibleIDs.isEmpty else { return }
-        let row = max(0, min(visibleIDs.count - 1, table.selectedRow + delta))
-        table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
-        table.scrollRowToVisible(row)
+        guard !rows.isEmpty else { return }
+        let index = max(0, min(rows.count - 1, table.selectedRow + delta))
+        table.preferKeyboardSelection()
+        selection.move(to: rows[index].id)
+        applySelection(scroll: true)
     }
 
-    @objc private func confirm() {
-        let candidate = visibleIDs.indices.contains(table.selectedRow)
-            ? inventory.candidates.first { $0.id == visibleIDs[table.selectedRow] } : nil
+    @objc private func clickedRow() {
+        // NSTableView also sends actions for empty space: never confirm the old selection there.
+        guard rows.indices.contains(table.clickedRow) else { return }
+        confirm(row: table.clickedRow)
+    }
+
+    @objc private func confirm() { confirm(row: table.selectedRow) }
+
+    private func confirm(row: Int) {
+        let target = rows.indices.contains(row) ? rows[row].targetID : nil
+        let candidate = target.flatMap { id in inventory.candidates.first { $0.id == id } }
         close()
         guard let candidate, !excludedWindowIDs().contains(candidate.id) else { return }
         system.focus(candidate)
@@ -247,42 +303,26 @@ final class WindowSwitcherController: NSObject, NSTextFieldDelegate, NSTableView
     func windowDidResignKey(_ notification: Notification) {
         if panel.isVisible { close() }
     }
-    func numberOfRows(in tableView: NSTableView) -> Int { visibleIDs.count }
+    func numberOfRows(in tableView: NSTableView) -> Int { rows.count }
+
+    func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
+        WindowSwitcherRowView()
+    }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
-        guard visibleIDs.indices.contains(row), let candidate = inventory.candidates.first(where: { $0.id == visibleIDs[row] }) else { return nil }
-        let cell = NSTableCellView()
-        let icon = NSImageView()
-        icon.image = NSRunningApplication(processIdentifier: candidate.pid)?.icon
-        let app = NSTextField(labelWithString: candidate.appName)
-        app.font = .systemFont(ofSize: 13, weight: .semibold)
-        let title = NSTextField(labelWithString: candidate.title)
-        title.font = .systemFont(ofSize: 13)
-        title.textColor = .secondaryLabelColor
-        title.lineBreakMode = .byTruncatingTail
-        app.lineBreakMode = .byTruncatingTail
-        let labels = NSStackView(views: [app, title])
-        labels.orientation = .vertical
-        labels.alignment = .leading
-        labels.spacing = 3
-        for view in [icon, labels] { view.translatesAutoresizingMaskIntoConstraints = false; cell.addSubview(view) }
-        NSLayoutConstraint.activate([
-            icon.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 8),
-            icon.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
-            icon.widthAnchor.constraint(equalToConstant: 32), icon.heightAnchor.constraint(equalToConstant: 32),
-            labels.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 12),
-            labels.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -8),
-            labels.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
-            app.widthAnchor.constraint(lessThanOrEqualTo: labels.widthAnchor),
-            title.widthAnchor.constraint(lessThanOrEqualTo: labels.widthAnchor)
-        ])
-        cell.textField = app
-        cell.imageView = icon
-        return cell
+        guard rows.indices.contains(row) else { return nil }
+        return WindowSwitcherCellView(row: rows[row])
     }
 }
 
 private final class WindowSwitcherPanel: NSPanel {
+    var onKeyDown: ((NSEvent) -> Bool)?
+
+    override func sendEvent(_ event: NSEvent) {
+        if event.type == .keyDown, onKeyDown?(event) == true { return }
+        super.sendEvent(event)
+    }
+
     init() {
         super.init(contentRect: NSRect(x: 0, y: 0, width: 640, height: 440),
                    styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
@@ -292,5 +332,113 @@ private final class WindowSwitcherPanel: NSPanel {
 }
 
 private final class WindowSwitcherTable: NSTableView {
+    var onHover: ((Int?) -> Void)?
+    private var hoverArea: NSTrackingArea?
+    private var keyboardPointerLocation: NSPoint?
     override var acceptsFirstResponder: Bool { false }
+
+    func preferKeyboardSelection() { keyboardPointerLocation = NSEvent.mouseLocation }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let hoverArea { removeTrackingArea(hoverArea) }
+        let area = NSTrackingArea(rect: .zero, options: [.inVisibleRect, .activeAlways, .mouseMoved, .mouseEnteredAndExited],
+                                  owner: self, userInfo: nil)
+        addTrackingArea(area)
+        hoverArea = area
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        // Relayout/scroll can generate mouse events without physical movement. They must not
+        // undo an arrow-key selection under a stationary pointer.
+        guard keyboardPointerLocation != NSEvent.mouseLocation else { return }
+        keyboardPointerLocation = nil
+        let index = row(at: convert(event.locationInWindow, from: nil))
+        onHover?(index >= 0 ? index : nil)
+    }
+
+    override func mouseEntered(with event: NSEvent) { mouseMoved(with: event) }
+
+    override func mouseExited(with event: NSEvent) { onHover?(nil) }
+}
+
+private final class WindowSwitcherRowView: NSTableRowView {
+    // A nonactivating panel must still use the system accent, not inactive gray selection.
+    override var isEmphasized: Bool {
+        get { true }
+        set {}
+    }
+
+    override func drawSelection(in dirtyRect: NSRect) {
+        NSColor.controlAccentColor.setFill()
+        NSBezierPath(roundedRect: bounds.insetBy(dx: 2, dy: 1), xRadius: 5, yRadius: 5).fill()
+    }
+}
+
+private final class WindowSwitcherCellView: NSTableCellView {
+    private let app = NSTextField(labelWithString: "")
+    private let title = NSTextField(labelWithString: "")
+
+    init(row: WindowSwitcherRow) {
+        super.init(frame: .zero)
+        let font = NSFont.systemFont(ofSize: 13)
+        for label in [app, title] {
+            label.font = font
+            label.lineBreakMode = .byTruncatingTail
+            label.maximumNumberOfLines = 1
+        }
+        app.attributedStringValue = Self.highlight(row.appName, ranges: row.appHighlights, font: font)
+        title.attributedStringValue = Self.highlight(row.title.isEmpty ? "无标题".localized : row.title,
+                                                   ranges: row.titleHighlights, font: font)
+        let labels: NSStackView
+        if row.kind == .window {
+            labels = NSStackView(views: [title])
+        } else {
+            let icon = NSImageView()
+            icon.image = NSRunningApplication(processIdentifier: row.pid)?.icon
+            icon.translatesAutoresizingMaskIntoConstraints = false
+            NSLayoutConstraint.activate([
+                icon.widthAnchor.constraint(equalToConstant: 20),
+                icon.heightAnchor.constraint(equalToConstant: 20)
+            ])
+            labels = NSStackView(views: row.kind == .application ? [icon, app] : [icon, app, title])
+            imageView = icon
+            if row.kind == .singleWindow {
+                title.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            }
+        }
+        labels.orientation = .horizontal
+        labels.alignment = .centerY
+        labels.spacing = 10
+        labels.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(labels)
+        if row.kind == .singleWindow {
+            app.widthAnchor.constraint(lessThanOrEqualTo: widthAnchor, multiplier: 0.4).isActive = true
+        }
+        NSLayoutConstraint.activate([
+            labels.leadingAnchor.constraint(equalTo: leadingAnchor, constant: row.kind == .window ? 60 : 10),
+            labels.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+            labels.centerYAnchor.constraint(equalTo: centerYAnchor)
+        ])
+        textField = row.kind == .window ? title : app
+        updateColors()
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override var backgroundStyle: NSView.BackgroundStyle { didSet { updateColors() } }
+
+    private func updateColors() {
+        let selected = backgroundStyle == .emphasized
+        app.textColor = selected ? .alternateSelectedControlTextColor : .labelColor
+        title.textColor = selected ? .alternateSelectedControlTextColor : .secondaryLabelColor
+    }
+
+    private static func highlight(_ text: String, ranges: [NSRange], font: NSFont) -> NSAttributedString {
+        let result = NSMutableAttributedString(string: text, attributes: [.font: font])
+        for range in ranges where NSMaxRange(range) <= result.length {
+            result.addAttribute(.font, value: NSFont.systemFont(ofSize: font.pointSize, weight: .bold), range: range)
+        }
+        return result
+    }
 }

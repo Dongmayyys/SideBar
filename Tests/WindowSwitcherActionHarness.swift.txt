@@ -1,0 +1,20 @@
+// The real single-click/confirmation methods, with no AppKit window or AX side effects.
+final class SwitcherActionHarness: NSObject {
+    final class Table { var clickedRow = -1 }
+    final class System {
+        var focused: [UInt32] = []
+        func focus(_ candidate: WindowSwitcherCandidate) { focused.append(candidate.id) }
+    }
+    struct Inventory { var candidates: [WindowSwitcherCandidate] = [] }
+    var rows: [WindowSwitcherRow] = []
+    let table = Table()
+    let system = System()
+    var inventory = Inventory()
+    var excluded: Set<UInt32> = []
+    var closes = 0
+    func excludedWindowIDs() -> Set<UInt32> { excluded }
+    func close() { closes += 1 }
+    func click(_ row: Int) { table.clickedRow = row; clickedRow() }
+    func enter(_ row: Int) { confirm(row: row) }
+__ACTION_METHODS__
+}

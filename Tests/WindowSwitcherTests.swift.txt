@@ -93,5 +93,131 @@ let ties = [candidate(20, "Tie"), candidate(10, "Tie")]
 expect(sorted("tie", ties) == [20, 10], "unobserved ties preserve inventory stacking order")
 recency.retain([1, 2, 3])
 expect(recency.order[5] == nil && recency.order[1] != nil, "closed WindowServer IDs are pruned")
+
+// Grouping consumes the real matcher and excludes windows before deciding single vs grouped rows.
+let groupedCandidates = [
+    WindowSwitcherCandidate(id: 101, pid: 11, appName: "Editor", title: "Report"),
+    WindowSwitcherCandidate(id: 102, pid: 11, appName: "Editor", title: "Notes"),
+    WindowSwitcherCandidate(id: 201, pid: 22, appName: "Browser", title: "Report draft"),
+    WindowSwitcherCandidate(id: 301, pid: 33, appName: "Viewer", title: "Other")
+]
+var groupRecency = WindowSwitcherRecency()
+groupRecency.seed(stackingOrder: [102, 201, 301, 101])
+func grouped(_ query: String, _ values: [WindowSwitcherCandidate] = groupedCandidates,
+             focused: UInt32? = nil, stashed: Set<UInt32> = []) -> [WindowSwitcherRow] {
+    let fields = Dictionary(uniqueKeysWithValues: values.map {
+        ($0.id, [WindowSwitcherSearchField($0.appName), WindowSwitcherSearchField($0.title)])
+    })
+    return WindowSwitcherList.rows(query: query, candidates: values, fields: fields, recency: groupRecency,
+                                   ownPID: 999, focusedID: focused, stashedIDs: stashed)
+}
+let groupedEmpty = grouped("")
+expect(groupedEmpty.map(\.kind) == [.application, .window, .window, .singleWindow, .singleWindow], "multiple windows have one header; single windows have no header")
+expect(groupedEmpty.map(\.targetID) == [102, 102, 101, 201, 301], "groups and children follow recency when query is empty")
+expect(groupedEmpty.first?.id == .application(.process(11)), "group header has a separate selectable identity")
+expect(groupedEmpty[1].id == .window(102), "header target and child remain distinct selections")
+let reportRows = grouped("report")
+expect(reportRows.map(\.targetID) == [102, 101, 201], "group position follows its best matching window, not header recency")
+expect(reportRows.first?.kind == .application && reportRows.first?.targetID == 102, "header confirms most recent eligible window even when title did not match")
+expect(reportRows.map(\.kind) == [.application, .window, .singleWindow], "multi-window software keeps its header when only one title matches")
+expect(reportRows[1].titleHighlights == [NSRange(location: 0, length: 6)], "window rows carry title hit ranges")
+expect(reportRows[2].titleHighlights == [NSRange(location: 0, length: 6)], "single-window row carries title hit ranges")
+let editorRows = grouped("EDITOR")
+expect(editorRows.map(\.targetID) == [102, 102, 101], "application name hit includes all eligible windows")
+expect(editorRows.first?.appHighlights == [NSRange(location: 0, length: 6)], "header carries software-name highlights")
+expect(editorRows[1].titleHighlights.isEmpty, "app-only hit does not invent a title highlight")
+expect(grouped("missing").isEmpty, "no matching application or title produces no rows")
+expect(grouped("", focused: 102).first?.kind == .singleWindow, "one remaining eligible window is ungrouped after focus exclusion")
+expect(grouped("", stashed: [101, 102]).map(\.targetID) == [201, 301], "stashed windows cannot create empty groups or header targets")
+expect(grouped("report", stashed: [102]).first?.targetID == 101, "header/row target cannot reference an excluded recent window")
+let sameNames = [
+    WindowSwitcherCandidate(id: 401, pid: 41, appName: "Same", title: "First"),
+    WindowSwitcherCandidate(id: 402, pid: 42, appName: "Same", title: "Second")
+]
+expect(grouped("", sameNames).map(\.kind) == [.singleWindow, .singleWindow], "same display name alone never merges different applications")
+var sameBundle = sameNames
+sameBundle[0].bundleID = "test.same"
+sameBundle[1].bundleID = "test.same"
+expect(grouped("", sameBundle).map(\.kind) == [.application, .window, .window], "same software bundle groups windows across owner processes")
+groupRecency.recordFocus(101)
+expect(grouped("report").first?.targetID == 101, "header confirmation tracks new focus independently of matching rank")
+let interleaved = [
+    WindowSwitcherCandidate(id: 501, pid: 51, appName: "A", title: "Code"),
+    WindowSwitcherCandidate(id: 502, pid: 52, appName: "B", title: "Code notes"),
+    WindowSwitcherCandidate(id: 503, pid: 51, appName: "A", title: "Visual Code")
+]
+expect(grouped("code", interleaved).map(\.targetID) == [501, 501, 503, 502], "group children stay together without changing within-group match ranks")
+
+func highlighted(_ query: String, _ source: String) -> [NSRange] {
+    WindowSwitcherSearchField(source).match(WindowSwitcherSearchField.normalize(query))?.ranges ?? []
+}
+expect(highlighted("dd", "滴答清单") == [NSRange(location: 0, length: 2)], "dd highlights 滴答 rather than Latin offsets")
+expect(highlighted("dida", "滴答清单") == [NSRange(location: 0, length: 2)], "full-pinyin prefix maps every syllable back to its Hanzi")
+expect(highlighted("qd", "滴答清单") == [NSRange(location: 2, length: 2)], "interior pinyin initials highlight 清单")
+expect(highlighted("qingdan", "滴答清单") == [NSRange(location: 2, length: 2)], "word-start pinyin maps to source Hanzi")
+expect(highlighted("didaqingdan", "滴答清单") == [NSRange(location: 0, length: 4)], "exact full-pinyin hit highlights all Hanzi once")
+expect(highlighted("清单", "滴答清单") == [NSRange(location: 2, length: 2)], "direct Chinese hit uses original UTF-16 offsets")
+expect(highlighted("vsc", "Visual Studio Code") == [NSRange(location: 0, length: 1), NSRange(location: 7, length: 1), NSRange(location: 14, length: 1)], "English acronym highlights word initials")
+expect(highlighted("soe", "Visual Studio Code") == [NSRange(location: 2, length: 1), NSRange(location: 12, length: 1), NSRange(location: 17, length: 1)], "subsequence highlights only the ordered matching characters")
+expect(highlighted("studio code", "Visual Studio Code") == [NSRange(location: 7, length: 11)], "multi-word match includes correct source spacing")
+expect(highlighted("cafe", "Café") == [NSRange(location: 0, length: 4)], "accent-folded exact match keeps original characters")
+expect(highlighted("ss", "Straße") == [("Straße" as NSString).range(of: "ß")], "case-fold expansion maps two matched letters to one source character")
+let emojiTitle = "👩🏽‍💻 滴答清单.md"
+expect(highlighted("qd", emojiTitle) == [(emojiTitle as NSString).range(of: "清单")], "emoji UTF-16 width does not displace pinyin highlights")
+expect(highlighted("chong", "重庆计划") == [NSRange(location: 0, length: 1)], "whole-string polyphonic transliteration maps chong to 重")
+expect(highlighted("cq", "重庆计划") == [NSRange(location: 0, length: 2)], "contextual pinyin initials map to 重庆")
+expect(highlighted("", "滴答清单").isEmpty, "empty query does not bold all results")
+expect(highlighted("zzz", "滴答清单").isEmpty, "non-hit text has no bold spans")
+expect(highlighted("qd", "  滴答清单  ") == [NSRange(location: 4, length: 2)], "trimming does not shift source ranges")
+let combining = "Cafe\u{301}"
+expect(highlighted("e", combining) == [(combining as NSString).range(of: "e\u{301}")], "decomposed accent remains a complete composed-character range")
+
+var selection = WindowSwitcherSelection()
+let selectionIDs = groupedEmpty.map(\.id)
+selection.reconcile(selectionIDs, preservingSelection: false)
+expect(selection.selectedID == selectionIDs[0], "default selection is first row, including headers")
+selection.hover(selectionIDs[2])
+expect(selection.selectedID == selectionIDs[2], "hover selects the row under the mouse")
+selection.move(to: selectionIDs[3])
+expect(selection.selectedID == selectionIDs[3], "keyboard takes precedence over old hover selection")
+selection.reconcile(selectionIDs, preservingSelection: true)
+expect(selection.selectedID == selectionIDs[3], "passive refresh cannot reapply stationary mouse hover")
+selection.hover(nil)
+expect(selection.selectedID == selectionIDs[3], "mouse exit preserves latest keyboard selection")
+selection.hover(selectionIDs[1])
+expect(selection.selectedID == selectionIDs[1], "fresh mouse movement can select a header child again")
+selection.hover(nil)
+expect(selection.selectedID == selectionIDs[3], "leaving hovered row restores keyboard selection")
+selection.reconcile([], preservingSelection: true)
+expect(selection.selectedID == nil, "empty results clear selection")
+
+let screen = CGRect(x: -1440, y: 100, width: 1440, height: 900)
+let smallPanel = WindowSwitcherPanelLayout.frame(visibleFrame: screen, rowCount: 1)
+let emptyPanel = WindowSwitcherPanelLayout.frame(visibleFrame: screen, rowCount: 0)
+let largePanel = WindowSwitcherPanelLayout.frame(visibleFrame: screen, rowCount: 50)
+expect(smallPanel.midX == screen.midX, "panel centers horizontally on the chosen screen")
+expect(smallPanel.midY > screen.midY, "short panel is in upper-middle screen area")
+expect(smallPanel.maxY == largePanel.maxY, "height changes preserve the top anchor")
+expect(largePanel.height == 480 && largePanel.height > smallPanel.height, "panel grows with rows up to scroll height cap")
+expect(emptyPanel == smallPanel, "empty results retain a compact readable status area")
+expect(screen.contains(largePanel), "panel stays within a negative-origin secondary display")
+let shortScreen = CGRect(x: 0, y: 0, width: 500, height: 300)
+expect(shortScreen.contains(WindowSwitcherPanelLayout.frame(visibleFrame: shortScreen, rowCount: 50)), "height and width limits adapt to small displays")
+
+let actions = SwitcherActionHarness()
+actions.rows = groupedEmpty
+actions.inventory.candidates = groupedCandidates
+actions.click(0)
+expect(actions.system.focused == [102] && actions.closes == 1, "one click on a header closes and focuses its recent target")
+actions.click(2)
+expect(actions.system.focused == [102, 101] && actions.closes == 2, "one click on a child confirms that exact window without double-click")
+actions.click(-1)
+expect(actions.system.focused.count == 2 && actions.closes == 2, "clicking blank table space cannot confirm a previous selection")
+actions.excluded = [201]
+actions.click(3)
+expect(actions.system.focused.count == 2 && actions.closes == 3, "new stash exclusion is rechecked at mouse confirmation")
+actions.inventory.candidates.removeAll { $0.id == 301 }
+actions.enter(4)
+expect(actions.system.focused.count == 2 && actions.closes == 4, "missing keyboard target only closes the panel")
 print("RESULT window-switcher checks=\(total) failures=\(failures)")
 exit(failures == 0 ? 0 : 1)

@@ -77,7 +77,7 @@ python3 Tests/run-multi-window-tabs.py
 python3 Tests/run-window-switcher.py
 ```
 
-直接编译生产 `WindowSwitcherLogic.swift`，51 项检查覆盖五级匹配、软件名与标题、大小写、中文原文、拼音全拼和首字母（`dd`、`dida`、`qd`）、同级最近使用、启动叠放顺序与稳定回退，以及当前焦点、收纳 ID、SideBar 自身、非标准窗口、无效尺寸、无 Space 后台窗口的排除；保留真正最小化的窗口。只写入 `build/tests/window-switcher/`，不连接 AX、显示服务或用户偏好。
+直接编译生产 `WindowSwitcherLogic.swift`，并提取生产单击/确认入口，109 项检查覆盖五级匹配、软件名与标题、大小写、中文原文、拼音全拼和首字母（`dd`、`dida`、`qd`）、同级最近使用、启动叠放顺序与稳定回退，以及当前焦点、收纳 ID、SideBar 自身、非标准窗口、无效尺寸、无 Space 后台窗口的排除；保留真正最小化的窗口。新增按软件分组、单窗口不成组、组头最近使用目标、组排序、软件名命中保留全部窗口、命中区间映射（含拼音、emoji、多音字和组合字符）、悬停/键盘优先级、中上部自适应布局，以及单击一次确认、空白处不误切和确认时重新排除收纳窗口。只写入 `build/tests/window-switcher/`，不连接 AX、显示服务或用户偏好。
 
 `run-multi-window-tabs.py` 同时提取生产热键分发方法，新增 4 项 F 快捷键路由/重复按键检查（协调器组共 395 项），完整生产 AppConfig 与设置冲突检查扩为 37 项，覆盖 F 默认值、自定义、清除、越界配置、旧绑定优先及三种全局快捷键的冲突。
 

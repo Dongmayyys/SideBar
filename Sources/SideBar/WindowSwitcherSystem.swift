@@ -219,6 +219,7 @@ final class WindowSwitcherSystem {
             let name = app.localizedName ?? app.bundleIdentifier ?? ""
             let title = Self.attribute(window, kAXTitleAttribute) as? String ?? row[kCGWindowName as String] as? String ?? ""
             var candidate = WindowSwitcherCandidate(id: id, pid: pid, appName: name, title: title)
+            candidate.bundleID = app.bundleIdentifier
             candidate.isMinimized = minimized
             candidate.hasSpace = hasSpace
             result.candidates.append(candidate)

@@ -392,37 +392,28 @@ private final class WindowSwitcherCellView: NSTableCellView {
         app.attributedStringValue = Self.highlight(row.appName, ranges: row.appHighlights, font: font)
         title.attributedStringValue = Self.highlight(row.title.isEmpty ? "无标题".localized : row.title,
                                                    ranges: row.titleHighlights, font: font)
-        let labels: NSStackView
-        if row.kind == .window {
-            labels = NSStackView(views: [title])
-        } else {
-            let icon = NSImageView()
-            icon.image = NSRunningApplication(processIdentifier: row.pid)?.icon
-            icon.translatesAutoresizingMaskIntoConstraints = false
-            NSLayoutConstraint.activate([
-                icon.widthAnchor.constraint(equalToConstant: 20),
-                icon.heightAnchor.constraint(equalToConstant: 20)
-            ])
-            labels = NSStackView(views: row.kind == .application ? [icon, app] : [icon, app, title])
-            imageView = icon
-            if row.kind == .singleWindow {
-                title.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-            }
-        }
+        let icon = NSImageView()
+        icon.image = NSRunningApplication(processIdentifier: row.pid)?.icon
+        icon.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            icon.widthAnchor.constraint(equalToConstant: 20),
+            icon.heightAnchor.constraint(equalToConstant: 20)
+        ])
+        let labels = NSStackView(views: [icon, app, title])
+        imageView = icon
+        title.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         labels.orientation = .horizontal
         labels.alignment = .centerY
         labels.spacing = 10
         labels.translatesAutoresizingMaskIntoConstraints = false
         addSubview(labels)
-        if row.kind == .singleWindow {
-            app.widthAnchor.constraint(lessThanOrEqualTo: widthAnchor, multiplier: 0.4).isActive = true
-        }
+        app.widthAnchor.constraint(lessThanOrEqualTo: widthAnchor, multiplier: 0.4).isActive = true
         NSLayoutConstraint.activate([
-            labels.leadingAnchor.constraint(equalTo: leadingAnchor, constant: row.kind == .window ? 60 : 10),
+            labels.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
             labels.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
             labels.centerYAnchor.constraint(equalTo: centerYAnchor)
         ])
-        textField = row.kind == .window ? title : app
+        textField = app
         updateColors()
     }
 

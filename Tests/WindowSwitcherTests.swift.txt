@@ -112,41 +112,34 @@ func grouped(_ query: String, _ values: [WindowSwitcherCandidate] = groupedCandi
                                    ownPID: 999, focusedID: focused, stashedIDs: stashed)
 }
 let groupedEmpty = grouped("")
-expect(groupedEmpty.map(\.kind) == [.application, .window, .window, .singleWindow, .singleWindow], "multiple windows have one header; single windows have no header")
-expect(groupedEmpty.map(\.targetID) == [102, 102, 101, 201, 301], "groups and children follow recency when query is empty")
-expect(groupedEmpty.first?.id == .application(.process(11)), "group header has a separate selectable identity")
-expect(groupedEmpty[1].id == .window(102), "header target and child remain distinct selections")
+expect(groupedEmpty.map(\.targetID) == [102, 101, 201, 301], "one row per window; same-software windows stay adjacent in recency order")
+expect(groupedEmpty.first?.id == .window(102), "every row is a window selection")
 let reportRows = grouped("report")
-expect(reportRows.map(\.targetID) == [102, 101, 201], "group position follows its best matching window, not header recency")
-expect(reportRows.first?.kind == .application && reportRows.first?.targetID == 102, "header confirms most recent eligible window even when title did not match")
-expect(reportRows.map(\.kind) == [.application, .window, .singleWindow], "multi-window software keeps its header when only one title matches")
-expect(reportRows[1].titleHighlights == [NSRange(location: 0, length: 6)], "window rows carry title hit ranges")
-expect(reportRows[2].titleHighlights == [NSRange(location: 0, length: 6)], "single-window row carries title hit ranges")
+expect(reportRows.map(\.targetID) == [101, 201], "only matching windows are listed")
+expect(reportRows[0].titleHighlights == [NSRange(location: 0, length: 6)], "window rows carry title hit ranges")
+expect(reportRows[1].titleHighlights == [NSRange(location: 0, length: 6)], "other software rows carry title hit ranges")
 let editorRows = grouped("EDITOR")
-expect(editorRows.map(\.targetID) == [102, 102, 101], "application name hit includes all eligible windows")
-expect(editorRows.first?.appHighlights == [NSRange(location: 0, length: 6)], "header carries software-name highlights")
-expect(editorRows[1].titleHighlights.isEmpty, "app-only hit does not invent a title highlight")
+expect(editorRows.map(\.targetID) == [102, 101], "application name hit includes all eligible windows")
+expect(editorRows.first?.appHighlights == [NSRange(location: 0, length: 6)], "rows carry software-name highlights")
+expect(editorRows[0].titleHighlights.isEmpty, "app-only hit does not invent a title highlight")
 expect(grouped("missing").isEmpty, "no matching application or title produces no rows")
-expect(grouped("", focused: 102).first?.kind == .singleWindow, "one remaining eligible window is ungrouped after focus exclusion")
-expect(grouped("", stashed: [101, 102]).map(\.targetID) == [201, 301], "stashed windows cannot create empty groups or header targets")
-expect(grouped("report", stashed: [102]).first?.targetID == 101, "header/row target cannot reference an excluded recent window")
+expect(grouped("", focused: 102).map(\.targetID) == [201, 301, 101], "focused window is excluded")
+expect(grouped("", stashed: [101, 102]).map(\.targetID) == [201, 301], "stashed windows are excluded")
 let sameNames = [
     WindowSwitcherCandidate(id: 401, pid: 41, appName: "Same", title: "First"),
     WindowSwitcherCandidate(id: 402, pid: 42, appName: "Same", title: "Second")
 ]
-expect(grouped("", sameNames).map(\.kind) == [.singleWindow, .singleWindow], "same display name alone never merges different applications")
+expect(grouped("", sameNames).map(\.targetID) == [401, 402], "same display name lists each window")
 var sameBundle = sameNames
 sameBundle[0].bundleID = "test.same"
 sameBundle[1].bundleID = "test.same"
-expect(grouped("", sameBundle).map(\.kind) == [.application, .window, .window], "same software bundle groups windows across owner processes")
-groupRecency.recordFocus(101)
-expect(grouped("report").first?.targetID == 101, "header confirmation tracks new focus independently of matching rank")
+expect(grouped("", sameBundle).count == 2, "same software bundle lists each window")
 let interleaved = [
     WindowSwitcherCandidate(id: 501, pid: 51, appName: "A", title: "Code"),
     WindowSwitcherCandidate(id: 502, pid: 52, appName: "B", title: "Code notes"),
     WindowSwitcherCandidate(id: 503, pid: 51, appName: "A", title: "Visual Code")
 ]
-expect(grouped("code", interleaved).map(\.targetID) == [501, 501, 503, 502], "group children stay together without changing within-group match ranks")
+expect(grouped("code", interleaved).map(\.targetID) == [501, 503, 502], "same-software windows stay together without changing within-group match ranks")
 
 func highlighted(_ query: String, _ source: String) -> [NSRange] {
     WindowSwitcherSearchField(source).match(WindowSwitcherSearchField.normalize(query))?.ranges ?? []
@@ -208,16 +201,16 @@ let actions = SwitcherActionHarness()
 actions.rows = groupedEmpty
 actions.inventory.candidates = groupedCandidates
 actions.click(0)
-expect(actions.system.focused == [102] && actions.closes == 1, "one click on a header closes and focuses its recent target")
-actions.click(2)
+expect(actions.system.focused == [102] && actions.closes == 1, "one click closes and focuses that window")
+actions.click(1)
 expect(actions.system.focused == [102, 101] && actions.closes == 2, "one click on a child confirms that exact window without double-click")
 actions.click(-1)
 expect(actions.system.focused.count == 2 && actions.closes == 2, "clicking blank table space cannot confirm a previous selection")
 actions.excluded = [201]
-actions.click(3)
+actions.click(2)
 expect(actions.system.focused.count == 2 && actions.closes == 3, "new stash exclusion is rechecked at mouse confirmation")
 actions.inventory.candidates.removeAll { $0.id == 301 }
-actions.enter(4)
+actions.enter(3)
 expect(actions.system.focused.count == 2 && actions.closes == 4, "missing keyboard target only closes the panel")
 print("RESULT window-switcher checks=\(total) failures=\(failures)")
 exit(failures == 0 ? 0 : 1)

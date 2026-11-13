@@ -218,10 +218,8 @@ enum WindowSwitcherSearch {
 
 struct WindowSwitcherRow {
     enum ApplicationID: Hashable { case bundle(String), process(Int32) }
-    enum ID: Hashable { case application(ApplicationID), window(UInt32) }
-    enum Kind { case application, window, singleWindow }
+    enum ID: Hashable { case window(UInt32) }
     let id: ID
-    let kind: Kind
     let targetID: UInt32
     let pid: Int32
     let appName: String
@@ -238,34 +236,26 @@ enum WindowSwitcherList {
         func appID(_ candidate: WindowSwitcherCandidate) -> WindowSwitcherRow.ApplicationID {
             candidate.bundleID.map { .bundle($0) } ?? .process(candidate.pid)
         }
-        let applications = Dictionary(grouping: eligible, by: appID)
         let sorted = WindowSwitcherSearch.sortedIDs(query: query, candidates: eligible, fields: fields, recency: recency,
                                                     ownPID: ownPID, focusedID: focusedID, stashedIDs: stashedIDs)
         let matched = sorted.compactMap { byID[$0] }
         let matchedGroups = Dictionary(grouping: matched, by: appID)
         let normalizedQuery = WindowSwitcherSearchField.normalize(query)
-        func row(_ candidate: WindowSwitcherCandidate, kind: WindowSwitcherRow.Kind) -> WindowSwitcherRow {
+        func row(_ candidate: WindowSwitcherCandidate) -> WindowSwitcherRow {
             let search = fields[candidate.id] ?? [WindowSwitcherSearchField(candidate.appName), WindowSwitcherSearchField(candidate.title)]
             return WindowSwitcherRow(
-                id: kind == .application ? .application(appID(candidate)) : .window(candidate.id), kind: kind,
+                id: .window(candidate.id),
                 targetID: candidate.id, pid: candidate.pid, appName: candidate.appName, title: candidate.title,
                 appHighlights: search.first?.match(normalizedQuery)?.ranges ?? [],
                 titleHighlights: search.dropFirst().first?.match(normalizedQuery)?.ranges ?? [])
         }
+        // 一行一个窗口；同一软件的窗口挨在一起，软件的位置取其排在最前的窗口。
         var result: [WindowSwitcherRow] = []
         var seen: Set<WindowSwitcherRow.ApplicationID> = []
         for candidate in matched {
             let application = appID(candidate)
-            guard seen.insert(application).inserted, let members = applications[application],
-                  let displayed = matchedGroups[application] else { continue }
-            if members.count == 1 {
-                result.append(row(candidate, kind: .singleWindow))
-                continue
-            }
-            let recent = WindowSwitcherSearch.sortedIDs(query: "", candidates: members, fields: fields, recency: recency,
-                                                        ownPID: ownPID, focusedID: focusedID, stashedIDs: stashedIDs)
-            if let target = recent.first.flatMap({ byID[$0] }) { result.append(row(target, kind: .application)) }
-            result += displayed.map { row($0, kind: .window) }
+            guard seen.insert(application).inserted, let displayed = matchedGroups[application] else { continue }
+            result += displayed.map(row)
         }
         return result
     }

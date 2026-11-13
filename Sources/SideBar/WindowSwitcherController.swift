@@ -278,7 +278,9 @@ final class WindowSwitcherController: NSObject, NSTextFieldDelegate, NSTableView
 
     private func moveSelection(_ delta: Int) {
         guard !rows.isEmpty else { return }
-        let index = max(0, min(rows.count - 1, table.selectedRow + delta))
+        // 首尾循环：在第一项按上到最后一项，在最后一项按下回到第一项。
+        let current = table.selectedRow < 0 ? (delta > 0 ? -1 : 0) : table.selectedRow
+        let index = ((current + delta) % rows.count + rows.count) % rows.count
         table.preferKeyboardSelection()
         selection.move(to: rows[index].id)
         applySelection(scroll: true)

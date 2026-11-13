@@ -8,6 +8,9 @@ final class WindowSwitcherController: NSObject, NSTextFieldDelegate, NSTableView
     private let input = NSTextField()
     private let table = WindowSwitcherTable()
     private let status = NSTextField(labelWithString: "")
+    private var scrollBottomConstraint: NSLayoutConstraint?
+    private var statusCenterConstraint: NSLayoutConstraint?
+    private var statusBottomConstraint: NSLayoutConstraint?
     private var inventory = WindowSwitcherInventory()
     private var recency = WindowSwitcherRecency()
     private var focusedID: CGWindowID?
@@ -24,7 +27,7 @@ final class WindowSwitcherController: NSObject, NSTextFieldDelegate, NSTableView
         self.excludedWindowIDs = excludedWindowIDs
         super.init()
         configurePanel()
-        recency.seed(stackingOrder: WindowSwitcherSystem.windowInfo().compactMap {
+        recency.seed(stackingOrder: (WindowSwitcherSystem.windowInfo() ?? []).compactMap {
             ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value
         })
         let center = NSWorkspace.shared.notificationCenter
@@ -53,9 +56,8 @@ final class WindowSwitcherController: NSObject, NSTextFieldDelegate, NSTableView
         // Keep the same screen/top anchor while typing or receiving incremental inventory updates.
         screenFrame = (NSScreen.screens.first { $0.frame.contains(NSEvent.mouseLocation) } ?? NSScreen.main)?.visibleFrame
         // Do not offer stale windows from a previous invocation while this snapshot is being refreshed.
-        inventory = WindowSwitcherInventory()
+        inventory = WindowSwitcherInventory(isReading: true)
         updateResults(preservingSelection: false)
-        status.stringValue = "正在读取窗口…".localized
         panel.makeKeyAndOrderFront(nil)
         panel.makeFirstResponder(input)
         installMouseMonitors()
@@ -178,10 +180,17 @@ final class WindowSwitcherController: NSObject, NSTextFieldDelegate, NSTableView
         scroll.drawsBackground = false
         status.textColor = .secondaryLabelColor
         status.font = .systemFont(ofSize: 13)
+        status.lineBreakMode = .byTruncatingTail
+        status.maximumNumberOfLines = 1
         for view in [input, separator, scroll, status] {
             view.translatesAutoresizingMaskIntoConstraints = false
             background.addSubview(view)
         }
+        let scrollBottom = scroll.bottomAnchor.constraint(equalTo: background.bottomAnchor, constant: -10)
+        let statusCenter = status.centerYAnchor.constraint(equalTo: scroll.centerYAnchor)
+        scrollBottomConstraint = scrollBottom
+        statusCenterConstraint = statusCenter
+        statusBottomConstraint = status.bottomAnchor.constraint(equalTo: background.bottomAnchor, constant: -10)
         NSLayoutConstraint.activate([
             input.leadingAnchor.constraint(equalTo: background.leadingAnchor, constant: 20),
             input.trailingAnchor.constraint(equalTo: background.trailingAnchor, constant: -20),
@@ -194,9 +203,11 @@ final class WindowSwitcherController: NSObject, NSTextFieldDelegate, NSTableView
             scroll.topAnchor.constraint(equalTo: separator.bottomAnchor, constant: 6),
             scroll.leadingAnchor.constraint(equalTo: background.leadingAnchor, constant: 10),
             scroll.trailingAnchor.constraint(equalTo: background.trailingAnchor, constant: -10),
-            scroll.bottomAnchor.constraint(equalTo: background.bottomAnchor, constant: -10),
+            scrollBottom,
             status.centerXAnchor.constraint(equalTo: scroll.centerXAnchor),
-            status.centerYAnchor.constraint(equalTo: scroll.centerYAnchor)
+            status.leadingAnchor.constraint(greaterThanOrEqualTo: background.leadingAnchor, constant: 14),
+            status.trailingAnchor.constraint(lessThanOrEqualTo: background.trailingAnchor, constant: -14),
+            statusCenter
         ])
     }
 
@@ -213,14 +224,20 @@ final class WindowSwitcherController: NSObject, NSTextFieldDelegate, NSTableView
             fields: inventory.fields, recency: recency, ownPID: ProcessInfo.processInfo.processIdentifier,
             focusedID: focusedID, stashedIDs: excludedWindowIDs())
         selection.reconcile(rows.map(\.id), preservingSelection: preservingSelection)
+        let message = WindowSwitcherStatus.message(isReading: inventory.isReading,
+            unavailableReason: inventory.unavailableReason, hasRows: !rows.isEmpty)
+        let footer = message != nil && !rows.isEmpty
+        statusCenterConstraint?.isActive = !footer
+        statusBottomConstraint?.isActive = footer
+        scrollBottomConstraint?.constant = footer ? -34 : -10
         // Resize before laying out rows; the top stays fixed and overflow remains inside the scroll view.
         if let screenFrame {
-            panel.setFrame(WindowSwitcherPanelLayout.frame(visibleFrame: screenFrame, rowCount: rows.count),
+            panel.setFrame(WindowSwitcherPanelLayout.frame(visibleFrame: screenFrame, rowCount: rows.count, statusFooter: footer),
                            display: panel.isVisible, animate: false)
         }
         table.reloadData()
-        status.isHidden = !rows.isEmpty
-        status.stringValue = "没有匹配的窗口".localized
+        status.isHidden = message == nil
+        status.stringValue = message?.localized ?? ""
         applySelection(scroll: true)
     }
 
@@ -306,10 +323,14 @@ final class WindowSwitcherController: NSObject, NSTextFieldDelegate, NSTableView
     @objc private func confirm() { confirm(row: table.selectedRow) }
 
     private func confirm(row: Int) {
-        let target = rows.indices.contains(row) ? rows[row].targetID : nil
-        let candidate = target.flatMap { id in inventory.candidates.first { $0.id == id } }
+        guard rows.indices.contains(row) else { close(); return }
+        let selected = rows[row]
+        let candidate = inventory.candidates.first { $0.id == selected.targetID }
         close()
-        guard let candidate, !excludedWindowIDs().contains(candidate.id) else { return }
+        guard let candidate, !excludedWindowIDs().contains(candidate.id) else {
+            system.reportFocusFailure(id: selected.targetID, pid: selected.pid, reason: "window-no-longer-eligible")
+            return
+        }
         system.focus(candidate)
     }
 

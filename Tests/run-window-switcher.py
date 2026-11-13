@@ -31,3 +31,36 @@ for name, command in commands:
     print(result.stderr, end="", file=sys.stderr)
     if result.returncode:
         sys.exit(result.returncode)
+
+# Compile the complete production request/scan/focus control flow against deterministic platform
+# boundaries. No real AX, WindowServer, application activation, sound, logs or user settings.
+system_source = (repo / "Sources/SideBar/WindowSwitcherSystem.swift").read_text()
+system_source = system_source[system_source.index("struct WindowSwitcherInventory"):]
+replacements = {
+    "AXUIElement": "TestElement", "NSRunningApplication": "TestApplication", "NSWorkspace": "TestWorkspace",
+    "DispatchQueue": "TestDispatchQueue", "NSSound": "TestSound",
+    "CGWindowListCopyWindowInfo": "testWindowInfo", "AXUIElementCreateApplication": "testCreateApplication",
+    "AXUIElementSetMessagingTimeout": "testTimeout", "AXUIElementGetPid": "testGetPid",
+    "CFGetTypeID": "testGetTypeID", "AXUIElementGetTypeID": "testElementTypeID",
+    "AXUIElementCopyAttributeValue": "testCopyAttribute", "AXUIElementSetAttributeValue": "testSetAttribute",
+    "AXUIElementPerformAction": "testPerformAction",
+}
+for original, replacement in replacements.items():
+    system_source = re.sub(r"\b" + original + r"\b", replacement, system_source)
+system_source = system_source.replace("ProcessInfo.processInfo.systemUptime", "TestClock.now")
+runtime = output / "runtime"
+runtime.mkdir(exist_ok=True)
+runtime_fixture = (repo / "Sources/SideBar/WindowSwitcherLogic.swift").read_text()
+runtime_fixture += "\n" + (repo / "Tests/WindowSwitcherSystemHarness.swift.txt").read_text().replace("__SYSTEM__", system_source)
+runtime_fixture += "\n" + (repo / "Tests/WindowSwitcherSystemTests.swift.txt").read_text()
+(runtime / "main.swift").write_text(runtime_fixture)
+for name, command in [
+    ("compile", ["swiftc", str(runtime / "main.swift"), "-framework", "AppKit", "-o", str(runtime / "tests")]),
+    ("tests", [str(runtime / "tests")]),
+]:
+    result = subprocess.run(command, capture_output=True, text=True)
+    (runtime / f"{name}.log").write_text(result.stdout + result.stderr)
+    print(result.stdout, end="")
+    print(result.stderr, end="", file=sys.stderr)
+    if result.returncode:
+        sys.exit(result.returncode)

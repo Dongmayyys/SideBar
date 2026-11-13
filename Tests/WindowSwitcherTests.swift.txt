@@ -211,6 +211,12 @@ actions.click(2)
 expect(actions.system.focused.count == 2 && actions.closes == 3, "new stash exclusion is rechecked at mouse confirmation")
 actions.inventory.candidates.removeAll { $0.id == 301 }
 actions.enter(3)
-expect(actions.system.focused.count == 2 && actions.closes == 4, "missing keyboard target only closes the panel")
+expect(actions.system.focused.count == 2 && actions.closes == 4, "missing keyboard target closes the panel without focusing another window")
+expect(actions.system.failures.count == 2, "excluded or missing selected target emits failure feedback")
+actions.enter(-1)
+expect(actions.system.failures.count == 2, "confirming an empty selection does not emit a false error")
+let footerPanel = WindowSwitcherPanelLayout.frame(visibleFrame: screen, rowCount: 1, statusFooter: true)
+expect(footerPanel.height == smallPanel.height + 24 && footerPanel.maxY == smallPanel.maxY,
+       "partial inventory status has space below list without moving the top anchor")
 print("RESULT window-switcher checks=\(total) failures=\(failures)")
 exit(failures == 0 ? 0 : 1)

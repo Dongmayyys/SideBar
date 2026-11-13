@@ -3,7 +3,9 @@ final class SwitcherActionHarness: NSObject {
     final class Table { var clickedRow = -1 }
     final class System {
         var focused: [UInt32] = []
+        var failures: [String] = []
         func focus(_ candidate: WindowSwitcherCandidate) { focused.append(candidate.id) }
+        func reportFocusFailure(id: UInt32, pid: Int32, reason: String) { failures.append(reason) }
     }
     struct Inventory { var candidates: [WindowSwitcherCandidate] = [] }
     var rows: [WindowSwitcherRow] = []

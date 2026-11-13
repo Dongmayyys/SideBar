@@ -124,29 +124,6 @@ print(result.stderr, end='', file=sys.stderr)
 if result.returncode:
     sys.exit(result.returncode)
 
-# Compile the production one-time legacy ownership migration without real apps/defaults.
-migration_source = (source / 'LegacyHiddenApplicationMigration.swift').read_text()
-migration_source = migration_source.replace('import AppKit', 'import Foundation').replace('Foundation.UserDefaults', 'TestHiddenDefaults')
-migration_fixture = session_base + '\n' + migration_source
-candidate_method = re.search(r'    private func candidatePIDs\(.*?\n    }', (source / 'WindowRescueManager.swift').read_text(), re.S).group()
-migration_tests = (repo / 'Tests/LegacyHiddenApplicationMigrationTests.swift.txt').read_text()
-migration_fixture += '\n' + migration_tests.replace('__CANDIDATE_PID_METHOD__', candidate_method)
-migration_output = output / 'legacy-app-migration'
-migration_output.mkdir(exist_ok=True)
-(migration_output / 'main.swift').write_text(migration_fixture)
-compiled = subprocess.run(['swiftc', str(migration_output / 'main.swift'), '-framework', 'ApplicationServices',
-                           '-o', str(migration_output / 'tests')], capture_output=True, text=True)
-(migration_output / 'compile.log').write_text(compiled.stdout + compiled.stderr)
-if compiled.returncode:
-    print(compiled.stdout + compiled.stderr, file=sys.stderr)
-    sys.exit(compiled.returncode)
-result = subprocess.run([str(migration_output / 'tests')], capture_output=True, text=True)
-(migration_output / 'tests.log').write_text(result.stdout + result.stderr)
-print(result.stdout, end='')
-print(result.stderr, end='', file=sys.stderr)
-if result.returncode:
-    sys.exit(result.returncode)
-
 # Compile all of AppConfig; use an in-memory preference backend, never user defaults.
 config_source = (source / 'AppConfig.swift').read_text()
 config_source = config_source.replace('UserDefaults', 'MemoryDefaults').replace('private init()', 'init()')

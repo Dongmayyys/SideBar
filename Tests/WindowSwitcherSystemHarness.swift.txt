@@ -1,0 +1,186 @@
+import AppKit
+import ApplicationServices
+import Carbon
+
+enum TestClock { static var now: TimeInterval = 0 }
+struct TestDeadline {
+    let value: TimeInterval
+    static func now() -> Self { Self(value: TestClock.now) }
+    static func + (left: Self, right: Double) -> Self { Self(value: left.value + right) }
+}
+final class TestDispatchQueue {
+    static let main = TestDispatchQueue(label: "main")
+    static var jobs: [(TimeInterval, () -> Void)] = []
+    init(label: String, qos: DispatchQoS = .unspecified) {}
+    func async(execute: @escaping () -> Void) { Self.jobs.append((TestClock.now, execute)) }
+    func asyncAfter(deadline: TestDeadline, execute: @escaping () -> Void) { Self.jobs.append((deadline.value, execute)) }
+    static func drain() {
+        var count = 0
+        while !jobs.isEmpty {
+            count += 1
+            precondition(count < 1000, "unbounded request continuation")
+            let index = jobs.indices.min { jobs[$0].0 < jobs[$1].0 }!
+            let (due, job) = jobs.remove(at: index)
+            TestClock.now = max(TestClock.now, due)
+            job()
+        }
+    }
+}
+final class TestApplication {
+    let processIdentifier: Int32
+    let activationPolicy: NSApplication.ActivationPolicy = .regular
+    let localizedName: String? = "Test App"
+    let bundleIdentifier: String? = "test.app"
+    init(_ pid: Int32) { processIdentifier = pid }
+}
+final class TestWorkspace {
+    static let shared = TestWorkspace()
+    var runningApplications: [TestApplication] = []
+    var frontmostApplication: TestApplication?
+}
+final class TestElement: NSObject {
+    let pid: Int32
+    let id: UInt32?
+    var minimized = false
+    init(pid: Int32, id: UInt32? = nil) { self.pid = pid; self.id = id }
+}
+enum TestPlatform {
+    static var info: [[String: Any]]? = []
+    static var windows: [Int32: [TestElement]] = [:]
+    static var remote: [UInt64: TestElement] = [:]
+    static var membership: [UInt32: [NSNumber]] = [:]
+    static var focused: [Int32: TestElement] = [:]
+    static var privateWorks = true
+    static var publicWorks = true
+    static var acceptsFocus = true
+    static var restoreWorks = true
+    static var windowIDWorks = true
+    static var spacesWork = true
+    static var attributeDelay: TimeInterval = 0
+    static var onGetWindow: (() -> Void)?
+    static var invalidElements: Set<ObjectIdentifier> = []
+    static var scanCount = 0
+    static var cgReads = 0
+    static var activations = 0
+    static var minimizedWrites = 0
+    static var beeps = 0
+    static var logs: [String] = []
+
+    static func reset() {
+        TestClock.now = 0
+        TestDispatchQueue.jobs = []
+        info = []; windows = [:]; remote = [:]; membership = [:]; focused = [:]
+        privateWorks = true; publicWorks = true; acceptsFocus = true; restoreWorks = true; windowIDWorks = true; spacesWork = true
+        attributeDelay = 0; onGetWindow = nil; invalidElements = []
+        scanCount = 0; cgReads = 0; activations = 0; minimizedWrites = 0; beeps = 0; logs = []
+        TestWorkspace.shared.runningApplications = []
+        TestWorkspace.shared.frontmostApplication = nil
+        WindowSwitcherPrivateAPI.restore()
+    }
+
+    static func add(_ id: UInt32, pid: Int32 = 100, advertised: Bool = true, onScreen: Bool = true) -> TestElement {
+        let window = TestElement(pid: pid, id: id)
+        if !TestWorkspace.shared.runningApplications.contains(where: { $0.processIdentifier == pid }) {
+            TestWorkspace.shared.runningApplications.append(TestApplication(pid))
+        }
+        info!.append([
+            kCGWindowNumber as String: NSNumber(value: id), kCGWindowOwnerPID as String: NSNumber(value: pid),
+            kCGWindowLayer as String: NSNumber(value: 0), kCGWindowIsOnscreen as String: onScreen,
+            kCGWindowBounds as String: CGRect(x: 10, y: 10, width: 500, height: 400).dictionaryRepresentation
+        ])
+        membership[id] = [1]
+        if advertised { windows[pid, default: []].append(window) }
+        return window
+    }
+}
+enum TestSound { static func beep() { TestPlatform.beeps += 1 } }
+enum StashDebugLog { static func write(_ value: String) { TestPlatform.logs.append(value) } }
+
+enum WindowSwitcherPrivateAPI {
+    static var copySpaces: Int? = 1
+    static var getWindow: ((TestElement, UnsafeMutablePointer<UInt32>) -> AXError)?
+    static var remoteElement: ((CFData) -> Unmanaged<TestElement>?)?
+    static var processForPID: ((Int32, UnsafeMutablePointer<ProcessSerialNumber>) -> Int32)?
+    static var frontWindow: ((UnsafeMutablePointer<ProcessSerialNumber>, UInt32, UInt32) -> Int32)?
+    static var postRecord: Int? = 1
+
+    static func restore() {
+        copySpaces = 1; postRecord = 1
+        getWindow = { window, id in
+            TestPlatform.onGetWindow?()
+            guard TestPlatform.windowIDWorks, !TestPlatform.invalidElements.contains(ObjectIdentifier(window)),
+                  let value = window.id else { return .invalidUIElement }
+            id.pointee = value
+            return .success
+        }
+        remoteElement = { data in
+            TestPlatform.scanCount += 1
+            TestClock.now += 0.01
+            var id: UInt64 = 0
+            var pid: Int32 = 0
+            memcpy(&id, CFDataGetBytePtr(data)! + 12, 8)
+            memcpy(&pid, CFDataGetBytePtr(data)!, 4)
+            guard let element = TestPlatform.remote[id], element.pid == pid else { return nil }
+            return Unmanaged.passRetained(element)
+        }
+        processForPID = { pid, psn in psn.pointee.lowLongOfPSN = UInt32(pid); return 0 }
+        frontWindow = { psn, id, _ in
+            guard TestPlatform.privateWorks else { return -1 }
+            let pid = Int32(psn.pointee.lowLongOfPSN)
+            TestWorkspace.shared.frontmostApplication = TestApplication(pid)
+            TestPlatform.focused[pid] = (TestPlatform.windows[pid] ?? []).first { $0.id == id }
+                ?? TestPlatform.remote.values.first { $0.id == id }
+            return 0
+        }
+    }
+    static func spaces(_ id: UInt32) -> [NSNumber]? {
+        copySpaces != nil && TestPlatform.spacesWork ? TestPlatform.membership[id] : nil
+    }
+    static func makeKey(_ id: UInt32, psn: inout ProcessSerialNumber) -> Int32? { postRecord == nil ? nil : 0 }
+}
+
+func testWindowInfo(_ options: CGWindowListOption, _ id: CGWindowID) -> CFArray? {
+    TestPlatform.cgReads += 1
+    return TestPlatform.info.map { $0 as CFArray }
+}
+func testCreateApplication(_ pid: Int32) -> TestElement { TestElement(pid: pid) }
+func testTimeout(_ element: TestElement, _ timeout: Float) -> AXError { .success }
+func testGetPid(_ element: TestElement, _ pid: inout Int32) -> AXError { pid = element.pid; return .success }
+func testGetTypeID(_ value: CFTypeRef) -> CFTypeID { value is TestElement ? 1 : 0 }
+func testElementTypeID() -> CFTypeID { 1 }
+func testCopyAttribute(_ element: TestElement, _ attribute: CFString, _ value: inout CFTypeRef?) -> AXError {
+    TestClock.now += TestPlatform.attributeDelay
+    switch attribute as String {
+    case kAXWindowsAttribute: value = (TestPlatform.windows[element.pid] ?? []) as CFArray
+    case kAXFocusedWindowAttribute: value = TestPlatform.focused[element.pid]
+    case kAXRoleAttribute: value = kAXWindowRole as CFString
+    case kAXSubroleAttribute: value = kAXStandardWindowSubrole as CFString
+    case kAXTitleAttribute: value = "Test Window" as CFString
+    case kAXMinimizedAttribute: value = element.minimized ? kCFBooleanTrue : kCFBooleanFalse
+    default: return .attributeUnsupported
+    }
+    return .success
+}
+func testSetAttribute(_ element: TestElement, _ attribute: CFString, _ value: CFTypeRef) -> AXError {
+    switch attribute as String {
+    case kAXMinimizedAttribute:
+        TestPlatform.minimizedWrites += 1
+        guard TestPlatform.restoreWorks else { return .cannotComplete }
+        element.minimized = false
+    case kAXFocusedWindowAttribute:
+        guard TestPlatform.publicWorks, let window = value as? TestElement else { return .cannotComplete }
+        if TestPlatform.acceptsFocus { TestPlatform.focused[element.pid] = window }
+    case kAXFrontmostAttribute:
+        TestPlatform.activations += 1
+        guard TestPlatform.publicWorks else { return .cannotComplete }
+        TestWorkspace.shared.frontmostApplication = TestApplication(element.pid)
+    default:
+        if !TestPlatform.publicWorks { return .cannotComplete }
+    }
+    return .success
+}
+func testPerformAction(_ element: TestElement, _ action: CFString) -> AXError {
+    TestPlatform.publicWorks ? .success : .cannotComplete
+}
+
+__SYSTEM__

@@ -1,0 +1,218 @@
+var total = 0
+var failures = 0
+func expect(_ condition: Bool, _ name: String) {
+    total += 1
+    if !condition { failures += 1 }
+    print("\(condition ? "PASS" : "FAIL") \(name)")
+}
+func enumerate(_ system: WindowSwitcherSystem) -> [WindowSwitcherInventory] {
+    var snapshots: [WindowSwitcherInventory] = []
+    system.enumerate { snapshots.append($0) }
+    TestDispatchQueue.drain()
+    return snapshots
+}
+let candidate = WindowSwitcherCandidate(id: 1, pid: 100, appName: "Test App", title: "Test Window")
+
+let budget = WindowSwitcherScanBudget(startedAt: 10)
+expect(budget.hasTime(at: 11.99) && !budget.hasTime(at: 12), "whole-request budget expires at two seconds")
+expect(budget.sliceDeadline(at: 11.9) == 12, "last process slice cannot extend whole-request deadline")
+expect(WindowSwitcherStatus.message(isReading: false, unavailableReason: nil, hasRows: false) == "没有匹配的窗口", "only a usable empty list reports no matching window")
+expect(WindowSwitcherStatus.message(isReading: true, unavailableReason: nil, hasRows: false) == "正在读取窗口…", "pending list is not reported as no match")
+expect(WindowSwitcherStatus.message(isReading: false, unavailableReason: "私有接口缺失", hasRows: false)?.contains("窗口列表读取不可用") == true, "missing interface gets unavailable state instead of no match")
+expect(WindowSwitcherStatus.message(isReading: false, unavailableReason: "调用失败", hasRows: true) != nil, "partial results retain visible unavailable feedback")
+
+TestPlatform.reset()
+_ = TestPlatform.add(1)
+_ = TestPlatform.add(2, advertised: false, onScreen: false)
+_ = TestPlatform.add(3, pid: 200, advertised: false, onScreen: false)
+let bounded = WindowSwitcherSystem()
+let boundedSnapshots = enumerate(bounded)
+expect(TestClock.now <= 2.11 && TestClock.now >= 2, "all processes and continuations share one two-second budget")
+expect(TestPlatform.scanCount > 25 && TestPlatform.scanCount <= 210, "no-progress remote scans stop instead of running indefinitely")
+expect(boundedSnapshots.last?.candidates.map(\.id) == [1], "budget expiry retains already published results")
+expect(boundedSnapshots.last?.isReading == false && boundedSnapshots.last?.unavailableReason?.contains("超时") == true, "budget expiry finalizes the request and explains incomplete inventory")
+expect(TestPlatform.cgReads == 1 && TestDispatchQueue.jobs.isEmpty, "continuations reuse CG snapshot and leave no scheduled scanning behind")
+
+TestPlatform.reset()
+_ = TestPlatform.add(1)
+let remote = TestPlatform.add(2, advertised: false, onScreen: false)
+TestPlatform.remote[5] = remote
+let complete = enumerate(WindowSwitcherSystem())
+expect(complete.last?.candidates.map(\.id) == [1, 2], "reachable cross-Space root is appended before budget expires")
+expect(complete.last?.unavailableReason == nil && complete.last?.isReading == false, "fully resolved inventory finishes without a warning")
+expect(TestPlatform.scanCount == 6, "successful sweep ends immediately after last requested root")
+
+TestPlatform.reset()
+let late = TestPlatform.add(2, advertised: false, onScreen: false)
+TestPlatform.remote[250] = late
+let resumed = WindowSwitcherSystem()
+expect(enumerate(resumed).last?.candidates.isEmpty == true, "sparse AX ids do not bypass request time limit")
+expect(enumerate(resumed).last?.candidates.map(\.id) == [2], "a later invocation resumes cursor with its own fresh bounded request")
+
+TestPlatform.reset()
+_ = TestPlatform.add(1)
+let cancelled = WindowSwitcherSystem()
+var deliveries = 0
+cancelled.enumerate { _ in deliveries += 1 }
+cancelled.cancel()
+TestDispatchQueue.drain()
+expect(deliveries == 0 && TestPlatform.scanCount == 0, "closing panel cancels old request and late publications")
+
+TestPlatform.reset()
+TestPlatform.info = nil
+let cgFailure = enumerate(WindowSwitcherSystem()).last
+expect(cgFailure?.unavailableReason?.contains("CGWindowList") == true, "failed CG inventory is distinct from a valid empty list")
+TestPlatform.reset()
+expect(enumerate(WindowSwitcherSystem()).last?.unavailableReason == nil, "valid empty inventory is not an API failure")
+
+TestPlatform.reset()
+_ = TestPlatform.add(1)
+WindowSwitcherPrivateAPI.getWindow = nil
+let missingID = enumerate(WindowSwitcherSystem()).last
+expect(missingID?.unavailableReason?.contains("缺失") == true && missingID?.candidates.isEmpty == true, "missing private id mapping is explicitly unavailable, never guessed")
+TestPlatform.reset()
+_ = TestPlatform.add(1)
+TestPlatform.windowIDWorks = false
+expect(enumerate(WindowSwitcherSystem()).last?.unavailableReason?.contains("调用失败") == true, "private id mapping call failure is reported")
+
+TestPlatform.reset()
+_ = TestPlatform.add(1)
+_ = TestPlatform.add(2, advertised: false, onScreen: false)
+WindowSwitcherPrivateAPI.remoteElement = nil
+let missingRemote = enumerate(WindowSwitcherSystem()).last
+expect(missingRemote?.unavailableReason?.contains("缺失") == true && missingRemote?.candidates.map(\.id) == [1], "missing remote-token API preserves public AX results with partial-list feedback")
+TestPlatform.reset()
+_ = TestPlatform.add(1)
+WindowSwitcherPrivateAPI.remoteElement = nil
+expect(enumerate(WindowSwitcherSystem()).last?.unavailableReason == nil, "remote-token API is not required if public AX resolves the complete list")
+
+for missing in [true, false] {
+    TestPlatform.reset()
+    _ = TestPlatform.add(1)
+    let minimized = TestPlatform.add(2, onScreen: false)
+    minimized.minimized = true
+    _ = TestPlatform.add(3, onScreen: false)
+    if missing { WindowSwitcherPrivateAPI.copySpaces = nil } else { TestPlatform.spacesWork = false }
+    let fallback = enumerate(WindowSwitcherSystem()).last
+    expect(fallback?.candidates.map(\.id) == [1, 2], "Space fallback keeps visible and minimized windows, not unproven background windows missing=\(missing)")
+    expect(fallback?.unavailableReason != nil, "Space missing/failure is visible even when public results exist missing=\(missing)")
+}
+
+TestPlatform.reset()
+_ = TestPlatform.add(1)
+let privateFocus = WindowSwitcherSystem()
+_ = enumerate(privateFocus)
+privateFocus.focus(candidate)
+TestDispatchQueue.drain()
+expect(TestPlatform.focused[100]?.id == 1 && TestPlatform.beeps == 0, "private exact-window fronting plus AX verification succeeds")
+
+for failure in ["front-missing", "process-missing", "front-error", "key-missing", "spaces-missing"] {
+    TestPlatform.reset()
+    _ = TestPlatform.add(1)
+    let fallback = WindowSwitcherSystem()
+    _ = enumerate(fallback)
+    switch failure {
+    case "front-missing": WindowSwitcherPrivateAPI.frontWindow = nil
+    case "process-missing": WindowSwitcherPrivateAPI.processForPID = nil
+    case "front-error": TestPlatform.privateWorks = false
+    case "key-missing": WindowSwitcherPrivateAPI.postRecord = nil
+    default: WindowSwitcherPrivateAPI.copySpaces = nil; WindowSwitcherPrivateAPI.frontWindow = nil
+    }
+    fallback.focus(candidate)
+    TestDispatchQueue.drain()
+    expect(TestPlatform.focused[100]?.id == 1 && TestWorkspace.shared.frontmostApplication?.processIdentifier == 100,
+           "public AX degradation confirms exact focus: \(failure)")
+    expect(TestPlatform.beeps == 0 && TestPlatform.logs.isEmpty, "successful degradation does not falsely report failure: \(failure)")
+}
+
+TestPlatform.reset()
+_ = TestPlatform.add(1)
+let failed = WindowSwitcherSystem()
+_ = enumerate(failed)
+WindowSwitcherPrivateAPI.frontWindow = nil
+TestPlatform.publicWorks = false
+failed.focus(candidate)
+TestDispatchQueue.drain()
+expect(TestPlatform.beeps == 1 && TestPlatform.logs.count == 1, "unconfirmed switch emits one visible/audible feedback and one diagnostic")
+expect(TestPlatform.activations == 0, "rejecting every targeted AX action never falls through to app-only activation")
+expect(TestPlatform.logs[0].contains("focus-not-confirmed") && TestPlatform.logs[0].contains("private-front=") && TestPlatform.logs[0].contains("AX-raise="), "failure log includes private path and public AX results")
+
+TestPlatform.reset()
+_ = TestPlatform.add(1)
+let sibling = TestPlatform.add(2)
+TestPlatform.focused[100] = sibling
+let wrong = WindowSwitcherSystem()
+_ = enumerate(wrong)
+WindowSwitcherPrivateAPI.frontWindow = nil
+TestPlatform.acceptsFocus = false
+wrong.focus(candidate)
+TestDispatchQueue.drain()
+expect(TestPlatform.activations == 1 && TestPlatform.beeps == 1, "activating software without exact target focus is failure, not success")
+expect(TestPlatform.logs.first?.contains("focused=2") == true, "wrong-window failure records actual focused id")
+
+for failure in ["closed", "owner-changed", "id-missing", "no-space", "unminimize"] {
+    TestPlatform.reset()
+    let window = TestPlatform.add(1)
+    let system = WindowSwitcherSystem()
+    _ = enumerate(system)
+    switch failure {
+    case "closed": TestPlatform.info = []
+    case "owner-changed": TestPlatform.info![0][kCGWindowOwnerPID as String] = NSNumber(value: 999)
+    case "id-missing": WindowSwitcherPrivateAPI.getWindow = nil
+    case "no-space": TestPlatform.membership[1] = []
+    default: window.minimized = true; TestPlatform.restoreWorks = false
+    }
+    system.focus(candidate)
+    TestDispatchQueue.drain()
+    expect(TestPlatform.beeps == 1 && TestPlatform.logs.count == 1, "preflight failure is logged and audible: \(failure)")
+    expect(TestWorkspace.shared.frontmostApplication == nil && TestPlatform.activations == 0, "preflight failure never activates an app as a substitute: \(failure)")
+}
+
+TestPlatform.reset()
+let minimized = TestPlatform.add(1)
+minimized.minimized = true
+let restoring = WindowSwitcherSystem()
+_ = enumerate(restoring)
+WindowSwitcherPrivateAPI.frontWindow = nil
+restoring.focus(candidate)
+TestDispatchQueue.drain()
+expect(TestPlatform.minimizedWrites == 1 && !minimized.minimized && TestPlatform.beeps == 0, "public fallback restores minimized exact window before focusing")
+
+TestPlatform.reset()
+_ = TestPlatform.add(1)
+let cancelledFocus = WindowSwitcherSystem()
+cancelledFocus.focus(candidate)
+cancelledFocus.cancel()
+TestDispatchQueue.drain()
+expect(TestPlatform.beeps == 0 && TestPlatform.activations == 0, "superseded focus request is cancelled without an error sound")
+
+TestPlatform.reset()
+for id in UInt32(1)...10 { _ = TestPlatform.add(id) }
+TestPlatform.attributeDelay = 0.1
+let slow = enumerate(WindowSwitcherSystem()).last
+expect(TestClock.now < 2.5 && (slow?.candidates.count ?? 10) < 10, "initial inventory also stops starting new AX batches after shared deadline")
+expect(slow?.unavailableReason?.contains("超时") == true && slow?.isReading == false, "slow first pass publishes its partial list as finished with timeout reason")
+
+TestPlatform.reset()
+_ = TestPlatform.add(1)
+let interruptedFocus = WindowSwitcherSystem()
+_ = enumerate(interruptedFocus)
+TestPlatform.onGetWindow = { interruptedFocus.cancel() }
+interruptedFocus.focus(candidate)
+TestDispatchQueue.drain()
+expect(TestPlatform.activations == 0 && TestPlatform.beeps == 0 && TestWorkspace.shared.frontmostApplication == nil,
+       "cancellation during exact-window preflight prevents later activation")
+
+TestPlatform.reset()
+let stale = TestPlatform.add(1)
+let repaired = WindowSwitcherSystem()
+_ = enumerate(repaired)
+let replacement = TestElement(pid: 100, id: 1)
+TestPlatform.windows[100] = [replacement]
+TestPlatform.invalidElements.insert(ObjectIdentifier(stale))
+WindowSwitcherPrivateAPI.frontWindow = nil
+repaired.focus(candidate)
+TestDispatchQueue.drain()
+expect(TestPlatform.focused[100] === replacement && TestPlatform.beeps == 0, "public AX re-resolves a stale handle by exact window id and confirms replacement focus")
+print("RESULT switcher-runtime checks=\(total) failures=\(failures)")
+exit(failures == 0 ? 0 : 1)

@@ -144,11 +144,6 @@ final class NSRunningApplication {
     static var bundles: [Int32: String] = [:]
     static var terminated: Set<Int32> = []
     static var hidden: Set<Int32> = []
-    static var unhideSucceeds = true
-    static var onUnhide: ((Int32) -> Void)?
-    static var launches: [Int32: Date] = [:]
-    var launchDate: Date? { Self.launches[processIdentifier] ?? Date(timeIntervalSince1970: 100) }
-    var processStartDate: Date? { launchDate }
     var isHidden: Bool { Self.hidden.contains(processIdentifier) }
     var bundleIdentifier: String? { Self.bundles[processIdentifier] ?? "same.app" }
     var isTerminated: Bool { Self.terminated.contains(processIdentifier) }
@@ -159,12 +154,6 @@ final class NSRunningApplication {
     func activate(options: ActivateOptions) {
         Self.hidden.remove(processIdentifier)
         NSWorkspace.shared.frontmostApplication = self
-    }
-    func unhide() -> Bool {
-        platformEvents.append("unhide:\(processIdentifier)")
-        if Self.unhideSucceeds { Self.hidden.remove(processIdentifier) }
-        Self.onUnhide?(processIdentifier)
-        return Self.unhideSucceeds
     }
 }
 final class NSWorkspace {

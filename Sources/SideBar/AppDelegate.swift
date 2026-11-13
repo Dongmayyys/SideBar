@@ -39,7 +39,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         setupMenuBarForEditActions()
         setupStatusBar()
-        LegacyHiddenApplicationMigration.restore(reason: "launch")
         guard checkPermissions() else { return }
 
         // 异常恢复逻辑：营救因上次崩溃、权限丢失或强制重启遗留在边缘的窗口

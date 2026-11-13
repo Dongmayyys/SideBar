@@ -283,12 +283,29 @@ struct WindowSwitcherSelection {
 enum WindowSwitcherPanelLayout {
     static let rowHeight: CGFloat = 30
 
-    static func frame(visibleFrame: CGRect, rowCount: Int) -> CGRect {
+    static func frame(visibleFrame: CGRect, rowCount: Int, statusFooter: Bool = false) -> CGRect {
         let width = min(640, max(0, visibleFrame.width - 32))
-        let height = min(480, visibleFrame.height * 0.65, 74 + CGFloat(max(1, rowCount)) * rowHeight)
+        let height = min(480, visibleFrame.height * 0.65, 74 + CGFloat(max(1, rowCount)) * rowHeight + (statusFooter ? 24 : 0))
         return CGRect(x: visibleFrame.midX - width / 2,
                       y: visibleFrame.maxY - visibleFrame.height * 0.18 - height,
                       width: width, height: height)
+    }
+}
+
+struct WindowSwitcherScanBudget {
+    static let duration: TimeInterval = 2
+    let deadline: TimeInterval
+
+    init(startedAt: TimeInterval) { deadline = startedAt + Self.duration }
+    func hasTime(at now: TimeInterval) -> Bool { now < deadline }
+    func sliceDeadline(at now: TimeInterval) -> TimeInterval { min(deadline, now + 0.25) }
+}
+
+enum WindowSwitcherStatus {
+    static func message(isReading: Bool, unavailableReason: String?, hasRows: Bool) -> String? {
+        if let unavailableReason { return "窗口列表读取不可用（\(unavailableReason)）" }
+        if hasRows { return nil }
+        return isReading ? "正在读取窗口…" : "没有匹配的窗口"
     }
 }
 

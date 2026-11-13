@@ -1,11 +1,13 @@
 import AppKit
 import ApplicationServices
+import Carbon
 
 final class WindowSwitcherController: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NSTableViewDelegate, NSWindowDelegate {
     private let excludedWindowIDs: () -> Set<CGWindowID>
     private let system = WindowSwitcherSystem()
     private let panel = WindowSwitcherPanel()
     private let input = NSTextField()
+    private var savedInputSource: TISInputSource?
     private let table = WindowSwitcherTable()
     private let status = NSTextField(labelWithString: "")
     private var inventory = WindowSwitcherInventory()
@@ -61,6 +63,12 @@ final class WindowSwitcherController: NSObject, NSTextFieldDelegate, NSTableView
         }
         panel.makeKeyAndOrderFront(nil)
         panel.makeFirstResponder(input)
+        // 搜索按拼音字母匹配：面板打开期间切到英文输入源，避免中文输入法把字母组成汉字候选；关闭时切回。
+        if savedInputSource == nil, let current = TISCopyCurrentKeyboardInputSource()?.takeRetainedValue(),
+           let ascii = TISCopyCurrentASCIICapableKeyboardInputSource()?.takeRetainedValue() {
+            savedInputSource = current
+            if !CFEqual(current, ascii) { TISSelectInputSource(ascii) }
+        }
         installMouseMonitors()
         system.enumerate { [weak self] snapshot in
             guard let self, self.panel.isVisible else { return }
@@ -73,6 +81,10 @@ final class WindowSwitcherController: NSObject, NSTextFieldDelegate, NSTableView
     func close() {
         system.cancel()
         panel.orderOut(nil)
+        if let saved = savedInputSource {
+            savedInputSource = nil
+            TISSelectInputSource(saved)
+        }
         if let globalMouseMonitor { NSEvent.removeMonitor(globalMouseMonitor); self.globalMouseMonitor = nil }
         if let localMouseMonitor { NSEvent.removeMonitor(localMouseMonitor); self.localMouseMonitor = nil }
     }

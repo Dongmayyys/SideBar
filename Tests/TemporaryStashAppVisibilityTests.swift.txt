@@ -149,7 +149,7 @@ unknownWindows.reconcile(sessions: unknownSessions)
 expect(NSRunningApplication.hidden.contains(123), "unknown subrole preserves an owned hidden app")
 
 // Finder regression: AX eligibility can change solely because the app is hidden.
-// Neither a fresh AX snapshot nor ordinary visibility transitions may rearm hide.
+// A fresh AX snapshot or Space change cannot rearm hide; successful expansion can.
 for failure in ["unmanaged-standard-window"] {
     for immediateHide in [false, true] {
         resetVisibilityBackend()
@@ -159,9 +159,7 @@ for failure in ["unmanaged-standard-window"] {
         NSRunningApplication.hideIsImmediate = immediateHide
         visibility.reconcile(sessions: sessions)
         let appElement = applicationElements[123]!
-        if failure == "unknown-windows" { appElement.windows = nil }
-        else if failure == "unknown-window-subrole" { sessions[0].windowElement.subroleUnavailable = true }
-        else { let ordinary = Element(); ordinary.systemWindowID = 999; appElement.windows!.append(ordinary) }
+        let ordinary = Element(); ordinary.systemWindowID = 999; appElement.windows!.append(ordinary)
         visibility.reconcile(sessions: sessions)
         visibility.reconcile(sessions: sessions)
         let context = "\(failure) immediateHide=\(immediateHide)"
@@ -189,17 +187,19 @@ for failure in ["unmanaged-standard-window"] {
         _ = sessions[0].hideForTemporaryStashTab()
         moment = moment.addingTimeInterval(2)
         visibility.reconcile(sessions: sessions)
-        expect(sessions[0].isSnappedForCoordination && !appVisibilityEvents.contains("hide:123")
-               && !StashDebugLog.messages.contains { $0.contains("circuit-breaker cleared") },
-               "Space events and expand-collapse leave breaker armed: \(context)")
+        expect(sessions[0].isSnappedForCoordination && appVisibilityEvents.filter { $0 == "hide:123" }.count == 1
+               && StashDebugLog.messages.filter { $0.contains("circuit-breaker cleared") && $0.contains("reason=managed-window-expanded") }.count == 1,
+               "successful expansion clears breaker and collapse rearms hide: \(context)")
         sessions[0].cancelTemporaryShortcutStash()
         expect(!sessions[0].isTemporaryShortcutManaged && sessions[0].alpha == 1,
                "breaker permits cancel and geometry/alpha restoration: \(context)")
         visibility.reconcile(sessions: sessions)
-        expect(StashDebugLog.messages.filter { $0.contains("circuit-breaker cleared") && $0.contains("reason=managed-session-set-changed") }.count == 1,
-               "removing a managed session clears and logs the breaker once: \(context)")
         appElement.windows = [sessions[1].windowElement]
         NSRunningApplication.hideIsImmediate = true
+        appVisibilityEvents.removeAll()
+        moment = moment.addingTimeInterval(2) // Settle the cancelled pending hide before the next hide.
+        visibility.reconcile(sessions: sessions)
+        moment = moment.addingTimeInterval(1) // Then expire the confirmed unhide's activation grace.
         visibility.reconcile(sessions: sessions)
         expect(NSRunningApplication.hidden.contains(123) && appVisibilityEvents.filter { $0 == "hide:123" }.count == 1,
                "changed stash set can auto-hide again when eligible: \(context)")
@@ -416,6 +416,112 @@ expect(switchSession.canRevealForTemporaryAppActivation(activatedPID: 123), "act
 switchSession.revealForTemporaryStashTab(isAppActivated: true)
 expect(switchSession.isExpandedForCoordination && switchSession.alpha == 1 && switchSession.pendingDockInteraction,
        "Command-Tab reveals originally hidden stash through existing focused-window activation path")
+
+// External unhide must not be stolen back after the old activation grace.
+// Exercise either notification order and polling-only observation with a utility
+// window that intentionally does not veto the all-standard-windows test.
+for observation in ["unhide-notification", "polling", "activation-first"] {
+    resetVisibilityBackend()
+    var moment = Date()
+    let visibility = TemporaryStashAppVisibility(now: { moment })
+    let sessions = collapsedSessions(visibility: visibility, count: 2)
+    visibility.reconcile(sessions: sessions)
+    let utility = Element()
+    utility.systemWindowID = 999
+    utility.standard = false
+    sessions[0].appElement.windows!.append(utility)
+    NSRunningApplication.hidden.remove(123)
+    appVisibilityEvents.removeAll()
+    switch observation {
+    case "unhide-notification": visibility.applicationWasUnhidden(pid: 123)
+    case "activation-first": visibility.applicationWasActivated(pid: 123)
+    default: visibility.reconcile(sessions: sessions)
+    }
+    visibility.applicationWasUnhidden(pid: 123) // Duplicate or delayed notification.
+    visibility.spaceDidChange()
+    visibility.spaceDidChange(topologyChanged: true)
+    for interval in [0.5, 1.0, 2.0, 30.0] {
+        moment = moment.addingTimeInterval(interval)
+        visibility.reconcile(sessions: sessions)
+    }
+    expect(!NSRunningApplication.hidden.contains(123) && !appVisibilityEvents.contains("hide:123")
+           && !appVisibilityEvents.contains("unhide:123") && utility.writes == 0,
+           "external unhide keeps utility available beyond grace without hide/unhide requests: \(observation)")
+    expect(StashDebugLog.messages.filter { $0.contains("circuit-breaker triggered") && $0.contains("reason=external-unhide") }.count == 1,
+           "external unhide logs one reasoned breaker despite polling and duplicate notifications: \(observation)")
+
+    // A requested but AX-blocked expansion is not permission to hide again.
+    sessions[0].rawUnavailable = true
+    sessions[0].revealForTemporaryStashTab()
+    moment = moment.addingTimeInterval(2)
+    visibility.reconcile(sessions: sessions)
+    expect(sessions[0].isSnappedForCoordination && !NSRunningApplication.hidden.contains(123)
+           && !StashDebugLog.messages.contains { $0.contains("reason=managed-window-expanded") },
+           "failed expansion and expired reveal intent leave external-unhide breaker armed: \(observation)")
+
+    sessions[0].rawUnavailable = false
+    sessions[0].revealForTemporaryStashTab(isAppActivated: observation == "activation-first")
+    visibility.reconcile(sessions: sessions)
+    expect(sessions[0].isExpandedForCoordination
+           && StashDebugLog.messages.filter { $0.contains("circuit-breaker cleared") && $0.contains("reason=managed-window-expanded") }.count == 1,
+           "completed managed expansion clears the existing breaker: \(observation)")
+    _ = sessions[0].hideForTemporaryStashTab()
+    moment = moment.addingTimeInterval(2)
+    visibility.reconcile(sessions: sessions)
+    expect(NSRunningApplication.hidden.contains(123) && appVisibilityEvents.filter { $0 == "hide:123" }.count == 1,
+           "collapse after successful expansion restores ordinary auto-hide: \(observation)")
+}
+
+resetVisibilityBackend()
+var lateMoment = Date()
+let lateUnhide = TemporaryStashAppVisibility(now: { lateMoment })
+let lateSession = collapsedSessions(visibility: lateUnhide)[0]
+lateUnhide.reconcile(sessions: [lateSession])
+NSRunningApplication.hidden.remove(123)
+lateSession.revealForTemporaryStashTab() // Expansion beats both polling and the unhide notice.
+lateUnhide.applicationWasUnhidden(pid: 123)
+lateUnhide.applicationWasActivated(pid: 123)
+lateUnhide.reconcile(sessions: [lateSession])
+_ = lateSession.hideForTemporaryStashTab()
+lateMoment = lateMoment.addingTimeInterval(2)
+appVisibilityEvents.removeAll()
+lateUnhide.reconcile(sessions: [lateSession])
+expect(lateSession.isSnappedForCoordination && NSRunningApplication.hidden.contains(123)
+       && appVisibilityEvents == ["hide:123"],
+       "successful expansion before external-unhide notification still rearms auto-hide on collapse")
+expect(StashDebugLog.messages.filter { $0.contains("circuit-breaker triggered") && $0.contains("reason=external-unhide-before-reveal") }.count == 1
+       && StashDebugLog.messages.filter { $0.contains("circuit-breaker cleared") && $0.contains("reason=managed-window-expanded") }.count == 1,
+       "external unhide is observed before reveal and not misclassified after completed expansion")
+
+for immediate in [true, false] {
+    resetVisibilityBackend()
+    var moment = Date()
+    let visibility = TemporaryStashAppVisibility(now: { moment })
+    let session = collapsedSessions(visibility: visibility)[0]
+    visibility.reconcile(sessions: [session])
+    NSRunningApplication.unhideIsImmediate = immediate
+    NSRunningApplication.onUnhide = { pid in
+        visibility.applicationWasUnhidden(pid: pid)
+        visibility.applicationWasActivated(pid: pid)
+    }
+    session.revealForTemporaryStashTab()
+    if !immediate {
+        NSRunningApplication.hidden.remove(123)
+        visibility.applicationWasUnhidden(pid: 123)
+    }
+    NSRunningApplication.onUnhide = nil
+    visibility.applicationWasUnhidden(pid: 123) // Late acknowledgement after completion.
+    visibility.reconcile(sessions: [session])
+    expect(session.isExpandedForCoordination
+           && !StashDebugLog.messages.contains { $0.contains("circuit-breaker triggered") },
+           "SideBar-owned reveal does not trip external-unhide rule with reentrant or delayed acknowledgement: \(immediate)")
+    _ = session.hideForTemporaryStashTab()
+    moment = moment.addingTimeInterval(2)
+    appVisibilityEvents.removeAll()
+    visibility.reconcile(sessions: [session])
+    expect(NSRunningApplication.hidden.contains(123) && appVisibilityEvents == ["hide:123"],
+           "SideBar-owned reveal-collapse continues to auto-hide: \(immediate)")
+}
 
 resetVisibilityBackend()
 let userRehide = TemporaryStashAppVisibility()

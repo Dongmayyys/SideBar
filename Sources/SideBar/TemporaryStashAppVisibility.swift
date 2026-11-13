@@ -206,10 +206,7 @@ final class TemporaryStashAppVisibility {
                 }
             }
         case .hiddenOwned:
-            if !live.isHidden {
-                release(pid: pid, reason: "external-unhide-state-observed", remove: false)
-                applications[pid]?.activationUntil = now().addingTimeInterval(0.8)
-            }
+            observeExternalUnhide(pid: pid, reason: "external-unhide-state-observed")
         case .released: break
         }
     }
@@ -222,14 +219,26 @@ final class TemporaryStashAppVisibility {
         _ = restore(pid: pid, reason: reason)
     }
 
-    private func restoreForInvalidAXEligibility(pid: pid_t, sessionIDs: Set<String>, reason: String) {
+    private func tripAutoHideCircuitBreaker(pid: pid_t, sessionIDs: Set<String>, reason: String) {
         if autoHideCircuitBreakers[pid] == nil, let current = applications[pid],
            current.phase == .hideRequested || current.phase == .hiddenOwned {
             autoHideCircuitBreakers[pid] = AutoHideCircuitBreaker(launchDate: current.launchDate,
                 bundleID: current.bundleID, sessionIDs: sessionIDs)
             StashDebugLog.write("app auto-hide circuit-breaker triggered pid=\(pid) bundle=\(current.bundleID) identity=\(current.launchDate) sessions=\(sessionIDs.sorted()) reason=\(reason)")
         }
-        skipHiding(pid: pid, reason: reason)
+    }
+
+    private func clearAutoHideCircuitBreaker(pid: pid_t, reason: String) {
+        guard let breaker = autoHideCircuitBreakers.removeValue(forKey: pid) else { return }
+        StashDebugLog.write("app auto-hide circuit-breaker cleared pid=\(pid) bundle=\(breaker.bundleID) identity=\(breaker.launchDate) sessions=\(breaker.sessionIDs.sorted()) reason=\(reason)")
+    }
+
+    private func observeExternalUnhide(pid: pid_t, reason: String) {
+        guard let current = applications[pid], current.phase == .hiddenOwned,
+              !current.app.isHidden else { return }
+        tripAutoHideCircuitBreaker(pid: pid, sessionIDs: Set(current.windows.keys), reason: reason)
+        release(pid: pid, reason: reason, remove: false)
+        applications[pid]?.activationUntil = now().addingTimeInterval(0.8)
     }
 
     private func keepUnknownEligibility(pid: pid_t, reason: String) {
@@ -249,8 +258,7 @@ final class TemporaryStashAppVisibility {
             } else if Set((groups[pid] ?? []).map(\.temporaryStashID)) != breaker.sessionIDs {
                 reason = "managed-session-set-changed"
             } else { continue }
-            autoHideCircuitBreakers[pid] = nil
-            StashDebugLog.write("app auto-hide circuit-breaker cleared pid=\(pid) bundle=\(breaker.bundleID) identity=\(breaker.launchDate) sessions=\(breaker.sessionIDs.sorted()) reason=\(reason)")
+            clearAutoHideCircuitBreaker(pid: pid, reason: reason)
         }
     }
 
@@ -331,7 +339,8 @@ final class TemporaryStashAppVisibility {
                 keepUnknownEligibility(pid: pid, reason: "unknown-standard-window-identity"); continue
             }
             guard standardIDs.allSatisfy({ managedIDs.contains($0) }) else {
-                restoreForInvalidAXEligibility(pid: pid, sessionIDs: Set(group.map(\.temporaryStashID)), reason: "unmanaged-standard-window"); continue
+                tripAutoHideCircuitBreaker(pid: pid, sessionIDs: Set(group.map(\.temporaryStashID)), reason: "unmanaged-standard-window")
+                skipHiding(pid: pid, reason: "unmanaged-standard-window"); continue
             }
             if let current = applications[pid], current.phase == .released,
                current.activationUntil != .distantPast, now() >= current.activationUntil, pendingActivationPID != pid {
@@ -401,6 +410,9 @@ final class TemporaryStashAppVisibility {
 
     func applicationWasActivated(pid: pid_t) {
         notification(pid: pid, kind: "activate")
+        // Workspace may deliver activation before the external unhide notice.
+        // Observe visibility before starting a SideBar restore transaction.
+        observeExternalUnhide(pid: pid, reason: "external-unhide-before-activation")
         guard applications[pid] != nil else { return }
         if applications[pid]?.phase == .released {
             applications[pid]?.activationUntil = now().addingTimeInterval(0.8)
@@ -413,8 +425,7 @@ final class TemporaryStashAppVisibility {
         if current.phase == .hideRequested {
             StashDebugLog.write("app notification ignored pid=\(pid) reason=old-unhide-during-hide-request")
         } else if current.phase == .hiddenOwned {
-            release(pid: pid, reason: "external-unhide-awaiting-activation", remove: false)
-            applications[pid]?.activationUntil = now().addingTimeInterval(0.8)
+            observeExternalUnhide(pid: pid, reason: "external-unhide-awaiting-activation")
         } else { advance(pid: pid) }
     }
 
@@ -441,6 +452,9 @@ final class TemporaryStashAppVisibility {
     /// state notifications. Polling retries never extend this deadline.
     @discardableResult
     func beginReveal(pid: pid_t, sessionID: String, screenID: UInt32, edge: Int) -> Bool {
+        // Observe an external unhide before registering this reveal, so its
+        // delayed notification cannot arm a breaker after expansion completes.
+        observeExternalUnhide(pid: pid, reason: "external-unhide-before-reveal")
         guard let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated,
               !app.isHidden || (applications[pid] != nil && applications[pid]?.phase != .released) else { return false }
         if pendingReveals[pid]?[sessionID] == nil {
@@ -480,6 +494,11 @@ final class TemporaryStashAppVisibility {
     }
 
     func completeReveal(pid: pid_t, sessionID: String) {
+        // Only a successful window expansion rearms auto-hide, not an unhide
+        // request or an expansion that is still waiting for AX geometry.
+        if autoHideCircuitBreakers[pid]?.sessionIDs.contains(sessionID) == true {
+            clearAutoHideCircuitBreaker(pid: pid, reason: "managed-window-expanded")
+        }
         guard pendingReveals[pid]?.removeValue(forKey: sessionID) != nil else { return }
         if pendingReveals[pid]?.isEmpty == true { pendingReveals[pid] = nil }
         StashDebugLog.write("app reveal complete pid=\(pid) session=\(sessionID)")

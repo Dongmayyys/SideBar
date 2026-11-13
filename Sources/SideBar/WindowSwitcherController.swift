@@ -378,20 +378,18 @@ private final class WindowSwitcherRowView: NSTableRowView {
 }
 
 private final class WindowSwitcherCellView: NSTableCellView {
-    private let app = NSTextField(labelWithString: "")
     private let title = NSTextField(labelWithString: "")
 
     init(row: WindowSwitcherRow) {
         super.init(frame: .zero)
         let font = NSFont.systemFont(ofSize: 13)
-        for label in [app, title] {
-            label.font = font
-            label.lineBreakMode = .byTruncatingTail
-            label.maximumNumberOfLines = 1
-        }
-        app.attributedStringValue = Self.highlight(row.appName, ranges: row.appHighlights, font: font)
-        title.attributedStringValue = Self.highlight(row.title.isEmpty ? "无标题".localized : row.title,
-                                                   ranges: row.titleHighlights, font: font)
+        title.font = font
+        title.lineBreakMode = .byTruncatingTail
+        title.maximumNumberOfLines = 1
+        // 图标已表明是哪个软件，行内只显示窗口标题；没有标题时退回软件名。
+        title.attributedStringValue = row.title.isEmpty
+            ? Self.highlight(row.appName, ranges: row.appHighlights, font: font)
+            : Self.highlight(row.title, ranges: row.titleHighlights, font: font)
         let icon = NSImageView()
         icon.image = NSRunningApplication(processIdentifier: row.pid)?.icon
         icon.translatesAutoresizingMaskIntoConstraints = false
@@ -399,7 +397,7 @@ private final class WindowSwitcherCellView: NSTableCellView {
             icon.widthAnchor.constraint(equalToConstant: 20),
             icon.heightAnchor.constraint(equalToConstant: 20)
         ])
-        let labels = NSStackView(views: [icon, app, title])
+        let labels = NSStackView(views: [icon, title])
         imageView = icon
         title.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         labels.orientation = .horizontal
@@ -407,13 +405,12 @@ private final class WindowSwitcherCellView: NSTableCellView {
         labels.spacing = 10
         labels.translatesAutoresizingMaskIntoConstraints = false
         addSubview(labels)
-        app.widthAnchor.constraint(lessThanOrEqualTo: widthAnchor, multiplier: 0.4).isActive = true
         NSLayoutConstraint.activate([
             labels.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
             labels.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
             labels.centerYAnchor.constraint(equalTo: centerYAnchor)
         ])
-        textField = app
+        textField = title
         updateColors()
     }
 
@@ -422,9 +419,7 @@ private final class WindowSwitcherCellView: NSTableCellView {
     override var backgroundStyle: NSView.BackgroundStyle { didSet { updateColors() } }
 
     private func updateColors() {
-        let selected = backgroundStyle == .emphasized
-        app.textColor = selected ? .alternateSelectedControlTextColor : .labelColor
-        title.textColor = selected ? .alternateSelectedControlTextColor : .secondaryLabelColor
+        title.textColor = backgroundStyle == .emphasized ? .alternateSelectedControlTextColor : .labelColor
     }
 
     private static func highlight(_ text: String, ranges: [NSRange], font: NSFont) -> NSAttributedString {
